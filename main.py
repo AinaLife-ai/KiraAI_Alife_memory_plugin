@@ -24,7 +24,7 @@ from core.utils.path_utils import get_config_path
 from .storage import MemoryStore, estimate_tokens
 
 
-PLUGIN_ID = "alife_memory"
+PLUGIN_ID = "alife_memory_z"
 
 
 def _num(value, default, low, high, integer=False):
@@ -94,7 +94,14 @@ class AlifeMemoryPlugin(BasePlugin):
         self._closed = False
         self._seen_user_ids: set[str] = set()
         self._load_settings()
+        # 数据目录迁移：旧 alife_memory → alife_memory_z
         data_dir = Path(ctx.get_plugin_data_dir())
+        old_data_dir = data_dir.parent / "alife_memory"
+        if old_data_dir.exists() and not data_dir.exists():
+            logger.info("[alife_memory] 检测到旧数据目录 %s，迁移到 %s", old_data_dir, data_dir)
+            data_dir.parent.mkdir(parents=True, exist_ok=True)
+            import shutil
+            shutil.move(str(old_data_dir), str(data_dir))
         self.store = MemoryStore(data_dir / "memory.sqlite3")
         self._config_path = get_config_path() / "plugins" / f"{PLUGIN_ID}.json"
 
@@ -285,14 +292,14 @@ class AlifeMemoryPlugin(BasePlugin):
             elif plugin_id == "kira_plugin_kiraos":
                 # KiraOS: data/memory/entities/ 目录下的 TOML 文件
                 kiraos_entities = data_root / "memory" / "entities"
-                if kiraos_entities.exists():
-                    toml_files = list(kiraos_entities.rglob("*.toml"))
+                if await asyncio.to_thread(kiraos_entities.exists):
+                    toml_files = await asyncio.to_thread(lambda: list(kiraos_entities.rglob("*.toml")))
                     if toml_files:
                         count = 0
-                        import re as _re
                         for tf in toml_files:
                             try:
-                                text = tf.read_text(encoding="utf-8", errors="replace")
+                                text = await asyncio.to_thread(lambda: tf.read_text(encoding="utf-8", errors="replace"))
+                                import re as _re
                                 t_id = _re.search(r'id\s*=\s*"([^"]*)"', text)
                                 t_text_match = _re.search(r'text\s*=\s*"([^"]*)"', text)
                                 t_type = _re.search(r'type\s*=\s*"([^"]*)"', text)
@@ -921,7 +928,7 @@ class AlifeMemoryPlugin(BasePlugin):
             parts.append(f"旧版本被取代: {memory['supersedes']}")
         return "\n".join(parts)
 
-    @register.page("/index", menu=PageMenu(label={"zh": "长期记忆", "en": "Memory"}, icon="Brain", order=90))
+    @register.page("/index", menu=PageMenu(label={"zh": "长期记忆·Z", "en": "Memory·Z"}, icon="Brain", order=90))
     def page(self):
         return PluginPage.from_folder("./web")
 
@@ -938,6 +945,12 @@ class AlifeMemoryPlugin(BasePlugin):
                        "max_level": self.max_level, "auto_archive_days": self.auto_archive_days,
                        "archive_level_min": self.archive_level_min})
         return result
+
+    @register.api(method="GET", path="/pending", auth=True, summary="Pending compression stats")
+    async def api_pending(self):
+        pending = await self.store.pending_messages_all()
+        return {"round_count": pending.get("round_count", 0), "token_sum": pending.get("token_sum", 0),
+                "message_count": pending.get("message_count", 0)}
 
     @register.api(method="GET", path="/memories", auth=True, summary="List memories")
     async def api_memories(self, sid: str | None = None, limit: int = 100):
@@ -987,8 +1000,38 @@ class AlifeMemoryPlugin(BasePlugin):
     async def api_tasks(self, limit: int = 50):
         return await self.store.tasks(_num(limit, 50, 1, 200, True))
 
+    @register.api(method="POST", path="/cleanup", auth=True, summary="Trigger manual cleanup")
+    async def api_cleanup(self):
+        result = await self.store.cleanup(self.message_retention_days, self.stale_retention_days)
+        return {"ok": True, "deleted_messages": result.get("deleted_messages", 0),
+                "deleted_stale_memories": result.get("deleted_stale_memories", 0)}
+
+    @register.api(method="GET", path="/config", auth=True, summary="Get current config")
+    async def api_config_get(self):
+        return self.cfg
+
+    @register.api(method="GET", path="/models", auth=True, summary="List available LLM models")
+    async def api_models(self):
+        models = []
+        try:
+            ctx = self.ctx
+            pm = getattr(ctx, "provider_mgr", None)
+            if pm and hasattr(pm, "kira_config"):
+                providers_config = pm.kira_config.get("providers", {}) or {}
+                for pid, pcfg in providers_config.items():
+                    if not isinstance(pcfg, dict):
+                        continue
+                    model_config = (pcfg or {}).get("model_config", {}) or {}
+                    llm_models = model_config.get("llm", {}) or {}
+                    pname = (pcfg.get('name', '') or pid)
+                    for mid in llm_models:
+                        models.append({"id": f"{pid}:{mid}", "name": f"{mid} ({pname})"})
+        except Exception as exc:
+            logger.warning("[alife_memory] failed to list models: %s", exc)
+        return {"models": models}
+
     @register.api(method="POST", path="/config", auth=True, summary="Hot update memory config")
-    async def api_config(self, request: Request):
+    async def api_config_post(self, request: Request):
         body = await request.json()
         if not isinstance(body, dict):
             return {"error": "object required"}
