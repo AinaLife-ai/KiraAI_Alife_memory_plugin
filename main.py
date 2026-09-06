@@ -297,6 +297,33 @@ class AlifeMemoryPlugin(BasePlugin):
         except Exception as exc:
             logger.warning("[alife_memory] 互斥检测/禁用失败: %s", exc)
 
+    @staticmethod
+    def _parse_kiraos_toml(tf: Path):
+        """解析单个 KiraOS TOML 记忆文件，返回 (content, summary, importance, sid, ts) 或 None。"""
+        try:
+            text = tf.read_text(encoding="utf-8", errors="replace")
+            import re as _re
+            t_text_match = _re.search(r'text\s*=\s*"([^"]*)"', text)
+            if not t_text_match:
+                return None
+            content = t_text_match.group(1)
+            # 跳过超长内容（KiraOS 海马体的长篇概况通常质量低、污染大）
+            if len(content) > 120:
+                return None
+            t_imp = _re.search(r'importance\s*=\s*(\d+)', text)
+            t_sid = _re.search(r'session\s*=\s*"([^"]*)"', text)
+            t_ts = _re.search(r'time\s*=\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', text)
+            importance = float(t_imp.group(1)) / 10.0 if t_imp else 0.5
+            source_sid = t_sid.group(1) if t_sid else "kiraos_import"
+            from datetime import datetime as _dt
+            try:
+                ts_val = _dt.fromisoformat(t_ts.group(1)).timestamp() if t_ts else time.time()
+            except Exception:
+                ts_val = time.time()
+            return (content, content[:100], importance, source_sid, ts_val)
+        except Exception:
+            return None
+
     async def _count_migratable(self, plugin_id: str) -> int:
         """统计冲突插件的待迁移记忆条数"""
         try:
@@ -333,27 +360,27 @@ class AlifeMemoryPlugin(BasePlugin):
                 core_txt = data_root / "memory" / "core.txt"
                 if core_txt.exists():
                     logger.info("[alife_memory] 发现 Simple Memory 数据文件: %s，正在迁移……", core_txt)
-                    raw_text = core_txt.read_text(encoding="utf-8", errors="replace")
+                    raw_text = await asyncio.to_thread(lambda: core_txt.read_text(encoding="utf-8", errors="replace"))
                     lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
                     if lines:
-                        count = 0
+                        now = time.time()
+                        # 1) 一次性并发嵌入所有内容（替代每条串行 embed）
+                        vectors = await self._embed_batch(lines)
+                        # 2) 批量组装 + 单事务写入（替代逐条 add_memory）
+                        rows = []
                         for line in lines:
+                            if len(line) > 120:
+                                continue
                             content_stripped = line
-                            vector = await self._embed(content_stripped)
-                            fp = hashlib.sha256(("simple_memory_import|" + content_stripped).encode()).hexdigest()[:32]
-                            try:
-                                await self.store.add_memory(
-                                    sid="system", level=3, summary=content_stripped[:100],
-                                    content=content_stripped, start_ts=time.time(),
-                                    end_ts=time.time(), source_ids=[], importance=0.5,
-                                    embedding=vector, user_id="",
-                                    source_fingerprint=fp,
-                                    source_refs=[{"sid": "simple_memory_import",
-                                                  "user_id": "", "ts": time.time(),
-                                                  "action": "从Simple Memory自动迁移，原始文件保留未清理"}])
-                                count += 1
-                            except Exception:
-                                pass
+                            rows.append({
+                                "sid": "system", "level": 3, "summary": content_stripped[:100],
+                                "content": content_stripped, "start_ts": now, "end_ts": now,
+                                "source_ids": [], "importance": 0.5, "embedding": vectors.get(content_stripped),
+                                "user_id": "", "source_fingerprint": hashlib.sha256(("simple_memory_import|" + content_stripped).encode()).hexdigest()[:32],
+                                "source_refs": [{"sid": "simple_memory_import", "user_id": "", "ts": now,
+                                                 "action": "从Simple Memory自动迁移，原始文件保留未清理"}],
+                            })
+                        count = await self.store.add_memories_batch(rows)
                         if count:
                             migrated = True
                             logger.info("[alife_memory] 已从 Simple Memory 迁移 %d 条记忆（原始文件未删除）", count)
@@ -364,52 +391,31 @@ class AlifeMemoryPlugin(BasePlugin):
                 if await asyncio.to_thread(kiraos_entities.exists):
                     toml_files = await asyncio.to_thread(lambda: list(kiraos_entities.rglob("*.toml")))
                     if toml_files:
-                        count = 0
-                        for tf in toml_files:
-                            try:
-                                text = await asyncio.to_thread(lambda: tf.read_text(encoding="utf-8", errors="replace"))
-                                import re as _re
-                                t_id = _re.search(r'id\s*=\s*"([^"]*)"', text)
-                                t_text_match = _re.search(r'text\s*=\s*"([^"]*)"', text)
-                                t_type = _re.search(r'type\s*=\s*"([^"]*)"', text)
-                                t_imp = _re.search(r'importance\s*=\s*(\d+)', text)
-                                t_sid = _re.search(r'session\s*=\s*"([^"]*)"', text)
-                                t_ts = _re.search(r'time\s*=\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', text)
-                                if not t_text_match:
-                                    continue
-                                content = t_text_match.group(1)
-                                # 跳过超长内容（KiraOS 海马体的长篇概况通常质量低、污染大）
-                                if len(content) > 120:
-                                    logger.debug("[alife_memory] KiraOS 迁移跳过超长内容 (%d 字符)", len(content))
-                                    continue
-                                summary = content[:100]
-                                importance = float(t_imp.group(1)) / 10.0 if t_imp else 0.5
-                                source_sid = t_sid.group(1) if t_sid else "kiraos_import"
-                                vector = await self._embed(content)
-                                from datetime import datetime as _dt
-                                try:
-                                    ts_val = _dt.fromisoformat(t_ts.group(1)).timestamp() if t_ts else time.time()
-                                except Exception:
-                                    ts_val = time.time()
-                                fp = hashlib.sha256(("kiraos_import|" + content).encode()).hexdigest()[:32]
-                                try:
-                                    await self.store.add_memory(
-                                        sid=source_sid, level=3, summary=summary,
-                                        content=content, start_ts=ts_val, end_ts=ts_val,
-                                        source_ids=[], importance=importance,
-                                        embedding=vector, user_id="",
-                                        source_fingerprint=fp,
-                                        source_refs=[{"sid": source_sid,
-                                                      "user_id": "", "ts": ts_val,
-                                                      "action": "从KiraOS记忆自动迁移，原始文件保留未清理"}])
-                                    count += 1
-                                except Exception:
-                                    pass
-                            except Exception:
-                                continue
-                        if count:
-                            migrated = True
-                            logger.info("[alife_memory] 已从 KiraOS 记忆迁移 %d 条记忆（原始文件未删除）", count)
+                        # 1) 并行读取所有文件并解析（替代逐条串行 read_text）
+                        from datetime import datetime as _dt
+                        parsed = await asyncio.gather(*[asyncio.to_thread(self._parse_kiraos_toml, tf) for tf in toml_files])
+                        valid = [p for p in parsed if p]  # [(content, summary, importance, sid, ts)]
+                        if valid:
+                            contents = [p[0] for p in valid]
+                            # 2) 一次性并发嵌入所有内容
+                            vectors = await self._embed_batch(contents)
+                            # 3) 批量组装 + 单事务写入
+                            rows = []
+                            now = time.time()
+                            for i, (content, summary, importance, source_sid, ts_val) in enumerate(valid):
+                                rows.append({
+                                    "sid": source_sid, "level": 3, "summary": summary,
+                                    "content": content, "start_ts": ts_val, "end_ts": ts_val,
+                                    "source_ids": [], "importance": importance,
+                                    "embedding": vectors.get(content), "user_id": "",
+                                    "source_fingerprint": hashlib.sha256(("kiraos_import|" + content).encode()).hexdigest()[:32],
+                                    "source_refs": [{"sid": source_sid, "user_id": "", "ts": ts_val,
+                                                     "action": "从KiraOS记忆自动迁移，原始文件保留未清理"}],
+                                })
+                            count = await self.store.add_memories_batch(rows)
+                            if count:
+                                migrated = True
+                                logger.info("[alife_memory] 已从 KiraOS 记忆迁移 %d 条记忆（原始文件未删除）", count)
         except Exception as exc:
             logger.warning("[alife_memory] 从 %s 迁移失败: %s", plugin_id, exc)
         return migrated
@@ -481,11 +487,18 @@ class AlifeMemoryPlugin(BasePlugin):
             logger.debug("[alife_memory] embedding unavailable: %s", exc)
             return None
 
-    async def _embed_batch(self, texts: list[str]) -> dict[str, list[float] | None]:
-        """并发批量嵌入，返回 {text: embedding}。避免每词串行等待 embedding API 造成注入延迟。"""
+    async def _embed_batch(self, texts: list[str], concurrency: int = 16) -> dict[str, list[float] | None]:
+        """并发批量嵌入，返回 {text: embedding}。用信号量限制并发，避免一次性大量请求压垮 embedding API。
+        比逐条串行快得多，但对大规模（如迁移 1000 条）也能安全并发。"""
         if not texts:
             return {}
-        results = await asyncio.gather(*(self._embed(t) for t in texts))
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def _one(t):
+            async with sem:
+                return await self._embed(t)
+
+        results = await asyncio.gather(*(_one(t) for t in texts))
         return {t: r for t, r in zip(texts, results)}
 
     async def _rerank(self, query: str, items: list[dict]) -> list[dict]:

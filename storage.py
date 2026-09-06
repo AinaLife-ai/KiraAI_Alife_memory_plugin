@@ -351,6 +351,53 @@ class MemoryStore:
         finally:
             conn.close()
 
+    async def add_memories_batch(self, rows: list[dict]) -> int:
+        """批量写记忆（迁移专用）：单连接单事务处理多条，显著快于逐条 add_memory。
+        保留 source_fingerprint 去重，避免重复迁移。返回新增条数。"""
+        if not rows:
+            return 0
+        return await asyncio.to_thread(self._add_memories_batch, rows)
+
+    def _add_memories_batch(self, rows):
+        conn = self._connect()
+        added = 0
+        try:
+            for it in rows:
+                sid = it["sid"]; level = it["level"]; summary = it["summary"]
+                content = it["content"]; start_ts = it["start_ts"]; end_ts = it["end_ts"]
+                importance = it.get("importance", 0.5); embedding = it.get("embedding")
+                source_ids = it.get("source_ids", []); source_refs = it.get("source_refs", [])
+                user_id = it.get("user_id", ""); confidence = it.get("confidence", 0.65)
+                source_fingerprint = it.get("source_fingerprint", ""); memory_id = it.get("memory_id")
+                fact_key = normalized_fact_key(summary, content)
+                now = time.time()
+                # 去重：同指纹已存在 → 跳过（迁移幂等）
+                if source_fingerprint:
+                    existing = conn.execute("SELECT id FROM memories WHERE source_fingerprint=? LIMIT 1", (source_fingerprint,)).fetchone()
+                    if existing:
+                        continue
+                # dedupe_key 一级去重（同层级同事实）
+                dup = conn.execute("SELECT id FROM memories WHERE dedupe_key=? AND status='active' AND deleted=0 AND level=? LIMIT 1", (fact_key, level)).fetchone()
+                if dup:
+                    continue
+                mid = memory_id or f"L{level}-{int(start_ts)}-{int(end_ts)}-{uuid.uuid4().hex[:8]}"
+                refs = source_refs or [{"sid": sid, "user_id": str(user_id or ""), "start_ts": start_ts, "end_ts": end_ts}]
+                conn.execute(
+                    "INSERT OR REPLACE INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (mid, sid, str(user_id or ""), level, summary.strip(), content, start_ts, end_ts,
+                     max(0.0, min(1.0, importance)), json.dumps(source_ids, ensure_ascii=False),
+                     json.dumps(embedding) if embedding else None, now, now, "active",
+                     max(0.0, min(1.0, confidence)), None, "", source_fingerprint or "", fact_key,
+                     json.dumps(refs, ensure_ascii=False)))
+                conn.execute("DELETE FROM memories_fts WHERE memory_id=?", (mid,))
+                conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
+                             (summary, content, sid, level, mid))
+                added += 1
+            conn.commit()
+            return added
+        finally:
+            conn.close()
+
     async def search(self, sid: str, query: str, limit: int = 6,
                      levels: list[int] | None = None,
                      query_embedding: list[float] | None = None,
