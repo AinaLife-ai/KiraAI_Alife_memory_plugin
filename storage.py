@@ -108,6 +108,21 @@ def cosine(a: list[float] | None, b: list[float] | None) -> float:
     return dot / (na * nb) if na and nb else 0.0
 
 
+def _normalize_item(item: dict) -> dict:
+    """解析并清理从 memories 表返回的行：反序列化 source_ids/source_refs，
+    去掉 embedding 大数组（对 LLM/前端无意义，避免浪费），保留 embed_model 标记。"""
+    try:
+        item["source_ids"] = json.loads(item.get("source_ids") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        item["source_ids"] = []
+    try:
+        item["source_refs"] = json.loads(item.get("source_refs") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        item["source_refs"] = []
+    item.pop("embedding", None)
+    return item
+
+
 class MemoryStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -599,13 +614,7 @@ class MemoryStore:
                 rows = conn.execute("SELECT * FROM memories WHERE deleted=0 ORDER BY end_ts DESC LIMIT ?", (limit,)).fetchall()
             result = []
             for row in rows:
-                item = dict(row)
-                try:
-                    item["source_ids"] = json.loads(item.get("source_ids") or "[]")
-                    item["source_refs"] = json.loads(item.get("source_refs") or "[]")
-                except (TypeError, json.JSONDecodeError):
-                    item["source_ids"], item["source_refs"] = [], []
-                result.append(item)
+                result.append(_normalize_item(dict(row)))
             return result
         finally:
             conn.close()
@@ -617,7 +626,7 @@ class MemoryStore:
         conn = self._connect()
         try:
             row = conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
-            return dict(row) if row else None
+            return _normalize_item(dict(row)) if row else None
         finally:
             conn.close()
 
@@ -777,13 +786,7 @@ class MemoryStore:
             ).fetchall()
             result = []
             for row in rows:
-                item = dict(row)
-                try:
-                    item["source_ids"] = json.loads(item.get("source_ids") or "[]")
-                    item["source_refs"] = json.loads(item.get("source_refs") or "[]")
-                except (TypeError, json.JSONDecodeError):
-                    item["source_ids"], item["source_refs"] = [], []
-                result.append(item)
+                result.append(_normalize_item(dict(row)))
             return result
         finally:
             conn.close()
@@ -901,13 +904,7 @@ class MemoryStore:
             ).fetchall()
             result = []
             for row in rows:
-                item = dict(row)
-                try:
-                    item["source_ids"] = json.loads(item.get("source_ids") or "[]")
-                    item["source_refs"] = json.loads(item.get("source_refs") or "[]")
-                except (TypeError, json.JSONDecodeError):
-                    item["source_ids"], item["source_refs"] = [], []
-                result.append(item)
+                result.append(_normalize_item(dict(row)))
             return result
         finally:
             conn.close()
@@ -927,13 +924,7 @@ class MemoryStore:
             ).fetchall()
             result = []
             for row in rows:
-                item = dict(row)
-                try:
-                    item["source_ids"] = json.loads(item.get("source_ids") or "[]")
-                    item["source_refs"] = json.loads(item.get("source_refs") or "[]")
-                except (TypeError, json.JSONDecodeError):
-                    item["source_ids"], item["source_refs"] = [], []
-                result.append(item)
+                result.append(_normalize_item(dict(row)))
             return result
         finally:
             conn.close()

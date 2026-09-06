@@ -59,7 +59,7 @@ async function loadHome(){
 async function loadMemories(){
   const q=$('#filterSid')?.value||'',list=await api('/memories?limit=100'+(q?'&sid='+encodeURIComponent(q):''));
   if(!Array.isArray(list)){$('#memoryList').innerHTML='<div class="empty">暂无数据</div>';return}
-  $('#memoryList').innerHTML=list.length?list.map(x=>`<div class="memory-item"><h3><span>${esc(x.summary)}</span><span class="tag">L${x.level}</span><span class="tag">${esc(x.status)}</span><span class="tag">${(x.confidence*100).toFixed(0)}%</span></h3><div class="content">${esc(x.content)}</div><div class="meta">${esc(x.id)} · 来源 ${esc(x.sid)} · 用户 ${esc(x.user_id||'—')} · ${new Date(x.end_ts*1000).toLocaleString()}</div><div class="actions"><button class="btn sm alt" onclick="editMemory('${x.id}')">修正</button><button class="btn sm danger" onclick="deleteMemory('${x.id}')">删除</button></div></div>`).join(''):'<div class="empty">没有记忆</div>';
+  $('#memoryList').innerHTML=list.length?list.map(x=>`<div class="memory-item"><h3><span>${esc(x.summary)}</span><span class="tag">L${x.level}</span><span class="tag">${esc(x.status)}</span><span class="tag">${(x.confidence*100).toFixed(0)}%</span>${x.embed_model?`<span class="tag" style="background:#e8f0ff;color:#2a6dc4">向量:${esc(x.embed_model)}</span>`:''}</h3><div class="content">${esc(x.content)}</div><div class="meta">${esc(x.id)} · 来源 ${esc(x.sid)} · 用户 ${esc(x.user_id||'—')} · ${new Date(x.end_ts*1000).toLocaleString()}</div><div class="actions"><button class="btn sm alt" onclick="editMemory('${x.id}')">修正</button><button class="btn sm danger" onclick="deleteMemory('${x.id}')">删除</button></div></div>`).join(''):'<div class="empty">没有记忆</div>';
 }
 
 function editMemory(id){
