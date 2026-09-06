@@ -100,6 +100,9 @@ class AlifeMemoryPlugin(BasePlugin):
         # rerank 探测缓存：首次调用时探测一次，没配置就记住不再每次尝试，插件重载/热更新时重置
         self._rerank_checked = False
         self._rerank_client = None
+        # embedding 探测缓存：与 rerank 对称，首次探测后缓存，避免每次注入都调 get_default_embedding_client
+        self._embed_checked = False
+        self._embed_client = None
         self._ctx_injected_ids: set[str] = set()  # context marker 已注入的记忆 id，避免 _inject 重复注入
         self._load_settings()
         self._llm_semaphore = asyncio.Semaphore(max(1, self.llm_concurrency_limit))
@@ -473,13 +476,21 @@ class AlifeMemoryPlugin(BasePlugin):
     async def _embed(self, text: str) -> list[float] | None:
         if not self.semantic_enabled:
             return None
+        # 首次探测一次并缓存 client：若不可用则记住，之后直接跳过，避免每轮重复探测
+        if not self._embed_checked:
+            try:
+                if self.embedding_model:
+                    client = self.ctx.get_embedding_client(model_uuid=self.embedding_model)
+                else:
+                    client = self.ctx.get_default_embedding_client()
+            except Exception:
+                client = None
+            self._embed_client = client if (client and hasattr(client, "embed")) else None
+            self._embed_checked = True
+        client = self._embed_client
+        if not client:
+            return None
         try:
-            if self.embedding_model:
-                client = self.ctx.get_embedding_client(model_uuid=self.embedding_model)
-            else:
-                client = self.ctx.get_default_embedding_client()
-            if not client:
-                return None
             result = await client.embed([text])
             vector = result[0] if isinstance(result, list) and result else result
             return [float(x) for x in vector] if vector else None
@@ -1338,6 +1349,9 @@ class AlifeMemoryPlugin(BasePlugin):
             logger.exception("[alife_memory] reload settings after config update failed")
         self._rerank_checked = False
         self._rerank_client = None
+        # embedding 探测缓存同样重置，让新配的向量模型立即生效
+        self._embed_checked = False
+        self._embed_client = None
         return {"ok": True}
 
     def _persist_config(self):
