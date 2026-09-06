@@ -97,6 +97,9 @@ class AlifeMemoryPlugin(BasePlugin):
         self._closed = False
         self._seen_user_ids: set[str] = set()
         self._recall_round_counter: dict[str, int] = {}
+        # rerank 探测缓存：首次调用时探测一次，没配置就记住不再每次尝试，插件重载/热更新时重置
+        self._rerank_checked = False
+        self._rerank_client = None
         self._load_settings()
         self._llm_semaphore = asyncio.Semaphore(max(1, self.llm_concurrency_limit))
         # 数据目录迁移：旧 alife_memory → alife_memory_z
@@ -481,20 +484,36 @@ class AlifeMemoryPlugin(BasePlugin):
         return {t: r for t, r in zip(texts, results)}
 
     async def _rerank(self, query: str, items: list[dict]) -> list[dict]:
-        """Rerank search results using configured rerank model."""
+        """Rerank search results using configured rerank model.
+
+        首次调用时探测一次：若未配置可用 rerank，缓存标记后之后直接跳过，
+        避免每轮注入都重复尝试 get_default_rerank() 造成阻塞。
+        """
         if not items:
             return items
+        # 已探测过且确认不可用 → 直接跳过
+        if self._rerank_checked and self._rerank_client is None:
+            return items
         try:
-            pm = getattr(self.ctx, "provider_mgr", None)
-            if not pm:
-                return items
-            if self.rerank_model:
-                parts = self.rerank_model.split(":")
-                client = pm.get_model_client(parts[0], ":".join(parts[1:]))
-            else:
-                client = pm.get_default_rerank()
-            if not client or not hasattr(client, "rerank"):
-                return items
+            # 首次探测：解析 rerank client 并缓存
+            if not self._rerank_checked:
+                pm = getattr(self.ctx, "provider_mgr", None)
+                if not pm:
+                    self._rerank_checked = True
+                    self._rerank_client = None
+                    return items
+                if self.rerank_model:
+                    parts = self.rerank_model.split(":")
+                    client = pm.get_model_client(parts[0], ":".join(parts[1:]))
+                else:
+                    client = pm.get_default_rerank()
+                if not client or not hasattr(client, "rerank"):
+                    self._rerank_checked = True
+                    self._rerank_client = None
+                    return items
+                self._rerank_client = client
+                self._rerank_checked = True
+            client = self._rerank_client
             texts = [f"{x.get('summary', '')} {x.get('content', '')}" for x in items]
             scores = await client.rerank(query, texts)
             if scores and len(scores) == len(items):
@@ -1233,5 +1252,12 @@ class AlifeMemoryPlugin(BasePlugin):
                 self.cfg[key].update(value)
             else:
                 self.cfg[key] = value
+        # 热更新后重新读取设置，并重置 rerank 探测缓存（让新配置立即生效）
+        try:
+            self._load_settings()
+        except Exception:
+            logger.exception("[alife_memory] reload settings after config update failed")
+        self._rerank_checked = False
+        self._rerank_client = None
         return {"ok": True}
           
