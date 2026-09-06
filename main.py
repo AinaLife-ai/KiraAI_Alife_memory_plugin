@@ -1133,32 +1133,67 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @register.tool(
         name="list_users",
-        description="列出我记住的所有用户，以及每个用户的记忆数量和最近记忆概要。当用户问‘你记得哪些人/多少用户’时使用。",
-        params={"type": "object", "properties": {"limit": {"type": "integer", "description": "最多列出多少个用户，默认50", "default": 50}}, "required": []})
+        description="列出我记住的所有用户，以及每个用户的记忆数量和最近记忆概要。当用户问‘你记得哪些人/多少用户’时使用。特别适合找回某个用户，但人数很多时请加大 limit。",
+        params={"type": "object", "properties": {"limit": {"type": "integer", "description": "本次列出多少个用户，默认50；总数始终显示。", "default": 50}}, "required": []})
     async def list_users(self, event: KiraMessageBatchEvent, limit: int = 50) -> str:
-        users = await self.store.list_users(_num(limit, 50, 1, 200, True))
-        if not users:
+        total = await self.store.count_users()
+        if total == 0:
             return "我目前还没有记住任何用户。"
-        out = [f"我记得 {len(users)} 个用户："]
+        shown = _num(limit, 50, 1, 500, True)
+        users = await self.store.list_users(shown)
+        out = [f"我记得一共 {total} 个用户（显示前 {len(users)} 个）："]
         for u in users:
             ts = time.strftime('%Y-%m-%d', time.localtime(u["last_ts"])) if u["last_ts"] else "未知"
-            out.append(f"\n- {u['user_id']} | {u['cnt']} 条记忆 | 最近 {ts}")
-            if u.get("recent_summary"):
-                out.append(f"  最近记得: {u['recent_summary'][:80]}")
+            max_lv = u.get("max_level") or 1
+            out.append(f"\n- {u['user_id']} | {u['cnt']} 条记忆 | 最高层 L{max_lv} | 最近 {ts}")
+            # 最高权重×层级的那条
+            if u.get("top_summary"):
+                out.append(f"  ★ 高权重: L{u.get('top_level',1)} 重要{u.get('top_importance',0.0):.2f} → {u['top_summary'][:90]}")
+            # 最近记得的几条（默认3条）
+            recents = u.get("recent_summaries") or []
+            if recents:
+                out.append(f"  最近记得:")
+                for rs in recents[:3]:
+                    out.append(f"    · {rs[:80]}")
+        if total > len(users):
+            out.append(f"\n… 还有 {total - len(users)} 个用户未显示（可增大 limit 查看）")
         return "\n".join(out)
 
     @register.tool(
         name="list_user_memories",
-        description="精确列出某个用户（指定 user_id）的全部记忆，跨会话。当你要回忆某个具体用户的相关事情时使用，比笼统检索更准。",
-        params={"type": "object", "properties": {"user_id": {"type": "string", "description": "要查询的用户标识，可通过 list_users 获取"}, "limit": {"type": "integer", "description": "最多返回多少条，默认20", "default": 20}}, "required": ["user_id"]})
+        description="精确列出某个用户（指定 user_id）的全部记忆，跨会话。按重要性×层级优先，兼顾最近。当你要回忆某个具体用户的相关事情时使用，比笼统检索更准。",
+        params={"type": "object", "properties": {"user_id": {"type": "string", "description": "要查询的用户标识，可通过 list_users 获取"}, "limit": {"type": "integer", "description": "本次列出多少条，默认20；该用户总数始终显示。", "default": 20}}, "required": ["user_id"]})
     async def list_user_memories(self, event: KiraMessageBatchEvent, user_id: str, limit: int = 20) -> str:
-        memories = await self.store.list_memories_by_user(user_id, _num(limit, 20, 1, 100, True))
-        if not memories:
+        total = await self.store.count_memories_by_user(user_id)
+        if total == 0:
             return f"没有找到用户 {user_id} 的记忆。"
-        out = [f"用户 {user_id} 共有 {len(memories)} 条记忆："]
+        shown = _num(limit, 20, 1, 200, True)
+        memories = await self.store.list_memories_by_user(user_id, shown)
+        out = [f"用户 {user_id} 共有 {total} 条记忆（显示前 {len(memories)} 条，按重要性×层级排序）："]
         for m in memories:
             t = time.strftime('%Y-%m-%d', time.localtime(m["end_ts"]))
-            out.append(f"\n- L{m['level']} | {t} | {m['summary']}")
+            conf = m.get("confidence", 0.65)
+            out.append(f"\n- L{m['level']} | 重要{m.get('importance', 0.5):.2f} | 置信{conf*100:.0f}% | {t} | {m['summary']}")
+        if total > len(memories):
+            out.append(f"\n… 还有 {total - len(memories)} 条未显示（可增大 limit 查看）")
+        return "\n".join(out)
+
+    @register.tool(
+        name="list_session_memories",
+        description="按会话（群聊/群组）列出该会话的全部记忆，适合群聊归因会话的记忆。按重要性×层级优先，兼顾最近。当用户问‘这个群里聊过什么/我记得这个会话的什么事’时使用。",
+        params={"type": "object", "properties": {"sid": {"type": "string", "description": "要查询的会话标识（如 adapter:dm|gm:id），可通过实际对话上下文获取"}, "limit": {"type": "integer", "description": "本次列出多少条，默认20；该会话总数始终显示。", "default": 20}}, "required": ["sid"]})
+    async def list_session_memories(self, event: KiraMessageBatchEvent, sid: str, limit: int = 20) -> str:
+        total = await self.store.count_memories_by_sid(sid)
+        if total == 0:
+            return f"没有找到会话 {sid} 的记忆。"
+        shown = _num(limit, 20, 1, 200, True)
+        memories = await self.store.list_memories_by_sid(sid, shown)
+        out = [f"会话 {sid} 共有 {total} 条记忆（显示前 {len(memories)} 条，按重要性×层级排序）："]
+        for m in memories:
+            t = time.strftime('%Y-%m-%d', time.localtime(m["end_ts"]))
+            out.append(f"\n- L{m['level']} | 重要{m.get('importance', 0.5):.2f} | {t} | {m['summary']} | 用户 {m.get('user_id','') or '—'}")
+        if total > len(memories):
+            out.append(f"\n… 还有 {total - len(memories)} 条未显示（可增大 limit 查看）")
         return "\n".join(out)
 
     @register.page("/index", menu=PageMenu(label={"zh": "长期记忆·Z", "en": "Memory·Z"}, icon="Brain", order=90))
