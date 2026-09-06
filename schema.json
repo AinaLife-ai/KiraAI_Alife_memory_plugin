@@ -20,7 +20,8 @@
       "max_injected_lines": {"type": "integer", "name": "注入行数上限", "default": 30, "minimum": 5, "maximum": 100, "hint": "双截断：行数+Token+字符三重保险，任一项超限即截断。", "locales": {"zh": {"name": "注入行数上限", "hint": "行数+Token+字符三重保险，任一项超限即截断。"}}},
       "passive_recall_boost_threshold": {"type": "float", "name": "被动召回最低分阈值", "default": 0.4, "minimum": 0.0, "maximum": 1.0, "hint": "主检索结果最高分低于此值时自动以关键词做宽召回补充。", "locales": {"zh": {"name": "被动召回最低分阈值", "hint": "主检索结果最高分低于此值时自动以关键词做宽召回补充。"}}},
       "auto_archive_days": {"type": "integer", "name": "自动归档天数（0=关闭）", "default": 0, "minimum": 0, "maximum": 3650, "hint": "超过此天数未被触碰的 active 记忆自动归档。归档后仍可通过检索找到，0 为关闭。", "locales": {"zh": {"name": "自动归档天数（0=关闭）", "hint": "超过此天数未被触碰的 active 记忆自动归档。0 为关闭。"}}},
-      "archive_level_min": {"type": "integer", "name": "归档影响最低层级", "default": 5, "minimum": 1, "maximum": 12, "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级（max_level），最高层受保护。", "locales": {"zh": {"name": "归档影响最低层级", "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级。"}}}
+      "archive_level_min": {"type": "integer", "name": "归档影响最低层级", "default": 5, "minimum": 1, "maximum": 12, "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级（max_level），最高层受保护。", "locales": {"zh": {"name": "归档影响最低层级", "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级。"}}},
+      "llm_concurrency_limit": {"type": "integer", "name": "LLM 并发上限", "default": 4, "minimum": 1, "maximum": 20, "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。", "locales": {"zh": {"name": "LLM 并发上限", "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。"}}}
     }
   },
   "section_trigger": {

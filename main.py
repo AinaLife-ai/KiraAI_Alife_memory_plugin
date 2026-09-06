@@ -98,6 +98,7 @@ class AlifeMemoryPlugin(BasePlugin):
         self._seen_user_ids: set[str] = set()
         self._recall_round_counter: dict[str, int] = {}
         self._load_settings()
+        self._llm_semaphore = asyncio.Semaphore(max(1, self.llm_concurrency_limit))
         # 数据目录迁移：旧 alife_memory → alife_memory_z
         data_dir = Path(ctx.get_plugin_data_dir())
         old_data_dir = data_dir.parent / "alife_memory"
@@ -122,6 +123,7 @@ class AlifeMemoryPlugin(BasePlugin):
         self.passive_recall = bool(basic.get("passive_recall", True))
         self.passive_recall_update_rounds = _num(basic.get("passive_recall_update_rounds", 10), 10, 1, 200, True)
         self.passive_recall_keyword_limit = _num(basic.get("passive_recall_keyword_limit", 8), 8, 1, 30, True)
+        self.llm_concurrency_limit = _num(basic.get("llm_concurrency_limit", 4), 4, 1, 20, True)
         self.max_injected_tokens = _num(basic.get("max_injected_tokens", 1500), 1500, 100, 8000, True)
         self.max_injected_items = _num(basic.get("max_injected_items", 8), 8, 1, 30, True)
         self.max_injected_chars = _num(basic.get("max_injected_chars", 3000), 3000, 200, 20000, True)
@@ -387,10 +389,11 @@ class AlifeMemoryPlugin(BasePlugin):
         if not client:
             return None
         try:
-            response = await asyncio.wait_for(
-                client.chat(LLMRequest(messages=[OpenAIMessage(role="user", content=prompt)])),
-                timeout=self.compress_timeout if hasattr(self, 'compress_timeout') and self.compress_timeout else 30
-            )
+            async with self._llm_semaphore:
+                response = await asyncio.wait_for(
+                    client.chat(LLMRequest(messages=[OpenAIMessage(role="user", content=prompt)])),
+                    timeout=self.compress_timeout if hasattr(self, 'compress_timeout') and self.compress_timeout else 30
+                )
             return _json_object(getattr(response, "text_response", "") or "")
         except asyncio.TimeoutError:
             logger.warning("[alife_memory] model request timed out after %ds",
