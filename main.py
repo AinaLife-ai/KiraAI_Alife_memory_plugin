@@ -764,7 +764,7 @@ class AlifeMemoryPlugin(BasePlugin):
             "summary": {"type": "string", "description": "一句话概括，留空的话系统会自动取 content 的开头"},
             "memory_type": {"type": "string", "description": "这是哪类事？\n- '关于我的' → 关于这个人是谁：职业、背景、性格、知识水平\n- '我喜欢的' → 这个人的习惯和偏好：喜欢什么、不喜欢什么、做事风格\n- '正在发生的' → 当前在忙的事：项目进展、决定、截止日期\n- '去哪查' → 外部信息源：去哪找什么资料、哪个系统管什么\n- '日常的' → 其他值得记住的日常事情", "default": "日常的"},
             "tags": {"type": "string", "description": "标签，逗号分隔，方便以后翻找。比如：工作,爱好,约定", "default": ""},
-            "importance": {"type": "float", "description": "这件事多重要？0-1。0.9是很重要的事，0.5是普通日常，0.3是随手一记", "default": 0.5},
+            "importance": {"type": "number", "description": "这件事多重要？0-1。0.9是很重要的事，0.5是普通日常，0.3是随手一记", "default": 0.5},
             "reason": {"type": "string", "description": "（偏好和项目类必填）为什么是这样？背后有什么故事或原因？比如Ta踩过什么坑才会这么要求", "default": ""},
             "when_it_matters": {"type": "string", "description": "（偏好和项目类必填）什么时候该想起这条？什么场景下适用？", "default": ""}},
             "required": ["content"]})
