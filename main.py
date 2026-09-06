@@ -1131,6 +1131,36 @@ class AlifeMemoryPlugin(BasePlugin):
             parts.append(f"旧版本被取代: {memory['supersedes']}")
         return "\n".join(parts)
 
+    @register.tool(
+        name="list_users",
+        description="列出我记住的所有用户，以及每个用户的记忆数量和最近记忆概要。当用户问‘你记得哪些人/多少用户’时使用。",
+        params={"type": "object", "properties": {"limit": {"type": "integer", "description": "最多列出多少个用户，默认50", "default": 50}}, "required": []})
+    async def list_users(self, event: KiraMessageBatchEvent, limit: int = 50) -> str:
+        users = await self.store.list_users(_num(limit, 50, 1, 200, True))
+        if not users:
+            return "我目前还没有记住任何用户。"
+        out = [f"我记得 {len(users)} 个用户："]
+        for u in users:
+            ts = time.strftime('%Y-%m-%d', time.localtime(u["last_ts"])) if u["last_ts"] else "未知"
+            out.append(f"\n- {u['user_id']} | {u['cnt']} 条记忆 | 最近 {ts}")
+            if u.get("recent_summary"):
+                out.append(f"  最近记得: {u['recent_summary'][:80]}")
+        return "\n".join(out)
+
+    @register.tool(
+        name="list_user_memories",
+        description="精确列出某个用户（指定 user_id）的全部记忆，跨会话。当你要回忆某个具体用户的相关事情时使用，比笼统检索更准。",
+        params={"type": "object", "properties": {"user_id": {"type": "string", "description": "要查询的用户标识，可通过 list_users 获取"}, "limit": {"type": "integer", "description": "最多返回多少条，默认20", "default": 20}}, "required": ["user_id"]})
+    async def list_user_memories(self, event: KiraMessageBatchEvent, user_id: str, limit: int = 20) -> str:
+        memories = await self.store.list_memories_by_user(user_id, _num(limit, 20, 1, 100, True))
+        if not memories:
+            return f"没有找到用户 {user_id} 的记忆。"
+        out = [f"用户 {user_id} 共有 {len(memories)} 条记忆："]
+        for m in memories:
+            t = time.strftime('%Y-%m-%d', time.localtime(m["end_ts"]))
+            out.append(f"\n- L{m['level']} | {t} | {m['summary']}")
+        return "\n".join(out)
+
     @register.page("/index", menu=PageMenu(label={"zh": "长期记忆·Z", "en": "Memory·Z"}, icon="Brain", order=90))
     def page(self):
         return PluginPage.from_folder("./web")

@@ -49,7 +49,7 @@ document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{
 async function loadHome(){
   try{
     const s=await api('/status'),p=await api('/pending');
-    const statItems=[['记忆条目',sv(s.memories)],['原始消息',sv(s.messages)],['待压缩',sv(s.pending)],['待压缩轮数',sv(p.round_count)],['待压缩Token',sv(p.token_sum)],['会话数',sv(s.sessions)],['Worker',sv(s.workers)],['启用',s.enabled?'✓':'✗'],['注入',s.auto_inject?'✓':'✗'],['被动召回',s.passive_recall?'✓':'✗']];
+    const statItems=[['记忆条目',sv(s.memories)],['用户数',sv(s.users)],['原始消息',sv(s.messages)],['待压缩',sv(s.pending)],['待压缩轮数',sv(p.round_count)],['待压缩Token',sv(p.token_sum)],['会话数',sv(s.sessions)],['Worker',sv(s.workers)],['启用',s.enabled?'✓':'✗'],['注入',s.auto_inject?'✓':'✗'],['被动召回',s.passive_recall?'✓':'✗']];
     $('#stats').innerHTML=statItems.map(x=>`<div class="stat"><small>${x[0]}</small><strong>${x[1]}</strong></div>`).join('');
     $('#triggerState').innerHTML=`<div class="row" style="flex-wrap:wrap"><span class="tag">${esc(s.trigger_mode||'either')}</span><span>轮数阈值 ${s.round_threshold}　Token阈值 ${s.token_threshold}　消息数阈值 ${s.message_threshold}</span></div><p class="meta">压缩触发条件：任一达到阈值即触发</p>`;
   }catch(e){$('#stats').innerHTML='<div class="empty">加载失败，请刷新</div>'}

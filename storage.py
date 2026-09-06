@@ -549,6 +549,7 @@ class MemoryStore:
             def n(sql): return int(conn.execute(sql).fetchone()[0])
             return {"messages": n("SELECT COUNT(*) FROM messages"), "pending": n("SELECT COUNT(*) FROM messages WHERE compressed=0"),
                     "memories": n("SELECT COUNT(*) FROM memories WHERE deleted=0"), "sessions": n("SELECT COUNT(DISTINCT sid) FROM messages"),
+                    "users": n("SELECT COUNT(DISTINCT user_id) FROM memories WHERE deleted=0 AND user_id != ''"),
                     "db_bytes": self.path.stat().st_size if self.path.exists() else 0}
         finally:
             conn.close()
@@ -635,6 +636,60 @@ class MemoryStore:
                 f"SELECT * FROM memories WHERE user_id IN ({placeholders}) AND deleted=0 AND status='active' "
                 "ORDER BY end_ts DESC LIMIT ?",
                 [*user_ids, limit * len(user_ids)]
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    item["source_ids"] = json.loads(item.get("source_ids") or "[]")
+                    item["source_refs"] = json.loads(item.get("source_refs") or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    item["source_ids"], item["source_refs"] = [], []
+                result.append(item)
+            return result
+        finally:
+            conn.close()
+
+    async def list_users(self, limit: int = 50) -> list[dict]:
+        """列出所有被记住的用户及其记忆概况。"""
+        return await asyncio.to_thread(self._list_users, limit)
+
+    def _list_users(self, limit):
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT user_id, COUNT(*) AS cnt, MAX(end_ts) AS last_ts, MAX(level) AS max_level "
+                "FROM memories WHERE deleted=0 AND user_id != '' AND status='active' "
+                "GROUP BY user_id ORDER BY cnt DESC, last_ts DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                # 取该用户最近一条记忆的概要作为画像
+                latest = conn.execute(
+                    "SELECT summary FROM memories WHERE user_id=? AND deleted=0 AND status='active' "
+                    "ORDER BY end_ts DESC LIMIT 1",
+                    (item["user_id"],)
+                ).fetchone()
+                item["recent_summary"] = latest["summary"] if latest else ""
+                result.append(item)
+            return result
+        finally:
+            conn.close()
+
+    async def list_memories_by_user(self, user_id: str, limit: int = 20, include_archived: bool = False) -> list[dict]:
+        """按用户精确列出其全部记忆（跨会话）。"""
+        return await asyncio.to_thread(self._list_memories_by_user, user_id, limit, include_archived)
+
+    def _list_memories_by_user(self, user_id, limit, include_archived):
+        conn = self._connect()
+        try:
+            status_sql = "IN ('active','archived')" if include_archived else "='active'"
+            rows = conn.execute(
+                f"SELECT * FROM memories WHERE user_id=? AND deleted=0 AND status{status_sql} "
+                "ORDER BY end_ts DESC LIMIT ?",
+                (user_id, limit)
             ).fetchall()
             result = []
             for row in rows:
