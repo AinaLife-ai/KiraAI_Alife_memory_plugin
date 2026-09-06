@@ -114,7 +114,6 @@ class AlifeMemoryPlugin(BasePlugin):
         self.max_injected_chars = _num(basic.get("max_injected_chars", 3000), 3000, 200, 20000, True)
         self.passive_recall_boost_threshold = _num(basic.get("passive_recall_boost_threshold", 0.4), 0.4, 0.0, 1.0)
 
-        self.default_fast_model = str(basic.get("default_fast_model", "") or "").strip()
         self.compress_model = str(compression.get("compress_model", "") or "").strip()
         self.reflect_model = str(reflection.get("reflect_model", "") or "").strip()
         self.compression_batch = _num(compression.get("batch_size", 10), 10, 2, 80, True)
@@ -452,7 +451,7 @@ class AlifeMemoryPlugin(BasePlugin):
             range_desc = f"从 {batch_start} 到 {batch_end} 期间的对话"
             task_id = await self.store.create_task(sid, "compress", "压缩对话为长期记忆")
             try:
-                result = await self._llm_json(self.compress_prompt.replace("{range}", range_desc).replace("{content}", content), self.compress_model or self.default_fast_model)
+                result = await self._llm_json(self.compress_prompt.replace("{range}", range_desc).replace("{content}", content), self.compress_model or "fast")
                 summary = str((result or {}).get("summary", "")).strip()
                 detail = str((result or {}).get("content", "")).strip()
                 if not summary or not detail:
@@ -486,7 +485,7 @@ class AlifeMemoryPlugin(BasePlugin):
             if group[-1]["start_ts"] < group[0]["start_ts"]:
                 continue
             content = "\n".join(f"[{x['summary']}] {x['content']}" for x in group)
-            result = await self._llm_json(self.compress_prompt.replace("{content}", content), self.compress_model)
+            result = await self._llm_json(self.compress_prompt.replace("{content}", content), self.compress_model or "fast")
             if not result:
                 continue
             summary = str(result.get("summary", "")).strip()
