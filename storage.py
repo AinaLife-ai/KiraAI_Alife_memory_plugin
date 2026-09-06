@@ -501,29 +501,30 @@ class MemoryStore:
                         rows.append(r)
                         seen_ids.add(r["id"])
                         fts_bm25[r["id"]] = float(r["bm25_score"] or 0.0)
-            # LIKE 兜底：分词后的 token 做子串匹配，捕获 FTS 未命中的词（含生僻、未登录词）
-            # LIKE 兜底：分词后的 token 做子串匹配，并补充中文单字（jieba 吞进相邻词的
-            # 单字关键词如书名"飘"也能兜底命中），捕获 FTS 未命中的词。
-            like_terms = list(dict.fromkeys(terms[:8]))  # 分词 token 去重
-            # 补充每个中文字符（去重，过滤纯空白），覆盖单字书名/人名等
-            for ch in str(query):
-                if ch.strip() and ('\u4e00' <= ch <= '\u9fff'):
-                    like_terms.append(ch)
-            like_terms_all = [f"%{term}%" for term in like_terms[:12]]
-            if like_terms_all:
-                like_sql = " OR ".join("(m.summary LIKE ? OR m.content LIKE ?)" for _ in like_terms_all)
-                like_rows = conn.execute(
-                    f"""SELECT m.*, 0.0 AS bm25_score FROM memories m
-                        WHERE {owner_sql} AND m.deleted=0 AND m.status IN ('active','archived')
-                          AND ({like_sql}) {level_sql}
-                        ORDER BY m.importance DESC, m.end_ts DESC LIMIT 80""",
-                    [*owner_params, *sum(([x, x] for x in like_terms_all), []), *([] if not levels else levels)]
-                ).fetchall()
-                for r in like_rows:
-                    if r["id"] not in seen_ids:
-                        rows.append(r)
-                        seen_ids.add(r["id"])
-                        fts_bm25[r["id"]] = 0.0
+            # LIKE 兜底：仅当 FTS 命中不足时才启用，避免全表扫和单字误召回刷屏。
+            # 若 FTS 已命中足够结果（>= limit*2），直接跳过（省性能、防误召回）。
+            target = max(limit * 2, limit)
+            if len(seen_ids) < target:
+                like_terms = list(dict.fromkeys(terms[:8]))  # 分词 token 去重
+                # 补充中文字符（去重，过滤空白），覆盖单字书名/人名等 jieba 未登录词
+                for ch in str(query):
+                    if ch.strip() and ('\u4e00' <= ch <= '\u9fff'):
+                        like_terms.append(ch)
+                like_terms_all = [f"%{term}%" for term in like_terms[:12]]
+                if like_terms_all:
+                    like_sql = " OR ".join("(m.summary LIKE ? OR m.content LIKE ?)" for _ in like_terms_all)
+                    like_rows = conn.execute(
+                        f"""SELECT m.*, 0.0 AS bm25_score FROM memories m
+                            WHERE {owner_sql} AND m.deleted=0 AND m.status IN ('active','archived')
+                              AND ({like_sql}) {level_sql}
+                            ORDER BY m.importance DESC, m.end_ts DESC LIMIT 80""",
+                        [*owner_params, *sum(([x, x] for x in like_terms_all), []), *([] if not levels else levels)]
+                    ).fetchall()
+                    for r in like_rows:
+                        if r["id"] not in seen_ids:
+                            rows.append(r)
+                            seen_ids.add(r["id"])
+                            fts_bm25[r["id"]] = 0.0
             if not rows:
                 rows = conn.execute(
                     f"""SELECT m.*, 0.0 AS bm25_score FROM memories m
