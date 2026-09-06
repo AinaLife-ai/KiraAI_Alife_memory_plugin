@@ -208,8 +208,8 @@ class AlifeMemoryPlugin(BasePlugin):
 
     async def initialize(self):
         self._closed = False
-        # 互斥检测：关闭冲突的记忆插件 + 自动迁移其数据
-        await self._mutual_exclusion()
+        # 互斥检测+迁移放入后台任务，避免阻塞初始化进程导致 WebUI 安装超时
+        self._tasks.add(asyncio.create_task(self._mutual_exclusion()))
         if self.reflect_enabled:
             self._reflect_task = asyncio.create_task(self._reflection_loop())
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
