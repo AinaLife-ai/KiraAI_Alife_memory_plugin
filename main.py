@@ -235,7 +235,7 @@ class AlifeMemoryPlugin(BasePlugin):
         logger.info("[alife_memory] initialized: triple-trigger compression, passive recall, linked retrieval")
 
     async def _mutual_exclusion(self):
-        """检测冲突的记忆插件并自动关闭，同时发起迁移"""
+        """检测冲突的记忆插件，先禁用再迁移，日志统计待迁移条数"""
         migrated = False
         conflict_plugins = {
             "kira_plugin_simple_memory": {"name": "Simple Memory（内置）", "data_file": "memory/core.txt"},
@@ -245,23 +245,50 @@ class AlifeMemoryPlugin(BasePlugin):
             ctx = self.ctx
             pm = getattr(ctx, "plugin_mgr", None)
             if not pm:
-                return  # 无法获取插件管理器时跳过
+                return
             for plugin_id, info in conflict_plugins.items():
                 plugin_inst = pm.get_plugin_inst(plugin_id)
                 if plugin_inst is None:
-                    continue  # 未安装，跳过
+                    continue
                 is_enabled = pm.is_plugin_enabled(plugin_id) if hasattr(pm, "is_plugin_enabled") else True
                 if not is_enabled:
-                    continue  # 已禁用，跳过
-                logger.info("[alife_memory] 检测到冲突插件 %s (%s)，正在自动禁用并迁移其记忆数据……", plugin_id, info["name"])
-                # 记忆迁移（禁用前读取数据）
-                migrated |= await self._migrate_from(plugin_id, info, pm, plugin_inst)
-                # 自动禁用
+                    continue
+                logger.info("[alife_memory] 检测到冲突插件 %s (%s)，先禁用……", plugin_id, info["name"])
+                # 先禁用，再迁移
                 if hasattr(pm, "set_plugin_enabled"):
                     await pm.set_plugin_enabled(plugin_id, False)
-                    logger.info("[alife_memory] 已自动禁用冲突插件 %s (%s)", plugin_id, info["name"])
+                    logger.info("[alife_memory] 已自动禁用 %s", plugin_id)
+                # 统计待迁移条数
+                pre_count = await self._count_migratable(plugin_id)
+                if pre_count > 0:
+                    logger.info("[alife_memory] 检测到 %s 有 %d 条记忆待迁移", info["name"], pre_count)
+                # 迁移数据
+                migrated |= await self._migrate_from(plugin_id, info, pm, plugin_inst)
         except Exception as exc:
             logger.warning("[alife_memory] 互斥检测/禁用失败: %s", exc)
+
+    async def _count_migratable(self, plugin_id: str) -> int:
+        """统计冲突插件的待迁移记忆条数"""
+        try:
+            from core.utils.path_utils import get_data_path
+            data_root = Path(get_data_path())
+            if plugin_id == "kira_plugin_simple_memory":
+                core_txt = data_root / "memory" / "core.txt"
+                exists = await asyncio.to_thread(core_txt.exists)
+                if not exists:
+                    return 0
+                text = await asyncio.to_thread(lambda: core_txt.read_text(encoding="utf-8", errors="replace"))
+                return len([l for l in text.splitlines() if l.strip()])
+            elif plugin_id == "kira_plugin_kiraos":
+                kiraos_dir = data_root / "memory" / "entities"
+                exists = await asyncio.to_thread(kiraos_dir.exists)
+                if not exists:
+                    return 0
+                files = await asyncio.to_thread(lambda: list(kiraos_dir.rglob("*.toml")))
+                return len(files)
+        except Exception:
+            return 0
+        return 0
 
     async def _migrate_from(self, plugin_id: str, info: dict, pm, plugin_inst) -> bool:
         """从指定插件迁移记忆。返回是否有数据导入。"""
@@ -321,6 +348,10 @@ class AlifeMemoryPlugin(BasePlugin):
                                 if not t_text_match:
                                     continue
                                 content = t_text_match.group(1)
+                                # 跳过超长内容（KiraOS 海马体的长篇概况通常质量低、污染大）
+                                if len(content) > 200:
+                                    logger.debug("[alife_memory] KiraOS 迁移跳过超长内容 (%d 字符)", len(content))
+                                    continue
                                 summary = content[:100]
                                 importance = float(t_imp.group(1)) / 10.0 if t_imp else 0.5
                                 source_sid = t_sid.group(1) if t_sid else "kiraos_import"
