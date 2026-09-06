@@ -225,6 +225,31 @@ class MemoryStore:
         finally:
             conn.close()
 
+    async def increment_attempts(self, ids: list[str]) -> None:
+        if ids:
+            await asyncio.to_thread(self._increment_attempts, ids)
+
+    def _increment_attempts(self, ids):
+        conn = self._connect()
+        try:
+            conn.executemany("UPDATE messages SET attempts=attempts+1 WHERE id=?", [(x,) for x in ids])
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def mark_skipped(self, ids: list[str], reason: str) -> None:
+        if ids:
+            await asyncio.to_thread(self._mark_skipped, ids, reason)
+
+    def _mark_skipped(self, ids, reason):
+        conn = self._connect()
+        try:
+            conn.executemany("UPDATE messages SET compressed=1, skip_reason=? WHERE id=?",
+                             [(reason, x) for x in ids])
+            conn.commit()
+        finally:
+            conn.close()
+
     async def add_memory(self, sid: str, level: int, summary: str, content: str,
                          start_ts: float, end_ts: float, source_ids: list[str],
                          importance: float = 0.5, embedding: list[float] | None = None,

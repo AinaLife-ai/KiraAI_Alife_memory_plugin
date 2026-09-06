@@ -45,6 +45,8 @@
     "fields": {
       "compress_model": {"type": "model_select", "name": "压缩模型", "model_type": "llm", "default": "", "hint": "留空跟随框架默认快速模型（WebUI-默认快速模型）。", "locales": {"zh": {"name": "压缩模型", "hint": "留空跟随框架默认快速模型（WebUI-默认快速模型）。"}}},
       "compress_probability": {"type": "float", "name": "压缩触发概率", "default": 0.8, "minimum": 0.0, "maximum": 1.0, "hint": "概率扰动，避免每次触发都压缩而影响互动感。1.0 为必触发。", "locales": {"zh": {"name": "压缩触发概率", "hint": "概率扰动，避免每次触发都压缩而影响互动感。1.0 为必触发。"}}},
+      "compress_timeout": {"type": "integer", "name": "压缩超时（秒）", "default": 30, "minimum": 5, "maximum": 120, "hint": "每次压缩 LLM 调用的超时秒数。超时后重试，超过最大重试次数则跳过整批。", "locales": {"zh": {"name": "压缩超时（秒）", "hint": "每次压缩 LLM 调用的超时秒数。超时后重试，超过最大重试次数则跳过整批。"}}},
+      "max_compress_retry": {"type": "integer", "name": "压缩最大重试", "default": 2, "minimum": 0, "maximum": 10, "hint": "超时后重试次数。超过后跳过整批消息，不阻塞后续消息处理。", "locales": {"zh": {"name": "压缩最大重试", "hint": "超时后重试次数。超过后跳过整批消息，不阻塞后续消息处理。"}}},
       "batch_size": {"type": "integer", "name": "每批消息数", "default": 10, "minimum": 2, "maximum": 80, "hint": "每次压缩取多少条原始消息给模型。", "locales": {"zh": {"name": "每批消息数", "hint": "每次压缩取多少条原始消息给模型。"}}},
       "level_group_size": {"type": "integer", "name": "高层合并数量", "default": 4, "minimum": 2, "maximum": 12, "hint": "同层摘要达到多少条时合并为更高层。", "locales": {"zh": {"name": "高层合并数量", "hint": "同层摘要达到多少条时合并为更高层。"}}},
       "max_level": {"type": "integer", "name": "最大压缩层级", "default": 5, "minimum": 1, "maximum": 12, "hint": "达到最高层后保留为长期事实，不再自动合并。", "locales": {"zh": {"name": "最大压缩层级", "hint": "达到最高层后保留为长期事实，不再自动合并。"}}},

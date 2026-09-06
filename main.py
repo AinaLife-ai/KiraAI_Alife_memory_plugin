@@ -160,6 +160,8 @@ class AlifeMemoryPlugin(BasePlugin):
         self.compress_prompt = str(compression.get("prompt", "") or "").strip() or self._default_compress_prompt()
         self.reflect_prompt = str(reflection.get("prompt", "") or "").strip() or self._default_reflect_prompt()
         self.compress_probability = _num(compression.get("compress_probability", 0.8), 0.8, 0.0, 1.0)
+        self.compress_timeout = _num(compression.get("compress_timeout", 30), 30, 5, 120, True)
+        self.max_compress_retry = _num(compression.get("max_compress_retry", 2), 2, 0, 10, True)
         self.inject_context_marker = bool(basic.get("inject_context_marker", True))
         self.recall_hint_keywords = list(basic.get("recall_hint_keywords", ["记得", "回忆", "以前", "上次", "忘记"])) if isinstance(basic.get("recall_hint_keywords"), list) else []
         self.max_injected_lines = _num(basic.get("max_injected_lines", 30), 30, 5, 100, True)
@@ -385,8 +387,15 @@ class AlifeMemoryPlugin(BasePlugin):
         if not client:
             return None
         try:
-            response = await client.chat(LLMRequest(messages=[OpenAIMessage(role="user", content=prompt)]))
+            response = await asyncio.wait_for(
+                client.chat(LLMRequest(messages=[OpenAIMessage(role="user", content=prompt)])),
+                timeout=self.compress_timeout if hasattr(self, 'compress_timeout') and self.compress_timeout else 30
+            )
             return _json_object(getattr(response, "text_response", "") or "")
+        except asyncio.TimeoutError:
+            logger.warning("[alife_memory] model request timed out after %ds",
+                           getattr(self, 'compress_timeout', 30))
+            return None
         except Exception as exc:
             logger.warning("[alife_memory] model request failed: %s", exc)
             return None
@@ -482,24 +491,42 @@ class AlifeMemoryPlugin(BasePlugin):
             return
         while len(pending) >= self.compression_batch or (priority and pending):
             batch = pending[:self.compression_batch]
+            # 检查整批中是否有超过最大重试次数的
+            max_attempts = max(x.get("attempts", 0) or 0 for x in batch)
+            if max_attempts >= self.max_compress_retry:
+                batch_ids = [x["id"] for x in batch]
+                await self.store.mark_skipped(batch_ids, f"超时{max_attempts}次，跳过整批")
+                logger.info("[alife_memory] 压缩跳过整批 %d 条（超时 %d 次）", len(batch_ids), max_attempts)
+                pending = await self.store.pending_messages(sid, self.compression_batch)
+                continue
             content = "\n".join(f"[{x['role']} user={x.get('user_id', '') or 'unknown'} turn={x.get('turn_no', 0)}] {x['content']}" for x in batch)
             if len(content) < self.compress_min_chars:
                 return
-            # 概率扰动：避免每次触发都压缩
             if self.compress_probability < 1.0 and random.random() > self.compress_probability:
                 return
-            # 构建 range 描述
             batch_start = time.strftime('%Y-%m-%d %H:%M', time.localtime(batch[0]['ts']))
             batch_end = time.strftime('%Y-%m-%d %H:%M', time.localtime(batch[-1]['ts']))
             range_desc = f"从 {batch_start} 到 {batch_end} 期间的对话"
             task_id = await self.store.create_task(sid, "compress", "压缩对话为长期记忆")
             try:
                 result = await self._llm_json(self.compress_prompt.replace("{range}", range_desc).replace("{content}", content), self.compress_model or "fast")
+                if result is None:
+                    # 超时或失败，记录重试次数
+                    batch_ids = [x["id"] for x in batch]
+                    await self.store.increment_attempts(batch_ids)
+                    new_attempts = max_attempts + 1
+                    await self.store.update_task(task_id, "failed", f"超时/失败，重试 {new_attempts}/{self.max_compress_retry}")
+                    logger.info("[alife_memory] 压缩超时/失败，重试 %d/%d: %d 条", new_attempts, self.max_compress_retry, len(batch_ids))
+                    pending = await self.store.pending_messages(sid, self.compression_batch)
+                    continue
                 summary = str((result or {}).get("summary", "")).strip()
                 detail = str((result or {}).get("content", "")).strip()
                 if not summary or not detail:
                     await self.store.update_task(task_id, "failed", "模型未返回有效结构化记忆")
-                    return
+                    batch_ids = [x["id"] for x in batch]
+                    await self.store.increment_attempts(batch_ids)
+                    pending = await self.store.pending_messages(sid, self.compression_batch)
+                    continue
                 importance = _num((result or {}).get("importance", 0.55), 0.55, 0.0, 1.0)
                 vector = await self._embed(summary + "\n" + detail)
                 fingerprint = hashlib.sha256((sid + "|" + "|".join(x["id"] for x in batch)).encode()).hexdigest()
@@ -511,6 +538,7 @@ class AlifeMemoryPlugin(BasePlugin):
                     source_fingerprint=fingerprint, source_refs=refs)
                 await self.store.mark_compressed([x["id"] for x in batch], archive_id)
                 await self.store.update_task(task_id, "completed", archive_id)
+                logger.debug("[alife_memory] 压缩成功: %d 条 → %s", len(batch), archive_id)
             except Exception as exc:
                 await self.store.update_task(task_id, "failed", str(exc)[:500])
                 logger.exception("[alife_memory] compression failed")
