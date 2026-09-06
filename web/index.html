@@ -93,6 +93,9 @@ const configFields=[
   ['section_basic.inject_context_marker','上下文记忆标记','switch',true],
   ['section_basic.passive_recall','被动召回','switch',true],
   ['section_basic.recall_hint_keywords','回忆提醒关键词','text','记得,回忆,以前,上次,忘记'],
+  ['section_basic.passive_recall_update_rounds','被动召回更新轮数','number',10],
+  ['section_basic.passive_recall_keyword_limit','关键词被动召回上限','number',8],
+  ['section_basic.llm_concurrency_limit','LLM并发上限','number',4],
   ['section_basic.max_injected_tokens','注入Token上限','number',1500],
   ['section_basic.max_injected_items','注入条数上限','number',8],
   ['section_basic.max_injected_chars','注入字符数上限','number',3000],
@@ -108,19 +111,26 @@ const configFields=[
   ['section_trigger.message_threshold','消息数阈值','number',50],
   ['section_compression.compress_model','压缩模型','model_select',''],
   ['section_compression.compress_probability','压缩触发概率','number',0.8],
+  ['section_compression.compress_timeout','压缩超时(秒)','number',30],
+  ['section_compression.max_compress_retry','压缩最大重试','number',2],
   ['section_compression.batch_size','每批消息数','number',10],
   ['section_compression.level_group_size','高层合并数量','number',4],
   ['section_compression.max_level','最大压缩层级','number',5],
   ['section_compression.min_chars','最小压缩字符数','number',80],
+  ['section_compression.prompt','压缩提示词','textarea',''],
   ['section_retrieval.semantic_enabled','启用语义向量','switch',true],
+  ['section_retrieval.embedding_model','向量模型','model_select',''],
+  ['section_retrieval.rerank_model','重排序模型','model_select',''],
   ['section_retrieval.search_scope','默认检索范围','select',['linked','session','global']],
   ['section_retrieval.cross_user_enabled','允许跨用户关联','switch',true],
   ['section_retrieval.top_k','默认结果数','number',5],
   ['section_retrieval.recency_half_life_days','时间衰减半衰期','number',45],
   ['section_retrieval.inject_level_max','注入最高层级','number',12],
   ['section_reflection.enabled','启用后台审校','switch',true],
-  ['section_reflection.interval_seconds','审校间隔（秒）','number',1800],
+  ['section_reflection.reflect_model','审校模型','model_select',''],
+  ['section_reflection.interval_seconds','审校间隔(秒)','number',1800],
   ['section_reflection.max_items','每次审校记忆数','number',4],
+  ['section_reflection.prompt','审校提示词','textarea',''],
 ];
 
 function getVal(path,def){
@@ -138,6 +148,7 @@ async function loadConfig(){
     if(type==='select')return `<div class="field"><label>${label}</label><select data-path="${path}">${def.map(o=>`<option value="${o}"${val===o?' selected':''}>${o}</option>`).join('')}</select></div>`;
     if(type==='model_select')return `<div class="field"><label>${label}</label><select data-path="${path}"><option value=""${!val?' selected':''}>默认</option>${__models.map(m=>`<option value="${esc(m.id)}"${val===m.id?' selected':''}>${esc(m.name)}</option>`).join('')}</select></div>`;
     if(type==='number')return `<div class="field"><label>${label}</label><input type="number" data-path="${path}" value="${esc(String(val))}"></div>`;
+    if(type==='textarea')return `<div class="field"><label>${label}</label><textarea data-path="${path}" rows="4">${esc(String(val))}</textarea></div>`;
     return `<div class="field"><label>${label}</label><input data-path="${path}" value="${esc(String(val))}"></div>`;
   }).join('');
 }

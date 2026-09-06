@@ -634,7 +634,7 @@ class AlifeMemoryPlugin(BasePlugin):
         evidence = "\n".join(f"[{x['role']}] {x['content']}" for x in recent)
         for memory in memories:
             prompt = self.reflect_prompt.replace("{memory}", memory["summary"] + "\n" + memory["content"]).replace("{evidence}", evidence)
-            result = await self._llm_json(prompt, self.reflect_model or self.compress_model)
+            result = await self._llm_json(prompt, self.reflect_model)
             if not result or str(result.get("action", "none")) == "none":
                 continue
             confidence = _num(result.get("confidence", 0), 0, 0, 1)
