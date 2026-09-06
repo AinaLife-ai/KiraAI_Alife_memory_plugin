@@ -1,6 +1,7 @@
-# Alife Memory for KiraAI
+# Alife Memory Z for KiraAI
 
-长期记忆插件，让机器人记得住、找得准、能自己反思纠错。
+长期记忆插件·Z 版，让机器人记得住、找得准、能自己反思纠错。  
+**所有配置均可侧边栏 WebUI 设置和管理**，无需手动编辑配置文件。
 
 > 灵感源于 [Alife](https://github.com/BDFFZI/Alife) 4.2.3 的分层记忆设计。
 > 感谢作者半点星光（BDFFZI）的精彩设计，让本项目有了坚实的起点。

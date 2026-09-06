@@ -535,6 +535,36 @@ class MemoryStore:
         finally:
             conn.close()
 
+    async def pending_messages_all(self) -> dict:
+        return await asyncio.to_thread(self._pending_messages_all)
+
+    def _pending_messages_all(self):
+        """Return aggregate {message_count, token_sum, round_count} across all sessions."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS msg_count, COALESCE(SUM(token_est), 0) AS token_sum, "
+                "COUNT(DISTINCT turn_key) AS round_count FROM messages WHERE compressed=0"
+            ).fetchone()
+            return {"message_count": row["msg_count"], "token_sum": row["token_sum"],
+                    "round_count": max(0, row["round_count"])}
+        finally:
+            conn.close()
+
+    async def count_memories_by_user
+        """Return {message_count, token_sum, round_count} for pending messages."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS msg_count, COALESCE(SUM(token_est), 0) AS token_sum, "
+                "COUNT(DISTINCT turn_key) AS round_count FROM messages WHERE sid=? AND compressed=0",
+                (sid,)
+            ).fetchone()
+            return {"message_count": row["msg_count"], "token_sum": row["token_sum"],
+                    "round_count": max(0, row["round_count"])}
+        finally:
+            conn.close()
+
     async def count_memories_by_user(self, user_id: str, limit: int = 20) -> list[dict]:
         return await asyncio.to_thread(self._count_memories_by_user, user_id, limit)
 
