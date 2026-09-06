@@ -118,7 +118,7 @@
 ### 三重触发压缩
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| 触发模式 | either | rounds/tokens/messages/either |
+| 触发模式 | rounds | rounds/tokens/messages/either |
 | 轮数阈值 | 10 | 满多少轮触发压缩 |
 | Token 阈值 | 10000 | 满多少 Token 触发 |
 | 消息数阈值 | 50 | 满多少条消息触发 |
@@ -161,7 +161,7 @@
 | 冲突插件 | 行为 |
 |---|---|
 | `kira_plugin_simple_memory`（KiraAI 内置简单记忆） | 自动禁用，迁移数据 |
-| `kira_plugin_kiraos`（KiraOS 海马体记忆） | 自动禁用，迁移数据 |
+| `kira_plugin_kiraos`（KiraOS / 海马体记忆） | 自动禁用，迁移数据 |
 
 原插件数据库和文件**不删除**，可手动恢复。
 
@@ -170,7 +170,6 @@
 ## 致谢
 
 - [Alife](https://github.com/BDFFZI/Alife) — C#/.NET 赛博生命框架，本项目的分层记忆设计深受其 MemoryService 启发
-- [KiraOS / 海马体记忆插件](https://github.com/LyaQanYi/KiraOS_Plugin) — 作者 [半点星光](https://github.com/LyaQanYi)，感谢其双脑记忆和 FTS5 设计思路的启发
 - [KiraAI](https://github.com/znq19/KiraAI) — 本项目运行的基础平台
 
 ---
