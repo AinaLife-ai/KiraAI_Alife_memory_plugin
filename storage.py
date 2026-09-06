@@ -502,7 +502,14 @@ class MemoryStore:
                         seen_ids.add(r["id"])
                         fts_bm25[r["id"]] = float(r["bm25_score"] or 0.0)
             # LIKE 兜底：分词后的 token 做子串匹配，捕获 FTS 未命中的词（含生僻、未登录词）
-            like_terms_all = [f"%{term}%" for term in terms[:8]]
+            # LIKE 兜底：分词后的 token 做子串匹配，并补充中文单字（jieba 吞进相邻词的
+            # 单字关键词如书名"飘"也能兜底命中），捕获 FTS 未命中的词。
+            like_terms = list(dict.fromkeys(terms[:8]))  # 分词 token 去重
+            # 补充每个中文字符（去重，过滤纯空白），覆盖单字书名/人名等
+            for ch in str(query):
+                if ch.strip() and ('\u4e00' <= ch <= '\u9fff'):
+                    like_terms.append(ch)
+            like_terms_all = [f"%{term}%" for term in like_terms[:12]]
             if like_terms_all:
                 like_sql = " OR ".join("(m.summary LIKE ? OR m.content LIKE ?)" for _ in like_terms_all)
                 like_rows = conn.execute(
