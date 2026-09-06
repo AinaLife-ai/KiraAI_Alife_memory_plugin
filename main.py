@@ -114,6 +114,7 @@ class AlifeMemoryPlugin(BasePlugin):
         self.max_injected_chars = _num(basic.get("max_injected_chars", 3000), 3000, 200, 20000, True)
         self.passive_recall_boost_threshold = _num(basic.get("passive_recall_boost_threshold", 0.4), 0.4, 0.0, 1.0)
 
+        self.default_fast_model = str(basic.get("default_fast_model", "") or "").strip()
         self.compress_model = str(compression.get("compress_model", "") or "").strip()
         self.reflect_model = str(reflection.get("reflect_model", "") or "").strip()
         self.compression_batch = _num(compression.get("batch_size", 10), 10, 2, 80, True)
@@ -451,7 +452,7 @@ class AlifeMemoryPlugin(BasePlugin):
             range_desc = f"从 {batch_start} 到 {batch_end} 期间的对话"
             task_id = await self.store.create_task(sid, "compress", "压缩对话为长期记忆")
             try:
-                result = await self._llm_json(self.compress_prompt.replace("{range}", range_desc).replace("{content}", content), self.compress_model)
+                result = await self._llm_json(self.compress_prompt.replace("{range}", range_desc).replace("{content}", content), self.compress_model or self.default_fast_model)
                 summary = str((result or {}).get("summary", "")).strip()
                 detail = str((result or {}).get("content", "")).strip()
                 if not summary or not detail:
@@ -997,47 +998,5 @@ class AlifeMemoryPlugin(BasePlugin):
                 self.cfg[key].update(value)
             else:
                 self.cfg[key] = value
-        self._load_settings()
-        self._config_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._config_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self._config_path)
-        return {"ok": True, "config": self.cfg}
-
-    @register.api(method="GET", path="/config", auth=True, summary="Get memory config")
-    async def api_get_config(self):
-        return self.cfg
-
-    @register.api(method="POST", path="/cleanup", auth=True, summary="Trigger cleanup")
-    async def api_cleanup(self):
-        result = await self.store.cleanup(self.message_retention_days, self.stale_retention_days)
-        if self.auto_archive_days > 0:
-            arch = await self.store.archive_inactive(self.auto_archive_days, self.archive_level_min)
-            result["archived"] = arch
-        return result
-
-    @register.api(method="GET", path="/models", auth=True, summary="Available models")
-    async def api_models(self):
-        import json, subprocess
-        try:
-            r = subprocess.run(["minis-model-use", "list"], capture_output=True, text=True, timeout=10)
-            data = json.loads(r.stdout)
-            models = [{"id": m["model_id"], "name": m.get("display_name", m["model_id"])} for m in data.get("models", [])]
-            return {"models": models}
-        except Exception as exc:
-            return {"models": [], "error": str(exc)}
-    async def api_pending(self, sid: str = ""):
-        if sid:
-            return await self.store.pending_stats(sid)
-        all_sids = set()
-        for item in await self.store.list_memories(None, 100):
-            all_sids.add(item["sid"])
-        if not all_sids:
-            return {"message_count": 0, "token_sum": 0, "round_count": 0}
-        total = {"message_count": 0, "token_sum": 0, "round_count": 0}
-        for s in all_sids:
-            stats = await self.store.pending_stats(s)
-            total["message_count"] += stats["message_count"]
-            total["token_sum"] += stats["token_sum"]
-            total["round_count"] += stats["round_count"]
-        return total
+        return {"ok": True}
+          

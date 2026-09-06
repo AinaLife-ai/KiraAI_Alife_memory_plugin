@@ -18,7 +18,8 @@
       "max_injected_lines": {"type": "integer", "name": "注入行数上限", "default": 30, "minimum": 5, "maximum": 100, "hint": "双截断：行数+Token+字符三重保险，任一项超限即截断。", "locales": {"zh": {"name": "注入行数上限", "hint": "行数+Token+字符三重保险，任一项超限即截断。"}}},
       "passive_recall_boost_threshold": {"type": "float", "name": "被动召回最低分阈值", "default": 0.4, "minimum": 0.0, "maximum": 1.0, "hint": "主检索结果最高分低于此值时自动以关键词做宽召回补充。", "locales": {"zh": {"name": "被动召回最低分阈值", "hint": "主检索结果最高分低于此值时自动以关键词做宽召回补充。"}}},
       "auto_archive_days": {"type": "integer", "name": "自动归档天数（0=关闭）", "default": 0, "minimum": 0, "maximum": 3650, "hint": "超过此天数未被触碰的 active 记忆自动归档。归档后仍可通过检索找到，0 为关闭。", "locales": {"zh": {"name": "自动归档天数（0=关闭）", "hint": "超过此天数未被触碰的 active 记忆自动归档。0 为关闭。"}}},
-      "archive_level_min": {"type": "integer", "name": "归档影响最低层级", "default": 5, "minimum": 1, "maximum": 12, "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级（max_level），最高层受保护。", "locales": {"zh": {"name": "归档影响最低层级", "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级。"}}}
+      "archive_level_min": {"type": "integer", "name": "归档影响最低层级", "default": 5, "minimum": 1, "maximum": 12, "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级（max_level），最高层受保护。", "locales": {"zh": {"name": "归档影响最低层级", "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级。"}}},
+      "default_fast_model": {"type": "model_select", "name": "默认快速模型（压缩用）", "model_type": "llm", "default": "", "hint": "压缩模型留空时使用的快速模型。建议选便宜模型如 deepseek-chat 或 gemini-flash。留空则跟随 bot 默认模型。", "locales": {"zh": {"name": "默认快速模型（压缩用）", "hint": "压缩模型留空时使用的快速模型。建议选便宜模型。留空则跟随 bot 默认模型。"}}}
     }
   },
   "section_trigger": {
@@ -41,7 +42,7 @@
     "name": "压缩与分层",
     "collapsed": false,
     "fields": {
-      "compress_model": {"type": "model_select", "name": "压缩模型", "model_type": "llm", "default": "", "hint": "可单独选择便宜快速模型；留空跟随默认模型。", "locales": {"zh": {"name": "压缩模型", "hint": "可单独选择便宜快速模型；留空跟随默认模型。"}}},
+      "compress_model": {"type": "model_select", "name": "压缩模型", "model_type": "llm", "default": "", "hint": "压缩用模型。留空使用默认快速模型(default_fast_model)；再次留空则跟随 bot 默认模型。", "locales": {"zh": {"name": "压缩模型", "hint": "压缩用模型。留空使用默认快速模型；再次留空则跟随 bot 默认模型。"}}},
       "compress_probability": {"type": "float", "name": "压缩触发概率", "default": 0.8, "minimum": 0.0, "maximum": 1.0, "hint": "概率扰动，避免每次触发都压缩而影响互动感。1.0 为必触发。", "locales": {"zh": {"name": "压缩触发概率", "hint": "概率扰动，避免每次触发都压缩而影响互动感。1.0 为必触发。"}}},
       "batch_size": {"type": "integer", "name": "每批消息数", "default": 10, "minimum": 2, "maximum": 80, "hint": "每次压缩取多少条原始消息给模型。", "locales": {"zh": {"name": "每批消息数", "hint": "每次压缩取多少条原始消息给模型。"}}},
       "level_group_size": {"type": "integer", "name": "高层合并数量", "default": 4, "minimum": 2, "maximum": 12, "hint": "同层摘要达到多少条时合并为更高层。", "locales": {"zh": {"name": "高层合并数量", "hint": "同层摘要达到多少条时合并为更高层。"}}},
@@ -69,7 +70,7 @@
     "collapsed": false,
     "fields": {
       "enabled": {"type": "switch", "name": "启用后台记忆审校", "default": true, "hint": "低频比较新证据与旧记忆，只有高置信度冲突才改动。", "locales": {"zh": {"name": "启用后台记忆审校", "hint": "低频比较新证据与旧记忆，只有高置信度冲突才改动。"}}},
-      "reflect_model": {"type": "model_select", "name": "审校模型", "model_type": "llm", "default": "", "hint": "可选用更强模型；留空使用压缩模型或默认模型。", "locales": {"zh": {"name": "审校模型", "hint": "可选用更强模型；留空使用压缩模型或默认模型。"}}},
+      "reflect_model": {"type": "model_select", "name": "审校模型", "model_type": "llm", "default": "", "hint": "可选用更强模型；留空跟随默认模型。", "locales": {"zh": {"name": "审校模型", "hint": "可选用更强模型；留空跟随默认模型。"}}},
       "interval_seconds": {"type": "integer", "name": "审校间隔（秒）", "default": 1800, "minimum": 300, "maximum": 86400, "hint": "低频运行，避免后台持续消耗。", "locales": {"zh": {"name": "审校间隔（秒）", "hint": "低频运行，避免后台持续消耗。"}}},
       "max_items": {"type": "integer", "name": "每次审校记忆数", "default": 4, "minimum": 1, "maximum": 20, "hint": "每个会话最多检查最近的高价值记忆。", "locales": {"zh": {"name": "每次审校记忆数", "hint": "每个会话最多检查最近的高价值记忆。"}}},
       "prompt": {"type": "markdown", "name": "审校提示词", "default": "", "hint": "必须输出 JSON，支持 {memory} 和 {evidence} 占位符。", "locales": {"zh": {"name": "审校提示词", "hint": "必须输出 JSON，支持 {memory} 和 {evidence} 占位符。"}}}
