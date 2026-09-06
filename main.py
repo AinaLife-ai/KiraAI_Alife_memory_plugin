@@ -95,11 +95,12 @@ class AlifeMemoryPlugin(BasePlugin):
         self._reflect_task: asyncio.Task | None = None
         self._cleanup_task: asyncio.Task | None = None
         self._closed = False
-        self._seen_user_ids: set[str] = set()
+        self._seen_recall: dict[str, set[str]] = {}  # sid → 该会话已召回过记忆的用户集合（per-session 去重）
         self._recall_round_counter: dict[str, int] = {}
         # rerank 探测缓存：首次调用时探测一次，没配置就记住不再每次尝试，插件重载/热更新时重置
         self._rerank_checked = False
         self._rerank_client = None
+        self._ctx_injected_ids: set[str] = set()  # context marker 已注入的记忆 id，避免 _inject 重复注入
         self._load_settings()
         self._llm_semaphore = asyncio.Semaphore(max(1, self.llm_concurrency_limit))
         # 数据目录迁移：旧 alife_memory → alife_memory_z
@@ -744,6 +745,8 @@ class AlifeMemoryPlugin(BasePlugin):
         user_id = user_id or _event_user_id(getattr(req, "messages", [])[-1] if getattr(req, "messages", []) else None)
         all_results: list[dict] = []
         seen_ids: set[str] = set()
+        # context marker 已注入的记忆不再重复注入，避免上下文冗余
+        seen_ids.update(getattr(self, "_ctx_injected_ids", ()) or ())
         scope = self.search_scope if self.cross_user_enabled else ("user" if user_id else "session")
         query_embed = await self._embed(str(query))
 
@@ -759,71 +762,63 @@ class AlifeMemoryPlugin(BasePlugin):
                 best_score = max(best_score, r.get("score", 0.0))
         logger.debug("[alife_memory] 主注入: query='%s' → %d 条, 最高分 %.2f", query[:40], len(content_results), best_score)
 
-        # 2) 关键词被动召回（每轮都做，提取关键词补新记忆）
+        # 2) 关键词被动召回池：把关键词召回 / 被动更新 / 宽召回统一收集 term，
+        #    一次并发 embed + 一次并发 search 全部完成，避免重复调用。
         if self.passive_recall and self.passive_recall_keyword_limit > 0:
-            keywords = re.split(r'[，。！？、：；\s,;:?()（）\n\t]+', str(query)[:200])
-            keywords = [k.strip() for k in keywords if len(k.strip()) >= 2 and not k.strip().isdigit()][:6]
-            # 并发一次嵌入所有关键词，避免每词串行等待 embedding API
-            kw_embeds = await self._embed_batch(keywords)
-            kw_added = 0
-            for keyword in keywords:
-                if kw_added >= self.passive_recall_keyword_limit:
-                    break
-                kw_results = await self.store.search(sid, keyword, 3,
-                    list(range(self.inject_level_max + 1)), kw_embeds.get(keyword),
-                    self.half_life, "linked", user_id)
-                for r in kw_results:
-                    if r["id"] not in seen_ids and r.get("status", "active") == "active":
-                        r["score"] = r.get("score", 0.0) * 0.4
-                        all_results.append(r)
-                        seen_ids.add(r["id"])
-                        kw_added += 1
-            if kw_added:
-                logger.debug("[alife_memory] 关键词被动召回: %d 关键词 → +%d 条", len(keywords), kw_added)
+            # 收集本轮需要检索的关键词（去重）
+            recall_terms: list[tuple[str, float]] = []  # (term, weight)
+            seen_terms: set[str] = set()
+            # 基础关键词（每轮）
+            for kw in re.split(r'[，。！？、：；\s,;:?()（）\n\t]+', str(query)[:200]):
+                kw = kw.strip()
+                if len(kw) >= 2 and not kw.isdigit() and kw not in seen_terms:
+                    seen_terms.add(kw)
+                    recall_terms.append((kw, 0.4))
+            # 被动更新（每 N 轮）：权重更高，补充新记忆
+            if do_passive_update:
+                for t in re.split(r'[，。！？、：；\s,;:?()（）\n\t]+', str(query)[:120]):
+                    t = t.strip()
+                    if len(t) >= 2 and t not in seen_terms:
+                        seen_terms.add(t)
+                        recall_terms.append((t, 0.5))
+            # 宽召回（弱结果时）：降低权重，扩大召回面
+            if best_score < self.passive_recall_boost_threshold and best_score > 0:
+                for t in re.split(r'[，。！？、\s,;:?]+', str(query)[:80]):
+                    t = t.strip()
+                    if len(t) >= 2 and t not in seen_terms:
+                        seen_terms.add(t)
+                        recall_terms.append((t, 0.85))
+            recall_terms = recall_terms[:self.passive_recall_keyword_limit * 2]
+            if recall_terms:
+                # 一次并发 embed 所有 term
+                terms = [t for t, _ in recall_terms]
+                embeds = await self._embed_batch(terms)
+                # 一次并发 search 所有 term
+                search_tasks = [
+                    self.store.search(sid, term, 3, list(range(self.inject_level_max + 1)),
+                        embeds.get(term), self.half_life, "linked", user_id)
+                    for term in terms
+                ]
+                search_results = await asyncio.gather(*search_tasks)
+                for (term, weight), results in zip(recall_terms, search_results):
+                    for r in results:
+                        if r["id"] not in seen_ids and r.get("status", "active") == "active":
+                            r["score"] = r.get("score", 0.0) * weight
+                            all_results.append(r)
+                            seen_ids.add(r["id"])
+                logger.debug("[alife_memory] 关键词召回池: %d 词 → +%d 条", len(recall_terms), len(seen_ids))
 
-        # 3) 首次见到用户召回
+        # 3) 首次见到用户召回（per-session：仅当该会话还没召回过这个用户的记忆）
         if self.passive_recall and recall_user_ids:
-            for uid in recall_user_ids:
-                if uid and uid == user_id:
-                    continue
-                for r in await self.store.count_memories_by_user(uid, 5):
+            new_uids = [u for u in recall_user_ids if u and u != user_id]
+            if new_uids:
+                # 一次批量查询所有新用户的跨会话历史记忆，避免逐用户串行 SQL
+                for r in await self.store.count_memories_by_users(new_uids, 5):
                     if r["id"] not in seen_ids and r.get("status", "active") == "active":
                         r["score"] = 0.3
                         all_results.append(r)
                         seen_ids.add(r["id"])
-                logger.debug("[alife_memory] 被动召回: 新用户 %s", uid)
-
-        # 4) 更新轮数已到时全量刷新
-        if self.passive_recall and do_passive_update:
-            refresh_terms = re.split(r'[，。！？、：；\s,;:?()（）\n\t]+', str(query)[:120])
-            refresh_terms = [t.strip() for t in refresh_terms if len(t.strip()) >= 2][:6]
-            refresh_embeds = await self._embed_batch(refresh_terms)
-            added = 0
-            for term in refresh_terms:
-                if added >= self.passive_recall_keyword_limit:
-                    break
-                tr = await self.store.search(sid, term, 3, list(range(self.inject_level_max + 1)),
-                    refresh_embeds.get(term), self.half_life, "linked", user_id)
-                for r in tr:
-                    if r["id"] not in seen_ids and r.get("status", "active") == "active":
-                        r["score"] = r.get("score", 0.0) * 0.5
-                        all_results.append(r)
-                        seen_ids.add(r["id"])
-                        added += 1
-            logger.debug("[alife_memory] 被动召回更新: 补充 %d 条", added)
-
-        # 5) 弱结果宽召回
-        if self.passive_recall and best_score < self.passive_recall_boost_threshold and best_score > 0:
-            terms = [t.strip() for t in re.split(r'[，。！？、\s,;:?]+', str(query)[:80]) if len(t.strip()) >= 2][:5]
-            wide_embeds = await self._embed_batch(terms)
-            for term in terms:
-                wide = await self.store.search(sid, term, 3, list(range(self.inject_level_max + 1)),
-                    wide_embeds.get(term), self.half_life, "linked", user_id)
-                for r in wide:
-                    if r["id"] not in seen_ids and r.get("status", "active") == "active":
-                        r["score"] = r.get("score", 0.0) * 0.85
-                        all_results.append(r)
-                        seen_ids.add(r["id"])
+                logger.debug("[alife_memory] 被动召回: %d 个新用户 → 补 %d 条跨会话记忆", len(new_uids), len(seen_ids))
 
         if not all_results:
             return
@@ -868,16 +863,6 @@ class AlifeMemoryPlugin(BasePlugin):
 
 
     async def _inject_context_marker(self, req: LLMRequest, sid: str):
-        block = ("一些关于过去的事情，供你参考。如果新了解到的情况和下面不一致，以最新的为准：\n"
-                 + "\n".join(lines)
-                 + "\n"
-                 + '（提醒：记录代码行号、文件路径、git 历史这些会过时的信息没有意义，'
-                   '它们应该通过查代码或日志来确认。'
-                   '如果对方跟你聊起过去的事，自然地用这些记忆回应就好，不必刻意提起\u201c我记得你说过\u201d。）')
-        system_msg = OpenAIMessage(role="system", content=block)
-        req.messages.insert(0, system_msg)
-
-    async def _inject_context_marker(self, req: LLMRequest, sid: str):
         """P0: 在上下文中保留最高层记忆标记，让 AI 感知自己有关联的记忆"""
         if not self.inject_context_marker or not sid:
             return
@@ -887,10 +872,12 @@ class AlifeMemoryPlugin(BasePlugin):
         if not top:
             return
         lines = []
+        self._ctx_injected_ids.clear()  # 每次重新记录本轮回注入的 id
         for item in top:
             source = f"来源:{item.get('sid', 'unknown')} / 时间:{time.strftime('%Y-%m-%d', time.localtime(item['end_ts']))}"
             text = f"[{item['summary']}]（{source}）"
             lines.append(f"- {text}")
+            self._ctx_injected_ids.add(item["id"])
         if not lines:
             return
         block = ("你过去经历过的一些事：\n"
@@ -943,10 +930,14 @@ class AlifeMemoryPlugin(BasePlugin):
             recall_user_ids = []
             for msg in messages:
                 uid = _event_user_id(msg)
-                if uid and uid not in self._seen_user_ids:
-                    self._seen_user_ids.add(uid)
-                    recall_user_ids.append(uid)
-                    logger.debug("[alife_memory] 首次见到用户 %s，准备被动召回其记忆", uid)
+                # per-session 去重：同一会话某用户只在首次出现时召回一次，
+                # 换新会话（新 sid）则重新召回——只要该会话上下文还没它的记忆
+                if uid:
+                    sid_seen = self._seen_recall.setdefault(sid, set())
+                    if uid not in sid_seen:
+                        sid_seen.add(uid)
+                        recall_user_ids.append(uid)
+                        logger.debug("[alife_memory] 会话 %s 首次见到用户 %s，准备被动召回其记忆", sid, uid)
         else:
             do_passive_update = False
             recall_user_ids = []

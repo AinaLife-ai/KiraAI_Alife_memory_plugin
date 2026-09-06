@@ -102,7 +102,7 @@ class MemoryStore:
                     ON memories(sid, level, end_ts DESC);
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                     summary, content, sid UNINDEXED, level UNINDEXED,
-                    memory_id UNINDEXED
+                    memory_id UNINDEXED, tokenize='trigram'
                 );
                 CREATE TABLE IF NOT EXISTS tasks (
                     id TEXT PRIMARY KEY,
@@ -137,6 +137,34 @@ class MemoryStore:
                 if name not in columns:
                     conn.execute(statement)
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_source_fingerprint ON memories(source_fingerprint) WHERE source_fingerprint <> ''")
+            # FTS 中文检索迁移：检测旧表未用 trigram tokenizer，重建为 trigram（支持中文子串匹配）
+            try:
+                fts_sql_row = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories_fts'"
+                ).fetchone()
+                if fts_sql_row and "trigram" not in (fts_sql_row[0] or "").lower():
+                    logger = __import__("logging").getLogger("alife_memory_storage")
+                    logger.info("[alife_memory_storage] 检测到旧版 FTS（无 trigram），重建 memories_fts 以支持中文检索")
+                    # 复制旧数据到临时表
+                    conn.execute("""
+                        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts_old USING fts5(
+                            summary, content, sid UNINDEXED, level UNINDEXED, memory_id UNINDEXED
+                        )
+                    """)
+                    conn.execute("INSERT INTO memories_fts_old(summary,content,sid,level,memory_id) "
+                                 "SELECT summary,content,sid,level,memory_id FROM memories_fts")
+                    conn.execute("DROP TABLE memories_fts")
+                    conn.execute("""
+                        CREATE VIRTUAL TABLE memories_fts USING fts5(
+                            summary, content, sid UNINDEXED, level UNINDEXED,
+                            memory_id UNINDEXED, tokenize='trigram'
+                        )
+                    """)
+                    conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) "
+                                 "SELECT summary,content,sid,level,memory_id FROM memories_fts_old")
+                    conn.execute("DROP TABLE memories_fts_old")
+            except Exception:
+                pass
             conn.commit()
         finally:
             conn.close()
@@ -334,7 +362,6 @@ class MemoryStore:
         conn = self._connect()
         try:
             terms = tokenize(query)
-            match = " OR ".join('"' + t.replace('"', ' ') + '"' for t in terms[:12])
             level_sql = "" if not levels else " AND m.level IN (%s)" % ",".join("?" * len(levels))
             if scope in ("global", "linked"):
                 owner_sql, owner_params = "1=1", []
@@ -342,24 +369,40 @@ class MemoryStore:
                 owner_sql, owner_params = "m.user_id=?", [str(user_id)]
             else:
                 owner_sql, owner_params = "m.sid=?", [sid]
-            if match:
-                rows = conn.execute(
+            rows = []
+            seen_ids: set[str] = set()
+            # trigram tokenizer 需要 ≥3 字符才能建 token；对 <3 字符的词用 LIKE 兜底
+            fts_terms = [t for t in terms[:12] if len(t) >= 3]
+            short_terms = [t for t in terms[:12] if 0 < len(t) < 3]
+            like_terms_all = [f"%{term}%" for term in terms[:8]]
+            if fts_terms:
+                fts_match = " OR ".join('"' + t.replace('"', ' ') + '"' for t in fts_terms)
+                fts_rows = conn.execute(
                     f"""SELECT m.*, bm25(memories_fts) AS bm25_score
                         FROM memories_fts f JOIN memories m ON m.id=f.memory_id
                         WHERE {owner_sql} AND memories_fts MATCH ? AND m.deleted=0 AND m.status IN ('active','archived') {level_sql}
-                        ORDER BY bm25_score LIMIT 80""", [*owner_params, match, *([] if not levels else levels)]
+                        ORDER BY bm25_score LIMIT 80""",
+                    [*owner_params, fts_match, *([] if not levels else levels)]
                 ).fetchall()
-                if not rows:
-                    like_terms = [f"%{term}%" for term in terms[:8]]
-                    like_sql = " OR ".join("(m.summary LIKE ? OR m.content LIKE ?)" for _ in like_terms)
-                    rows = conn.execute(
-                        f"""SELECT m.*, 0.0 AS bm25_score FROM memories m
-                            WHERE {owner_sql} AND m.deleted=0 AND m.status IN ('active','archived')
-                              AND ({like_sql}) {level_sql}
-                            ORDER BY m.importance DESC, m.end_ts DESC LIMIT 80""",
-                        [*owner_params, *sum(([x, x] for x in like_terms), []), *([] if not levels else levels)]
-                    ).fetchall()
-            else:
+                for r in fts_rows:
+                    if r["id"] not in seen_ids:
+                        rows.append(r)
+                        seen_ids.add(r["id"])
+            # LIKE 兜底：短词（<3，trigram 不建 token）+ 中文整句（FTS 无法匹配子串）都会被这里捕获
+            if like_terms_all:
+                like_sql = " OR ".join("(m.summary LIKE ? OR m.content LIKE ?)" for _ in like_terms_all)
+                like_rows = conn.execute(
+                    f"""SELECT m.*, 0.0 AS bm25_score FROM memories m
+                        WHERE {owner_sql} AND m.deleted=0 AND m.status IN ('active','archived')
+                          AND ({like_sql}) {level_sql}
+                        ORDER BY m.importance DESC, m.end_ts DESC LIMIT 80""",
+                    [*owner_params, *sum(([x, x] for x in like_terms_all), []), *([] if not levels else levels)]
+                ).fetchall()
+                for r in like_rows:
+                    if r["id"] not in seen_ids:
+                        rows.append(r)
+                        seen_ids.add(r["id"])
+            if not rows:
                 rows = conn.execute(
                     f"""SELECT m.*, 0.0 AS bm25_score FROM memories m
                         WHERE {owner_sql} AND m.deleted=0 AND m.status='active' {level_sql}
@@ -369,7 +412,9 @@ class MemoryStore:
             scored = []
             for row in rows:
                 item = dict(row)
-                lex = 1.0 / (1.0 + max(0.0, float(item.get("bm25_score") or 0.0)))
+                lex = abs(float(item.get("bm25_score") or 0.0))
+                # FTS5 bm25 负值越小越相关，归一化到 [0,1]：相关→趋近1，不相关→趋近0
+                lex = lex / (1.0 + lex)
                 semantic = cosine(query_embedding, json.loads(item["embedding"])) if query_embedding and item.get("embedding") else 0.0
                 age_days = max(0.0, (now - float(item["end_ts"])) / 86400.0)
                 decay = 0.5 ** (age_days / max(1.0, half_life))
@@ -576,15 +621,20 @@ class MemoryStore:
         finally:
             conn.close()
 
-    async def count_memories_by_user(self, user_id: str, limit: int = 20) -> list[dict]:
-        return await asyncio.to_thread(self._count_memories_by_user, user_id, limit)
+    async def count_memories_by_users(self, user_ids: list[str], limit: int = 20) -> list[dict]:
+        """批量查询多个用户的跨会话记忆，一次 SQL 代替逐个查询。"""
+        return await asyncio.to_thread(self._count_memories_by_users, user_ids, limit)
 
-    def _count_memories_by_user(self, user_id, limit):
+    def _count_memories_by_users(self, user_ids, limit):
+        if not user_ids:
+            return []
         conn = self._connect()
         try:
+            placeholders = ",".join("?" * len(user_ids))
             rows = conn.execute(
-                "SELECT * FROM memories WHERE user_id=? AND deleted=0 AND status='active' ORDER BY end_ts DESC LIMIT ?",
-                (user_id, limit)
+                f"SELECT * FROM memories WHERE user_id IN ({placeholders}) AND deleted=0 AND status='active' "
+                "ORDER BY end_ts DESC LIMIT ?",
+                [*user_ids, limit * len(user_ids)]
             ).fetchall()
             result = []
             for row in rows:
