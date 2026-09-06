@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Alife Memory</title>
+<style>
+:root{--ink:#282238;--muted:#827b96;--pink:#ee6d9b;--violet:#7568e8;--cyan:#5ccfd1;--paper:#fffaff;--line:#eadff0;--shadow:0 14px 34px #49326816}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#fff8fb,#f4f3ff 58%,#effbfa);color:var(--ink);font:14px/1.55 ui-sans-serif,system-ui,"Noto Sans SC",sans-serif}.shell{display:grid;grid-template-columns:230px 1fr;min-height:100vh}.side{padding:24px 16px;background:#ffffffc9;border-right:1px solid var(--line);backdrop-filter:blur(18px)}.brand{display:flex;gap:11px;align-items:center;margin:0 8px 28px;font-weight:800;font-size:17px}.brand em{display:grid;place-items:center;width:38px;height:38px;border-radius:14px;background:linear-gradient(135deg,var(--pink),var(--violet));color:white;font-style:normal;box-shadow:0 7px 18px #d96b9b4d}.nav button{display:block;width:100%;border:0;border-radius:12px;background:transparent;color:var(--muted);text-align:left;padding:12px;margin:4px 0;cursor:pointer;font:inherit}.nav button.active,.nav button:hover{background:#f5edff;color:var(--violet);font-weight:700}.tiny{position:fixed;bottom:18px;margin-left:8px;color:#aaa2b2;font-size:11px}.main{padding:28px clamp(18px,4vw,48px);max-width:1200px;width:100%}.top{display:flex;align-items:end;justify-content:space-between;margin-bottom:24px;flex-wrap:wrap;gap:12px}.eyebrow{color:var(--pink);font-size:12px;font-weight:800;letter-spacing:0}.top h1{margin:4px 0 0;font-size:27px}.top p{margin:4px 0;color:var(--muted)}.btn{border:0;border-radius:11px;padding:10px 16px;background:var(--violet);color:white;font-weight:700;cursor:pointer;box-shadow:0 7px 14px #7568e833}.btn.sm{border-radius:8px;padding:6px 11px;font-size:12px;box-shadow:none}.btn.alt{background:#fff;color:var(--violet);border:1px solid #ddd4f2;box-shadow:none}.btn.danger{background:var(--pink);box-shadow:0 7px 14px #ee6d9b44}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.panel,.stat,.card{background:#ffffffe8;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow)}.stat{padding:17px}.stat small{color:var(--muted)}.stat strong{display:block;font-size:25px;margin-top:5px}.panel{padding:20px;margin-top:16px}.panel h2{font-size:16px;margin:0 0 15px}.card{display:flex;align-items:center;gap:12px;padding:12px 14px;margin:8px 0}.card p{flex:1;margin:0}.card .meta{color:var(--muted);font-size:11px;min-width:120px}.toolbar{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:12px}.input{border:1px solid var(--line);border-radius:10px;padding:9px 12px;background:#fff;color:var(--ink);font:inherit;min-width:180px;flex:1}.input.sm{min-width:80px;padding:6px 9px;font-size:12px;flex:0}.tag{display:inline-block;border-radius:7px;background:#f7ecff;color:#8067c8;padding:2px 7px;margin-left:5px;font-size:12px}.hide{display:none}.fields{display:grid;grid-template-columns:1fr 1fr;gap:14px}.field label{display:block;color:var(--muted);font-size:12px;margin-bottom:4px;font-weight:600}.field input,.field select{width:100%;border:1px solid var(--line);border-radius:9px;padding:9px;background:white;color:var(--ink);font:inherit}.field textarea{width:100%;border:1px solid var(--line);border-radius:9px;padding:9px;background:white;color:var(--ink);font:inherit;min-height:80px;resize:vertical}.row{display:flex;align-items:center;gap:12px;margin:8px 0}.switch{accent-color:var(--violet);width:18px;height:18px}.empty{text-align:center;color:var(--muted);padding:32px}.toast{position:fixed;right:22px;bottom:22px;background:#302641;color:white;padding:11px 16px;border-radius:10px;display:none;z-index:99}.modal{position:fixed;inset:0;background:#00000055;display:flex;align-items:center;justify-content:center;z-index:100}.modal-inner{background:white;border-radius:14px;padding:24px;max-width:520px;width:90%;max-height:80vh;overflow:auto}.modal-inner h3{margin:0 0 12px}.modal-inner .field{margin:10px 0}.modal-inner .btn{margin:18px 0 0}.memory-item{padding:14px 0;border-bottom:1px solid #f0e9f3}.memory-item:last-child{border-bottom:0}.memory-item h3{font-size:14px;margin:0 0 4px;display:flex;align-items:center;gap:9px;flex-wrap:wrap}.memory-item .content{color:#625a73;margin:4px 0;white-space:pre-wrap;word-break:break-all}.memory-item .actions{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}.task-item{padding:10px 0;border-bottom:1px solid #f0e9f3;display:flex;justify-content:space-between;align-items:center;gap:12px}.task-item .status{display:inline-block;border-radius:7px;padding:2px 7px;font-size:11px;font-weight:700}.pending{background:#fff3d6;color:#b8860b}.running{background:#d4e9ff;color:#2a6dc4}.completed{background:#d4f5d4;color:#238b23}.failed{background:#ffe0e0;color:#c0392b}.memory-detail p{margin:4px 0}.memory-detail .label{color:var(--muted);font-size:12px;font-weight:600}.memory-detail .value{color:var(--ink);margin:2px 0 10px;white-space:pre-wrap;word-break:break-all}@media(max-width:760px){.shell{grid-template-columns:1fr}.side{position:sticky;top:0;z-index:3;padding:10px 12px;border-right:0;border-bottom:1px solid var(--line)}.brand{display:inline-flex;margin:0 8px 6px}.nav{display:flex;overflow:auto}.nav button{white-space:nowrap;padding:8px 11px;width:auto}.tiny{display:none}.main{padding:20px 14px}.grid{grid-template-columns:repeat(2,1fr)}.fields{grid-template-columns:1fr}.top{align-items:start}.top h1{font-size:22px}}
+</style></head>
+<body><div class="shell"><aside class="side"><div class="brand"><em>✦</em><span>Alife Memory</span></div><nav class="nav"><button class="active" data-tab="home">总览</button><button data-tab="memories">记忆管理</button><button data-tab="search">检索</button><button data-tab="tasks">任务</button><button data-tab="config">配置</button></nav><div class="tiny">v1.0.0 主动与自动精准跨维度检索</div></aside><main class="main">
+<section id="home" class="view"><div class="top"><div><div class="eyebrow">LONG-TERM MEMORY</div><h1>记忆中枢</h1><p>三重触发压缩·被动召回·跨来源关联</p></div><div><button class="btn sm" onclick="loadHome()" id="refreshBtn">刷新</button><button class="btn sm" onclick="reflectAll()">后台审校</button><button class="btn sm danger" onclick="triggerCleanup()">清理过期</button></div></div><div class="grid" id="stats"></div><div class="panel"><h2>当前触发状态</h2><div id="triggerState"></div></div></section>
+<section id="memories" class="view hide"><div class="top"><div><div class="eyebrow">ARCHIVE</div><h1>记忆管理</h1><p>查看、修正、删除长期记忆</p></div><div class="toolbar"><input id="filterSid" class="input" placeholder="按会话过滤"><button class="btn sm" onclick="loadMemories()">刷新</button></div></div><div id="memoryList" class="panel"></div></section>
+<section id="search" class="view hide"><div class="top"><div><div class="eyebrow">RETRIEVAL</div><h1>检索实验室</h1><p>测试记忆召回效果</p></div></div><div class="panel"><div class="toolbar"><input id="searchQuery" class="input" placeholder="输入检索内容"><input id="searchSid" class="input sm" placeholder="会话ID"><select id="searchScope" class="input sm"><option value="linked">linked</option><option value="session">session</option><option value="global">global</option></select><button class="btn sm" onclick="runSearch()">检索</button></div><div id="searchResults"></div></div></section>
+<section id="tasks" class="view hide"><div class="top"><div><div class="eyebrow">BACKGROUND</div><h1>后台任务</h1><p>压缩、合并、反思任务状态</p></div><button class="btn sm" onclick="loadTasks()">刷新</button></div><div id="taskList" class="panel"></div></section>
+<section id="config" class="view hide"><div class="top"><div><div class="eyebrow">SETTINGS</div><h1>配置</h1><p>所有参数热修改即时生效。管理记忆内容推荐用侧边栏「记忆管理」「检索」等页面，比直接改配置更方便直观。</p></div><button class="btn" onclick="saveConfig()">保存配置</button></div><div class="panel"><div class="fields" id="configForm"></div></div></section>
+</main></div><div class="toast" id="toast"></div>
+<div id="modal" class="modal hide" onclick="if(event.target===this)closeModal()"><div class="modal-inner" id="modalContent"></div></div>
+<script>
+const $=s=>document.querySelector(s),$$=s=>document.querySelectorAll(s);
+const api=(p,o)=>fetch('/api/plugin/alife_memory'+p,{headers:{'Content-Type':'application/json'},...o}).then(r=>r.json());
+let cfg={},__models=[];
+
+function toast(t){const e=$('#toast');e.textContent=t;e.style.display='block';setTimeout(()=>e.style.display='none',2200)}
+function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function openModal(html){$('#modalContent').innerHTML=html;$('#modal').classList.remove('hide')}
+function closeModal(){$('#modal').classList.add('hide')}
+
+async function fetchModels(){
+  try{const d=await api('/models');__models=d.models||[]}catch(e){__models=[]}
+}
+
+document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{
+  $$('.nav button').forEach(x=>x.classList.remove('active'));b.classList.add('active');
+  $$('.view').forEach(x=>x.classList.add('hide'));$('#'+b.dataset.tab).classList.remove('hide');
+  const f={home:loadHome,memories:loadMemories,tasks:loadTasks,config:loadConfig};
+  (f[b.dataset.tab]||(()=>{}))();
+});
+
+// ---- 总览 ----
+async function loadHome(){
+  const s=await api('/status'),p=await api('/pending');
+  const statItems=[['记忆条目',s.memories],['原始消息',s.messages],['待压缩',s.pending],['待压缩轮数',p.round_count],['待压缩Token',p.token_sum],['会话数',s.sessions],['Worker',s.workers],['启用',s.enabled?'✓':'✗'],['注入',s.auto_inject?'✓':'✗'],['被动召回',s.passive_recall?'✓':'✗']];
+  $('#stats').innerHTML=statItems.map(x=>`<div class="stat"><small>${x[0]}</small><strong>${x[1]}</strong></div>`).join('');
+  $('#triggerState').innerHTML=`<div class="row" style="flex-wrap:wrap"><span class="tag">${esc(s.trigger_mode||'either')}</span><span>轮数阈值 ${s.round_threshold}　Token阈值 ${s.token_threshold}　消息数阈值 ${s.message_threshold}</span></div><p class="meta">压缩触发条件：任一达到阈值即触发</p>`;
+}
+
+// ---- 记忆管理 ----
+async function loadMemories(){
+  const q=$('#filterSid')?.value||'',list=await api('/memories?limit=100'+(q?'&sid='+encodeURIComponent(q):''));
+  if(!Array.isArray(list)){$('#memoryList').innerHTML='<div class="empty">暂无数据</div>';return}
+  $('#memoryList').innerHTML=list.length?list.map(x=>`<div class="memory-item"><h3><span>${esc(x.summary)}</span><span class="tag">L${x.level}</span><span class="tag">${esc(x.status)}</span><span class="tag">${(x.confidence*100).toFixed(0)}%</span></h3><div class="content">${esc(x.content)}</div><div class="meta">${esc(x.id)} · 来源 ${esc(x.sid)} · 用户 ${esc(x.user_id||'—')} · ${new Date(x.end_ts*1000).toLocaleString()}</div><div class="actions"><button class="btn sm alt" onclick="editMemory('${x.id}')">修正</button><button class="btn sm danger" onclick="deleteMemory('${x.id}')">删除</button></div></div>`).join(''):'<div class="empty">没有记忆</div>';
+}
+
+function editMemory(id){
+  api('/memory/'+id).then(x=>{
+    openModal(`<h3>修正记忆</h3><div class="field"><label>概述</label><input id="editSummary" value="${esc(x.summary)}"></div><div class="field"><label>内容</label><textarea id="editContent">${esc(x.content)}</textarea></div><div class="field"><label>修正依据</label><input id="editReason" placeholder="为什么修正？"></div><button class="btn" onclick="doEdit('${id}')">确认修正</button>`);
+  });
+}
+async function doEdit(id){
+  const s=$('#editSummary').value,c=$('#editContent').value,r=$('#editReason').value;
+  if(!s||!c)return toast('概述和内容不能为空');
+  await api('/memory/'+id+'/correct',{method:'POST',body:JSON.stringify({summary:s,content:c,reason:r||'WebUI修正'})});
+  toast('记忆已修正');closeModal();loadMemories();
+}
+async function deleteMemory(id){
+  if(!confirm('确定删除这条记忆？'))return;
+  await api('/memory/'+id,{method:'DELETE'});toast('已删除');loadMemories();
+}
+
+// ---- 检索 ----
+async function runSearch(){
+  const q=$('#searchQuery').value.trim();
+  if(!q)return toast('请输入检索内容');
+  const r=await api('/search',{method:'POST',body:JSON.stringify({query:q,sid:$('#searchSid').value,scope:$('#searchScope').value,top_k:10})});
+  const list=r.results||[];
+  $('#searchResults').innerHTML=list.length?list.map(x=>`<div class="memory-item"><h3><span>${esc(x.summary)}</span><span class="tag">${(x.score*100).toFixed(0)}%</span></h3><div class="content">${esc(x.content)}</div><div class="meta">${esc(x.id)} · 来源 ${esc(x.sid)} · 用户 ${esc(x.user_id||'—')}</div></div>`).join(''):'<div class="empty">无结果</div>';
+}
+
+// ---- 任务 ----
+async function loadTasks(){
+  const list=await api('/tasks?limit=80');
+  if(!Array.isArray(list)){$('#taskList').innerHTML='<div class="empty">暂无数据</div>';return}
+  $('#taskList').innerHTML=list.length?list.map(x=>`<div class="task-item"><div><strong>${esc(x.kind)}</strong><span class="status ${x.status}">${esc(x.status)}</span><div class="meta">${esc(x.message||'')}</div></div><div class="meta">${new Date(x.updated_at*1000).toLocaleString()}</div></div>`).join(''):'<div class="empty">暂无任务</div>';
+}
+
+// ---- 配置 ----
+const configFields=[
+  ['section_basic.enabled','启用记忆系统','switch',true],
+  ['section_basic.capture_enabled','自动记录对话','switch',true],
+  ['section_basic.auto_inject','自动注入','switch',true],
+  ['section_basic.inject_context_marker','上下文记忆标记','switch',true],
+  ['section_basic.passive_recall','被动召回','switch',true],
+  ['section_basic.recall_hint_keywords','回忆提醒关键词','text','记得,回忆,以前,上次,忘记'],
+  ['section_basic.max_injected_tokens','注入Token上限','number',1500],
+  ['section_basic.max_injected_items','注入条数上限','number',8],
+  ['section_basic.max_injected_chars','注入字符数上限','number',3000],
+  ['section_basic.max_injected_lines','注入行数上限','number',30],
+  ['section_basic.passive_recall_boost_threshold','被动召回最低分阈值','number',0.4],
+  ['section_basic.auto_archive_days','自动归档天数 0=关闭','number',0],
+  ['section_basic.archive_level_min','归档影响最低层级 默认=最高层','number',5],
+  ['section_basic.message_retention_days','消息保留天数','number',7],
+  ['section_basic.stale_retention_days','旧版本保留天数','number',30],
+  ['section_trigger.trigger_mode','触发模式','select',['rounds','tokens','messages','either']],
+  ['section_trigger.round_threshold','轮数阈值','number',10],
+  ['section_trigger.token_threshold','Token阈值','number',10000],
+  ['section_trigger.message_threshold','消息数阈值','number',50],
+  ['section_compression.compress_model','压缩模型','model_select',''],
+  ['section_compression.compress_probability','压缩触发概率','number',0.8],
+  ['section_compression.batch_size','每批消息数','number',10],
+  ['section_compression.level_group_size','高层合并数量','number',4],
+  ['section_compression.max_level','最大压缩层级','number',5],
+  ['section_compression.min_chars','最小压缩字符数','number',80],
+  ['section_retrieval.semantic_enabled','启用语义向量','switch',true],
+  ['section_retrieval.search_scope','默认检索范围','select',['linked','session','global']],
+  ['section_retrieval.cross_user_enabled','允许跨用户关联','switch',true],
+  ['section_retrieval.top_k','默认结果数','number',5],
+  ['section_retrieval.recency_half_life_days','时间衰减半衰期','number',45],
+  ['section_retrieval.inject_level_max','注入最高层级','number',12],
+  ['section_reflection.enabled','启用后台审校','switch',true],
+  ['section_reflection.interval_seconds','审校间隔（秒）','number',1800],
+  ['section_reflection.max_items','每次审校记忆数','number',4],
+];
+
+function getVal(path,def){
+  const parts=path.split('.');let o=cfg;
+  for(const p of parts){if(!o||typeof o!=='object')return def;o=o[p]}
+  return o===undefined||o===null?def:o;
+}
+
+async function loadConfig(){
+  cfg=await api('/config');
+  await fetchModels();
+  $('#configForm').innerHTML=configFields.map(([path,label,type,def])=>{
+    const val=getVal(path,def);
+    if(type==='switch')return `<div class="field"><label>${label}</label><input type="checkbox" data-path="${path}" class="switch" ${val?'checked':''}></div>`;
+    if(type==='select')return `<div class="field"><label>${label}</label><select data-path="${path}">${def.map(o=>`<option value="${o}"${val===o?' selected':''}>${o}</option>`).join('')}</select></div>`;
+    if(type==='model_select')return `<div class="field"><label>${label}</label><select data-path="${path}"><option value=""${!val?' selected':''}>默认</option>${__models.map(m=>`<option value="${esc(m.id)}"${val===m.id?' selected':''}>${esc(m.name)}</option>`).join('')}</select></div>`;
+    if(type==='number')return `<div class="field"><label>${label}</label><input type="number" data-path="${path}" value="${esc(String(val))}"></div>`;
+    return `<div class="field"><label>${label}</label><input data-path="${path}" value="${esc(String(val))}"></div>`;
+  }).join('');
+}
+
+async function saveConfig(){
+  const body=JSON.parse(JSON.stringify(cfg));
+  document.querySelectorAll('[data-path]').forEach(el=>{
+    const parts=el.dataset.path.split('.');
+    let o=body;
+    for(let i=0;i<parts.length-1;i++){if(!o[parts[i]])o[parts[i]]={};o=o[parts[i]]}
+    const key=parts[parts.length-1];
+    if(el.type==='checkbox')o[key]=el.checked;
+    else if(el.type==='number')o[key]=Number(el.value);
+    else o[key]=el.value;
+  });
+  await api('/config',{method:'POST',body:JSON.stringify(body)});
+  toast('配置已保存并生效');
+  loadHome();
+}
+
+async function reflectAll(){
+  await api('/reflect',{method:'POST',body:'{}'});
+  toast('审校任务已排队');
+  loadTasks();
+}
+async function triggerCleanup(){
+  if(!confirm('确认清理过期消息和旧版本记忆？不可恢复。'))return;
+  const r=await api('/cleanup',{method:'POST'});
+  toast('清理完毕：删除消息'+r.deleted_messages+'条，旧版本'+r.deleted_stale_memories+'条');
+  loadHome();
+}
+
+loadHome();
+</script></body></html>
