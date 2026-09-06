@@ -1,4 +1,16 @@
 {
+  "info_intro": {
+    "type": "info",
+    "name": "说明",
+    "hint": "Alife Memory·Z：异步分层长期记忆系统。三重触发压缩（轮数/Token/消息数）、被动召回、跨来源关联、后台审校。以下所有配置项均可直接在侧边栏 WebUI 配置和编辑。",
+    "level": "info",
+    "locales": {
+      "zh": {
+        "name": "说明",
+        "hint": "Alife Memory·Z：异步分层长期记忆系统。三重触发压缩（轮数/Token/消息数）、被动召回、跨来源关联、后台审校。以下所有配置项均可直接在侧边栏 WebUI 配置和编辑。"
+      }
+    }
+  },
   "section_basic": {
     "type": "section",
     "name": "记忆总控",
@@ -21,7 +33,10 @@
       "passive_recall_boost_threshold": {"type": "float", "name": "被动召回最低分阈值", "default": 0.4, "minimum": 0.0, "maximum": 1.0, "hint": "主检索结果最高分低于此值时自动以关键词做宽召回补充。", "locales": {"zh": {"name": "被动召回最低分阈值", "hint": "主检索结果最高分低于此值时自动以关键词做宽召回补充。"}}},
       "auto_archive_days": {"type": "integer", "name": "自动归档天数（0=关闭）", "default": 0, "minimum": 0, "maximum": 3650, "hint": "超过此天数未被触碰的 active 记忆自动归档。归档后仍可通过检索找到，0 为关闭。", "locales": {"zh": {"name": "自动归档天数（0=关闭）", "hint": "超过此天数未被触碰的 active 记忆自动归档。0 为关闭。"}}},
       "archive_level_min": {"type": "integer", "name": "归档影响最低层级", "default": 5, "minimum": 1, "maximum": 12, "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级（max_level），最高层受保护。", "locales": {"zh": {"name": "归档影响最低层级", "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级。"}}},
-      "llm_concurrency_limit": {"type": "integer", "name": "LLM 并发上限", "default": 4, "minimum": 1, "maximum": 20, "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。", "locales": {"zh": {"name": "LLM 并发上限", "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。"}}}
+      "llm_concurrency_limit": {"type": "integer", "name": "LLM 并发上限", "default": 4, "minimum": 1, "maximum": 20, "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。", "locales": {"zh": {"name": "LLM 并发上限", "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。"}}},
+      "user_list_limit": {"type": "integer", "name": "默认展示用户数", "default": 50, "minimum": 1, "maximum": 200, "hint": "list_users 默认一次列出多少个用户（总数始终显示，超出会提示）。", "locales": {"zh": {"name": "默认展示用户数", "hint": "list_users 默认一次列出多少个用户（总数始终显示，超出会提示）。"}}},
+      "memory_list_limit": {"type": "integer", "name": "默认展示记忆条数", "default": 20, "minimum": 1, "maximum": 100, "hint": "list_user_memories / list_session_memories 默认一次列出多少条记忆（总数始终显示）。", "locales": {"zh": {"name": "默认展示记忆条数", "hint": "list_user_memories / list_session_memories 默认一次列出多少条记忆（总数始终显示）。"}}},
+      "recent_summaries_count": {"type": "integer", "name": "默认最近记得条数", "default": 3, "minimum": 1, "maximum": 10, "hint": "list_users 里每个用户默认展示几条最近记得的记忆。", "locales": {"zh": {"name": "默认最近记得条数", "hint": "list_users 里每个用户默认展示几条最近记得的记忆。"}}}
     }
   },
   "section_trigger": {
@@ -52,7 +67,7 @@
       "level_group_size": {"type": "integer", "name": "高层合并数量", "default": 4, "minimum": 2, "maximum": 12, "hint": "同层摘要达到多少条时合并为更高层。", "locales": {"zh": {"name": "高层合并数量", "hint": "同层摘要达到多少条时合并为更高层。"}}},
       "max_level": {"type": "integer", "name": "最大压缩层级", "default": 5, "minimum": 1, "maximum": 12, "hint": "达到最高层后保留为长期事实，不再自动合并。", "locales": {"zh": {"name": "最大压缩层级", "hint": "达到最高层后保留为长期事实，不再自动合并。"}}},
       "min_chars": {"type": "integer", "name": "最小压缩字符数", "default": 80, "minimum": 20, "maximum": 2000, "hint": "内容太短时不调用压缩模型。", "locales": {"zh": {"name": "最小压缩字符数", "hint": "内容太短时不调用压缩模型。"}}},
-      "prompt": {"type": "markdown", "name": "压缩提示词", "default": "", "hint": "必须输出 JSON，支持 {content} 和 {range} 占位符。", "locales": {"zh": {"name": "压缩提示词", "hint": "必须输出 JSON，支持 {content} 和 {range} 占位符。"}}}
+      "prompt": {"type": "markdown", "name": "压缩提示词", "default": "你是长期记忆整理器。把{range}中提取成可验证、简洁、无重复的记忆。\n只输出 JSON，不要 Markdown：{\"summary\":\"一句话概述\",\"content\":\"事实、偏好、决定和关系变化，分行列出\",\"importance\":0.0}\n不要臆测，不要把闲聊或临时情绪写成长期事实；保留时间、主体和限定条件。\n待整理内容：\n{content}", "hint": "必须输出 JSON，支持 {content} 和 {range} 占位符。", "locales": {"zh": {"name": "压缩提示词", "hint": "必须输出 JSON，支持 {content} 和 {range} 占位符。"}}}
     }
   },
   "section_retrieval": {
@@ -79,7 +94,7 @@
       "reflect_model": {"type": "model_select", "name": "审校模型", "model_type": "llm", "default": "", "hint": "留空跟随框架默认语言模型（WebUI-默认语言模型）。", "locales": {"zh": {"name": "审校模型", "hint": "留空跟随框架默认语言模型（WebUI-默认语言模型）。"}}},
       "interval_seconds": {"type": "integer", "name": "审校间隔（秒）", "default": 1800, "minimum": 300, "maximum": 86400, "hint": "低频运行，避免后台持续消耗。", "locales": {"zh": {"name": "审校间隔（秒）", "hint": "低频运行，避免后台持续消耗。"}}},
       "max_items": {"type": "integer", "name": "每次审校记忆数", "default": 4, "minimum": 1, "maximum": 20, "hint": "每个会话最多检查最近的高价值记忆。", "locales": {"zh": {"name": "每次审校记忆数", "hint": "每个会话最多检查最近的高价值记忆。"}}},
-      "prompt": {"type": "markdown", "name": "审校提示词", "default": "", "hint": "必须输出 JSON，支持 {memory} 和 {evidence} 占位符。", "locales": {"zh": {"name": "审校提示词", "hint": "必须输出 JSON，支持 {memory} 和 {evidence} 占位符。"}}}
+      "prompt": {"type": "markdown", "name": "审校提示词", "default": "你是记忆审校器。比较旧记忆和新证据，只处理有明确矛盾的事实。\n只输出 JSON：{\"action\":\"none|correct|stale\",\"summary\":\"修正后的概述\",\"content\":\"修正后的事实\",\"confidence\":0.0,\"reason\":\"证据依据\"}\n若只是措辞不同、证据不足或可能是临时状态，输出 none。不得凭空补全。\n旧记忆：\n{memory}\n新证据：\n{evidence}", "hint": "必须输出 JSON，支持 {memory} 和 {evidence} 占位符。", "locales": {"zh": {"name": "审校提示词", "hint": "必须输出 JSON，支持 {memory} 和 {evidence} 占位符。"}}}
     }
   }
 }

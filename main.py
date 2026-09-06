@@ -95,8 +95,15 @@ class AlifeMemoryPlugin(BasePlugin):
         self._reflect_task: asyncio.Task | None = None
         self._cleanup_task: asyncio.Task | None = None
         self._closed = False
-        self._seen_user_ids: set[str] = set()
+        self._seen_recall: dict[str, set[str]] = {}  # sid → 该会话已召回过记忆的用户集合（per-session 去重）
         self._recall_round_counter: dict[str, int] = {}
+        # rerank 探测缓存：首次调用时探测一次，没配置就记住不再每次尝试，插件重载/热更新时重置
+        self._rerank_checked = False
+        self._rerank_client = None
+        # embedding 探测缓存：与 rerank 对称，首次探测后缓存，避免每次注入都调 get_default_embedding_client
+        self._embed_checked = False
+        self._embed_client = None
+        self._ctx_injected_ids: set[str] = set()  # context marker 已注入的记忆 id，避免 _inject 重复注入
         self._load_settings()
         self._llm_semaphore = asyncio.Semaphore(max(1, self.llm_concurrency_limit))
         # 数据目录迁移：旧 alife_memory → alife_memory_z
@@ -124,6 +131,10 @@ class AlifeMemoryPlugin(BasePlugin):
         self.passive_recall_update_rounds = _num(basic.get("passive_recall_update_rounds", 10), 10, 1, 200, True)
         self.passive_recall_keyword_limit = _num(basic.get("passive_recall_keyword_limit", 8), 8, 1, 30, True)
         self.llm_concurrency_limit = _num(basic.get("llm_concurrency_limit", 4), 4, 1, 20, True)
+        # 列表展示默认值（可在 WebUI/侧边栏热配置）
+        self.user_list_limit = _num(basic.get("user_list_limit", 50), 50, 1, 200, True)
+        self.memory_list_limit = _num(basic.get("memory_list_limit", 20), 20, 1, 100, True)
+        self.recent_summaries_count = _num(basic.get("recent_summaries_count", 3), 3, 1, 10, True)
         self.max_injected_tokens = _num(basic.get("max_injected_tokens", 1500), 1500, 100, 8000, True)
         self.max_injected_items = _num(basic.get("max_injected_items", 8), 8, 1, 30, True)
         self.max_injected_chars = _num(basic.get("max_injected_chars", 3000), 3000, 200, 20000, True)
@@ -161,6 +172,8 @@ class AlifeMemoryPlugin(BasePlugin):
 
         self.compress_prompt = str(compression.get("prompt", "") or "").strip() or self._default_compress_prompt()
         self.reflect_prompt = str(reflection.get("prompt", "") or "").strip() or self._default_reflect_prompt()
+        # 若用户未自定义压缩/审校提示词，把默认词回填进 cfg，让 WebUI 可展示、可编辑（用户改过后不再覆盖）
+        self._sync_default_prompts(compression, reflection)
         self.compress_probability = _num(compression.get("compress_probability", 0.8), 0.8, 0.0, 1.0)
         self.compress_timeout = _num(compression.get("compress_timeout", 30), 30, 5, 120, True)
         self.max_compress_retry = _num(compression.get("max_compress_retry", 2), 2, 0, 10, True)
@@ -183,6 +196,26 @@ class AlifeMemoryPlugin(BasePlugin):
         return ("你是记忆审校器。比较旧记忆和新证据，只处理有明确矛盾的事实。\n"
                 "只输出 JSON：{\"action\":\"none|correct|stale\",\"summary\":\"修正后的概述\",\"content\":\"修正后的事实\",\"confidence\":0.0,\"reason\":\"证据依据\"}\n"
                 "若只是措辞不同、证据不足或可能是临时状态，输出 none。不得凭空补全。\n旧记忆：\n{memory}\n新证据：\n{evidence}")
+
+    def _sync_default_prompts(self, compression: dict, reflection: dict):
+        """当用户未自定义提示词时，把最新默认词回填进 cfg（供 WebUI 展示/编辑）。
+        用户一旦改过（cfg 里是非空且非默认的内容），就不再覆盖。"""
+        default_comp = self._default_compress_prompt()
+        default_refl = self._default_reflect_prompt()
+        comp_val = str(compression.get("prompt", "") or "").strip()
+        refl_val = str(reflection.get("prompt", "") or "").strip()
+        changed = False
+        # 空 或 等于旧默认（即从未真正自定义）→ 用最新默认
+        if not comp_val:
+            compression["prompt"] = default_comp
+            changed = True
+        if not refl_val:
+            reflection["prompt"] = default_refl
+            changed = True
+        if changed:
+            # 回写到模块级 cfg，让 WebUI /config 能拿到
+            self.cfg.setdefault("section_compression", {})["prompt"] = compression.get("prompt", default_comp)
+            self.cfg.setdefault("section_reflection", {})["prompt"] = reflection.get("prompt", default_refl)
 
     @staticmethod
     def _convert_relative_dates(text: str) -> str:
@@ -267,6 +300,33 @@ class AlifeMemoryPlugin(BasePlugin):
         except Exception as exc:
             logger.warning("[alife_memory] 互斥检测/禁用失败: %s", exc)
 
+    @staticmethod
+    def _parse_kiraos_toml(tf: Path):
+        """解析单个 KiraOS TOML 记忆文件，返回 (content, summary, importance, sid, ts) 或 None。"""
+        try:
+            text = tf.read_text(encoding="utf-8", errors="replace")
+            import re as _re
+            t_text_match = _re.search(r'text\s*=\s*"([^"]*)"', text)
+            if not t_text_match:
+                return None
+            content = t_text_match.group(1)
+            # 跳过超长内容（KiraOS 海马体的长篇概况通常质量低、污染大）
+            if len(content) > 120:
+                return None
+            t_imp = _re.search(r'importance\s*=\s*(\d+)', text)
+            t_sid = _re.search(r'session\s*=\s*"([^"]*)"', text)
+            t_ts = _re.search(r'time\s*=\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', text)
+            importance = float(t_imp.group(1)) / 10.0 if t_imp else 0.5
+            source_sid = t_sid.group(1) if t_sid else "kiraos_import"
+            from datetime import datetime as _dt
+            try:
+                ts_val = _dt.fromisoformat(t_ts.group(1)).timestamp() if t_ts else time.time()
+            except Exception:
+                ts_val = time.time()
+            return (content, content[:100], importance, source_sid, ts_val)
+        except Exception:
+            return None
+
     async def _count_migratable(self, plugin_id: str) -> int:
         """统计冲突插件的待迁移记忆条数"""
         try:
@@ -303,27 +363,27 @@ class AlifeMemoryPlugin(BasePlugin):
                 core_txt = data_root / "memory" / "core.txt"
                 if core_txt.exists():
                     logger.info("[alife_memory] 发现 Simple Memory 数据文件: %s，正在迁移……", core_txt)
-                    raw_text = core_txt.read_text(encoding="utf-8", errors="replace")
+                    raw_text = await asyncio.to_thread(lambda: core_txt.read_text(encoding="utf-8", errors="replace"))
                     lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
                     if lines:
-                        count = 0
+                        now = time.time()
+                        # 1) 一次性并发嵌入所有内容（替代每条串行 embed）
+                        vectors = await self._embed_batch(lines)
+                        # 2) 批量组装 + 单事务写入（替代逐条 add_memory）
+                        rows = []
                         for line in lines:
+                            if len(line) > 120:
+                                continue
                             content_stripped = line
-                            vector = await self._embed(content_stripped)
-                            fp = hashlib.sha256(("simple_memory_import|" + content_stripped).encode()).hexdigest()[:32]
-                            try:
-                                await self.store.add_memory(
-                                    sid="system", level=3, summary=content_stripped[:100],
-                                    content=content_stripped, start_ts=time.time(),
-                                    end_ts=time.time(), source_ids=[], importance=0.5,
-                                    embedding=vector, user_id="",
-                                    source_fingerprint=fp,
-                                    source_refs=[{"sid": "simple_memory_import",
-                                                  "user_id": "", "ts": time.time(),
-                                                  "action": "从Simple Memory自动迁移，原始文件保留未清理"}])
-                                count += 1
-                            except Exception:
-                                pass
+                            rows.append({
+                                "sid": "system", "level": 3, "summary": content_stripped[:100],
+                                "content": content_stripped, "start_ts": now, "end_ts": now,
+                                "source_ids": [], "importance": 0.5, "embedding": vectors.get(content_stripped),
+                                "user_id": "", "source_fingerprint": hashlib.sha256(("simple_memory_import|" + content_stripped).encode()).hexdigest()[:32],
+                                "source_refs": [{"sid": "simple_memory_import", "user_id": "", "ts": now,
+                                                 "action": "从Simple Memory自动迁移，原始文件保留未清理"}],
+                            })
+                        count = await self.store.add_memories_batch(rows)
                         if count:
                             migrated = True
                             logger.info("[alife_memory] 已从 Simple Memory 迁移 %d 条记忆（原始文件未删除）", count)
@@ -334,52 +394,31 @@ class AlifeMemoryPlugin(BasePlugin):
                 if await asyncio.to_thread(kiraos_entities.exists):
                     toml_files = await asyncio.to_thread(lambda: list(kiraos_entities.rglob("*.toml")))
                     if toml_files:
-                        count = 0
-                        for tf in toml_files:
-                            try:
-                                text = await asyncio.to_thread(lambda: tf.read_text(encoding="utf-8", errors="replace"))
-                                import re as _re
-                                t_id = _re.search(r'id\s*=\s*"([^"]*)"', text)
-                                t_text_match = _re.search(r'text\s*=\s*"([^"]*)"', text)
-                                t_type = _re.search(r'type\s*=\s*"([^"]*)"', text)
-                                t_imp = _re.search(r'importance\s*=\s*(\d+)', text)
-                                t_sid = _re.search(r'session\s*=\s*"([^"]*)"', text)
-                                t_ts = _re.search(r'time\s*=\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', text)
-                                if not t_text_match:
-                                    continue
-                                content = t_text_match.group(1)
-                                # 跳过超长内容（KiraOS 海马体的长篇概况通常质量低、污染大）
-                                if len(content) > 200:
-                                    logger.debug("[alife_memory] KiraOS 迁移跳过超长内容 (%d 字符)", len(content))
-                                    continue
-                                summary = content[:100]
-                                importance = float(t_imp.group(1)) / 10.0 if t_imp else 0.5
-                                source_sid = t_sid.group(1) if t_sid else "kiraos_import"
-                                vector = await self._embed(content)
-                                from datetime import datetime as _dt
-                                try:
-                                    ts_val = _dt.fromisoformat(t_ts.group(1)).timestamp() if t_ts else time.time()
-                                except Exception:
-                                    ts_val = time.time()
-                                fp = hashlib.sha256(("kiraos_import|" + content).encode()).hexdigest()[:32]
-                                try:
-                                    await self.store.add_memory(
-                                        sid=source_sid, level=3, summary=summary,
-                                        content=content, start_ts=ts_val, end_ts=ts_val,
-                                        source_ids=[], importance=importance,
-                                        embedding=vector, user_id="",
-                                        source_fingerprint=fp,
-                                        source_refs=[{"sid": source_sid,
-                                                      "user_id": "", "ts": ts_val,
-                                                      "action": "从KiraOS记忆自动迁移，原始文件保留未清理"}])
-                                    count += 1
-                                except Exception:
-                                    pass
-                            except Exception:
-                                continue
-                        if count:
-                            migrated = True
-                            logger.info("[alife_memory] 已从 KiraOS 记忆迁移 %d 条记忆（原始文件未删除）", count)
+                        # 1) 并行读取所有文件并解析（替代逐条串行 read_text）
+                        from datetime import datetime as _dt
+                        parsed = await asyncio.gather(*[asyncio.to_thread(self._parse_kiraos_toml, tf) for tf in toml_files])
+                        valid = [p for p in parsed if p]  # [(content, summary, importance, sid, ts)]
+                        if valid:
+                            contents = [p[0] for p in valid]
+                            # 2) 一次性并发嵌入所有内容
+                            vectors = await self._embed_batch(contents)
+                            # 3) 批量组装 + 单事务写入
+                            rows = []
+                            now = time.time()
+                            for i, (content, summary, importance, source_sid, ts_val) in enumerate(valid):
+                                rows.append({
+                                    "sid": source_sid, "level": 3, "summary": summary,
+                                    "content": content, "start_ts": ts_val, "end_ts": ts_val,
+                                    "source_ids": [], "importance": importance,
+                                    "embedding": vectors.get(content), "user_id": "",
+                                    "source_fingerprint": hashlib.sha256(("kiraos_import|" + content).encode()).hexdigest()[:32],
+                                    "source_refs": [{"sid": source_sid, "user_id": "", "ts": ts_val,
+                                                     "action": "从KiraOS记忆自动迁移，原始文件保留未清理"}],
+                                })
+                            count = await self.store.add_memories_batch(rows)
+                            if count:
+                                migrated = True
+                                logger.info("[alife_memory] 已从 KiraOS 记忆迁移 %d 条记忆（原始文件未删除）", count)
         except Exception as exc:
             logger.warning("[alife_memory] 从 %s 迁移失败: %s", plugin_id, exc)
         return migrated
@@ -437,13 +476,21 @@ class AlifeMemoryPlugin(BasePlugin):
     async def _embed(self, text: str) -> list[float] | None:
         if not self.semantic_enabled:
             return None
+        # 首次探测一次并缓存 client：若不可用则记住，之后直接跳过，避免每轮重复探测
+        if not self._embed_checked:
+            try:
+                if self.embedding_model:
+                    client = self.ctx.get_embedding_client(model_uuid=self.embedding_model)
+                else:
+                    client = self.ctx.get_default_embedding_client()
+            except Exception:
+                client = None
+            self._embed_client = client if (client and hasattr(client, "embed")) else None
+            self._embed_checked = True
+        client = self._embed_client
+        if not client:
+            return None
         try:
-            if self.embedding_model:
-                client = self.ctx.get_embedding_client(model_uuid=self.embedding_model)
-            else:
-                client = self.ctx.get_default_embedding_client()
-            if not client:
-                return None
             result = await client.embed([text])
             vector = result[0] if isinstance(result, list) and result else result
             return [float(x) for x in vector] if vector else None
@@ -451,21 +498,51 @@ class AlifeMemoryPlugin(BasePlugin):
             logger.debug("[alife_memory] embedding unavailable: %s", exc)
             return None
 
+    async def _embed_batch(self, texts: list[str], concurrency: int = 16) -> dict[str, list[float] | None]:
+        """并发批量嵌入，返回 {text: embedding}。用信号量限制并发，避免一次性大量请求压垮 embedding API。
+        比逐条串行快得多，但对大规模（如迁移 1000 条）也能安全并发。"""
+        if not texts:
+            return {}
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def _one(t):
+            async with sem:
+                return await self._embed(t)
+
+        results = await asyncio.gather(*(_one(t) for t in texts))
+        return {t: r for t, r in zip(texts, results)}
+
     async def _rerank(self, query: str, items: list[dict]) -> list[dict]:
-        """Rerank search results using configured rerank model."""
+        """Rerank search results using configured rerank model.
+
+        首次调用时探测一次：若未配置可用 rerank，缓存标记后之后直接跳过，
+        避免每轮注入都重复尝试 get_default_rerank() 造成阻塞。
+        """
         if not items:
             return items
+        # 已探测过且确认不可用 → 直接跳过
+        if self._rerank_checked and self._rerank_client is None:
+            return items
         try:
-            pm = getattr(self.ctx, "provider_mgr", None)
-            if not pm:
-                return items
-            if self.rerank_model:
-                parts = self.rerank_model.split(":")
-                client = pm.get_model_client(parts[0], ":".join(parts[1:]))
-            else:
-                client = pm.get_default_rerank()
-            if not client or not hasattr(client, "rerank"):
-                return items
+            # 首次探测：解析 rerank client 并缓存
+            if not self._rerank_checked:
+                pm = getattr(self.ctx, "provider_mgr", None)
+                if not pm:
+                    self._rerank_checked = True
+                    self._rerank_client = None
+                    return items
+                if self.rerank_model:
+                    parts = self.rerank_model.split(":")
+                    client = pm.get_model_client(parts[0], ":".join(parts[1:]))
+                else:
+                    client = pm.get_default_rerank()
+                if not client or not hasattr(client, "rerank"):
+                    self._rerank_checked = True
+                    self._rerank_client = None
+                    return items
+                self._rerank_client = client
+                self._rerank_checked = True
+            client = self._rerank_client
             texts = [f"{x.get('summary', '')} {x.get('content', '')}" for x in items]
             scores = await client.rerank(query, texts)
             if scores and len(scores) == len(items):
@@ -696,6 +773,8 @@ class AlifeMemoryPlugin(BasePlugin):
         user_id = user_id or _event_user_id(getattr(req, "messages", [])[-1] if getattr(req, "messages", []) else None)
         all_results: list[dict] = []
         seen_ids: set[str] = set()
+        # context marker 已注入的记忆不再重复注入，避免上下文冗余
+        seen_ids.update(getattr(self, "_ctx_injected_ids", ()) or ())
         scope = self.search_scope if self.cross_user_enabled else ("user" if user_id else "session")
         query_embed = await self._embed(str(query))
 
@@ -711,67 +790,63 @@ class AlifeMemoryPlugin(BasePlugin):
                 best_score = max(best_score, r.get("score", 0.0))
         logger.debug("[alife_memory] 主注入: query='%s' → %d 条, 最高分 %.2f", query[:40], len(content_results), best_score)
 
-        # 2) 关键词被动召回（每轮都做，提取关键词补新记忆）
+        # 2) 关键词被动召回池：把关键词召回 / 被动更新 / 宽召回统一收集 term，
+        #    一次并发 embed + 一次并发 search 全部完成，避免重复调用。
         if self.passive_recall and self.passive_recall_keyword_limit > 0:
-            keywords = re.split(r'[，。！？、：；\s,;:?()（）\n\t]+', str(query)[:200])
-            keywords = [k.strip() for k in keywords if len(k.strip()) >= 2 and not k.strip().isdigit()][:6]
-            kw_added = 0
-            for keyword in keywords:
-                if kw_added >= self.passive_recall_keyword_limit:
-                    break
-                kw_results = await self.store.search(sid, keyword, 3,
-                    list(range(self.inject_level_max + 1)), await self._embed(keyword),
-                    self.half_life, "linked", user_id)
-                for r in kw_results:
-                    if r["id"] not in seen_ids and r.get("status", "active") == "active":
-                        r["score"] = r.get("score", 0.0) * 0.4
-                        all_results.append(r)
-                        seen_ids.add(r["id"])
-                        kw_added += 1
-            if kw_added:
-                logger.debug("[alife_memory] 关键词被动召回: %d 关键词 → +%d 条", len(keywords), kw_added)
+            # 收集本轮需要检索的关键词（去重）
+            recall_terms: list[tuple[str, float]] = []  # (term, weight)
+            seen_terms: set[str] = set()
+            # 基础关键词（每轮）
+            for kw in re.split(r'[，。！？、：；\s,;:?()（）\n\t]+', str(query)[:200]):
+                kw = kw.strip()
+                if len(kw) >= 2 and not kw.isdigit() and kw not in seen_terms:
+                    seen_terms.add(kw)
+                    recall_terms.append((kw, 0.4))
+            # 被动更新（每 N 轮）：权重更高，补充新记忆
+            if do_passive_update:
+                for t in re.split(r'[，。！？、：；\s,;:?()（）\n\t]+', str(query)[:120]):
+                    t = t.strip()
+                    if len(t) >= 2 and t not in seen_terms:
+                        seen_terms.add(t)
+                        recall_terms.append((t, 0.5))
+            # 宽召回（弱结果时）：降低权重，扩大召回面
+            if best_score < self.passive_recall_boost_threshold and best_score > 0:
+                for t in re.split(r'[，。！？、\s,;:?]+', str(query)[:80]):
+                    t = t.strip()
+                    if len(t) >= 2 and t not in seen_terms:
+                        seen_terms.add(t)
+                        recall_terms.append((t, 0.85))
+            recall_terms = recall_terms[:self.passive_recall_keyword_limit * 2]
+            if recall_terms:
+                # 一次并发 embed 所有 term
+                terms = [t for t, _ in recall_terms]
+                embeds = await self._embed_batch(terms)
+                # 一次并发 search 所有 term
+                search_tasks = [
+                    self.store.search(sid, term, 3, list(range(self.inject_level_max + 1)),
+                        embeds.get(term), self.half_life, "linked", user_id)
+                    for term in terms
+                ]
+                search_results = await asyncio.gather(*search_tasks)
+                for (term, weight), results in zip(recall_terms, search_results):
+                    for r in results:
+                        if r["id"] not in seen_ids and r.get("status", "active") == "active":
+                            r["score"] = r.get("score", 0.0) * weight
+                            all_results.append(r)
+                            seen_ids.add(r["id"])
+                logger.debug("[alife_memory] 关键词召回池: %d 词 → +%d 条", len(recall_terms), len(seen_ids))
 
-        # 3) 首次见到用户召回
+        # 3) 首次见到用户召回（per-session：仅当该会话还没召回过这个用户的记忆）
         if self.passive_recall and recall_user_ids:
-            for uid in recall_user_ids:
-                if uid and uid == user_id:
-                    continue
-                for r in await self.store.count_memories_by_user(uid, 5):
+            new_uids = [u for u in recall_user_ids if u and u != user_id]
+            if new_uids:
+                # 一次批量查询所有新用户的跨会话历史记忆，避免逐用户串行 SQL
+                for r in await self.store.count_memories_by_users(new_uids, 5):
                     if r["id"] not in seen_ids and r.get("status", "active") == "active":
                         r["score"] = 0.3
                         all_results.append(r)
                         seen_ids.add(r["id"])
-                logger.debug("[alife_memory] 被动召回: 新用户 %s", uid)
-
-        # 4) 更新轮数已到时全量刷新
-        if self.passive_recall and do_passive_update:
-            refresh_terms = re.split(r'[，。！？、：；\s,;:?()（）\n\t]+', str(query)[:120])
-            refresh_terms = [t.strip() for t in refresh_terms if len(t.strip()) >= 2][:6]
-            added = 0
-            for term in refresh_terms:
-                if added >= self.passive_recall_keyword_limit:
-                    break
-                tr = await self.store.search(sid, term, 3, list(range(self.inject_level_max + 1)),
-                    await self._embed(term), self.half_life, "linked", user_id)
-                for r in tr:
-                    if r["id"] not in seen_ids and r.get("status", "active") == "active":
-                        r["score"] = r.get("score", 0.0) * 0.5
-                        all_results.append(r)
-                        seen_ids.add(r["id"])
-                        added += 1
-            logger.debug("[alife_memory] 被动召回更新: 补充 %d 条", added)
-
-        # 5) 弱结果宽召回
-        if self.passive_recall and best_score < self.passive_recall_boost_threshold and best_score > 0:
-            terms = [t.strip() for t in re.split(r'[，。！？、\s,;:?]+', str(query)[:80]) if len(t.strip()) >= 2][:5]
-            for term in terms:
-                wide = await self.store.search(sid, term, 3, list(range(self.inject_level_max + 1)),
-                    await self._embed(term), self.half_life, "linked", user_id)
-                for r in wide:
-                    if r["id"] not in seen_ids and r.get("status", "active") == "active":
-                        r["score"] = r.get("score", 0.0) * 0.85
-                        all_results.append(r)
-                        seen_ids.add(r["id"])
+                logger.debug("[alife_memory] 被动召回: %d 个新用户 → 补 %d 条跨会话记忆", len(new_uids), len(seen_ids))
 
         if not all_results:
             return
@@ -816,16 +891,6 @@ class AlifeMemoryPlugin(BasePlugin):
 
 
     async def _inject_context_marker(self, req: LLMRequest, sid: str):
-        block = ("一些关于过去的事情，供你参考。如果新了解到的情况和下面不一致，以最新的为准：\n"
-                 + "\n".join(lines)
-                 + "\n"
-                 + '（提醒：记录代码行号、文件路径、git 历史这些会过时的信息没有意义，'
-                   '它们应该通过查代码或日志来确认。'
-                   '如果对方跟你聊起过去的事，自然地用这些记忆回应就好，不必刻意提起\u201c我记得你说过\u201d。）')
-        system_msg = OpenAIMessage(role="system", content=block)
-        req.messages.insert(0, system_msg)
-
-    async def _inject_context_marker(self, req: LLMRequest, sid: str):
         """P0: 在上下文中保留最高层记忆标记，让 AI 感知自己有关联的记忆"""
         if not self.inject_context_marker or not sid:
             return
@@ -835,10 +900,12 @@ class AlifeMemoryPlugin(BasePlugin):
         if not top:
             return
         lines = []
+        self._ctx_injected_ids.clear()  # 每次重新记录本轮回注入的 id
         for item in top:
             source = f"来源:{item.get('sid', 'unknown')} / 时间:{time.strftime('%Y-%m-%d', time.localtime(item['end_ts']))}"
             text = f"[{item['summary']}]（{source}）"
             lines.append(f"- {text}")
+            self._ctx_injected_ids.add(item["id"])
         if not lines:
             return
         block = ("你过去经历过的一些事：\n"
@@ -891,10 +958,14 @@ class AlifeMemoryPlugin(BasePlugin):
             recall_user_ids = []
             for msg in messages:
                 uid = _event_user_id(msg)
-                if uid and uid not in self._seen_user_ids:
-                    self._seen_user_ids.add(uid)
-                    recall_user_ids.append(uid)
-                    logger.debug("[alife_memory] 首次见到用户 %s，准备被动召回其记忆", uid)
+                # per-session 去重：同一会话某用户只在首次出现时召回一次，
+                # 换新会话（新 sid）则重新召回——只要该会话上下文还没它的记忆
+                if uid:
+                    sid_seen = self._seen_recall.setdefault(sid, set())
+                    if uid not in sid_seen:
+                        sid_seen.add(uid)
+                        recall_user_ids.append(uid)
+                        logger.debug("[alife_memory] 会话 %s 首次见到用户 %s，准备被动召回其记忆", sid, uid)
         else:
             do_passive_update = False
             recall_user_ids = []
@@ -1088,6 +1159,72 @@ class AlifeMemoryPlugin(BasePlugin):
             parts.append(f"旧版本被取代: {memory['supersedes']}")
         return "\n".join(parts)
 
+    @register.tool(
+        name="list_users",
+        description="列出我记住的所有用户，以及每个用户的记忆数量和最近记忆概要。当用户问‘你记得哪些人/多少用户’时使用。特别适合找回某个用户，但人数很多时请加大 limit。",
+        params={"type": "object", "properties": {"limit": {"type": "integer", "description": "本次列出多少个用户；留空则用配置默认值（默认50）。总数始终显示。"}}, "required": []})
+    async def list_users(self, event: KiraMessageBatchEvent, limit: int | None = None) -> str:
+        total = await self.store.count_users()
+        if total == 0:
+            return "我目前还没有记住任何用户。"
+        shown = _num(limit, self.user_list_limit, 1, 500, True) if limit is not None else self.user_list_limit
+        users = await self.store.list_users(shown)
+        out = [f"我记得一共 {total} 个用户（显示前 {len(users)} 个）："]
+        for u in users:
+            ts = time.strftime('%Y-%m-%d', time.localtime(u["last_ts"])) if u["last_ts"] else "未知"
+            max_lv = u.get("max_level") or 1
+            out.append(f"\n- {u['user_id']} | {u['cnt']} 条记忆 | 最高层 L{max_lv} | 最近 {ts}")
+            # 最高权重×层级的那条
+            if u.get("top_summary"):
+                out.append(f"  ★ 高权重: L{u.get('top_level',1)} 重要{u.get('top_importance',0.0):.2f} → {u['top_summary'][:90]}")
+            # 最近记得的几条（数量用配置）
+            recents = u.get("recent_summaries") or []
+            rec_cnt = self.recent_summaries_count
+            if recents:
+                out.append(f"  最近记得:")
+                for rs in recents[:rec_cnt]:
+                    out.append(f"    · {rs[:80]}")
+        if total > len(users):
+            out.append(f"\n… 还有 {total - len(users)} 个用户未显示（可增大 limit 查看）")
+        return "\n".join(out)
+
+    @register.tool(
+        name="list_user_memories",
+        description="精确列出某个用户（指定 user_id）的全部记忆，跨会话。按重要性×层级优先，兼顾最近。当你要回忆某个具体用户的相关事情时使用，比笼统检索更准。",
+        params={"type": "object", "properties": {"user_id": {"type": "string", "description": "要查询的用户标识，可通过 list_users 获取"}, "limit": {"type": "integer", "description": "本次列出多少条；留空则用配置默认值（默认20）。该用户总数始终显示。"}}, "required": ["user_id"]})
+    async def list_user_memories(self, event: KiraMessageBatchEvent, user_id: str, limit: int | None = None) -> str:
+        total = await self.store.count_memories_by_user(user_id)
+        if total == 0:
+            return f"没有找到用户 {user_id} 的记忆。"
+        shown = _num(limit, self.memory_list_limit, 1, 200, True) if limit is not None else self.memory_list_limit
+        memories = await self.store.list_memories_by_user(user_id, shown)
+        out = [f"用户 {user_id} 共有 {total} 条记忆（显示前 {len(memories)} 条，按重要性×层级排序）："]
+        for m in memories:
+            t = time.strftime('%Y-%m-%d', time.localtime(m["end_ts"]))
+            conf = m.get("confidence", 0.65)
+            out.append(f"\n- L{m['level']} | 重要{m.get('importance', 0.5):.2f} | 置信{conf*100:.0f}% | {t} | {m['summary']}")
+        if total > len(memories):
+            out.append(f"\n… 还有 {total - len(memories)} 条未显示（可增大 limit 查看）")
+        return "\n".join(out)
+
+    @register.tool(
+        name="list_session_memories",
+        description="按会话（群聊/群组）列出该会话的全部记忆，适合群聊归因会话的记忆。按重要性×层级优先，兼顾最近。当用户问‘这个群里聊过什么/我记得这个会话的什么事’时使用。",
+        params={"type": "object", "properties": {"sid": {"type": "string", "description": "要查询的会话标识（如 adapter:dm|gm:id），可通过实际对话上下文获取"}, "limit": {"type": "integer", "description": "本次列出多少条；留空则用配置默认值（默认20）。该会话总数始终显示。"}}, "required": ["sid"]})
+    async def list_session_memories(self, event: KiraMessageBatchEvent, sid: str, limit: int | None = None) -> str:
+        total = await self.store.count_memories_by_sid(sid)
+        if total == 0:
+            return f"没有找到会话 {sid} 的记忆。"
+        shown = _num(limit, self.memory_list_limit, 1, 200, True) if limit is not None else self.memory_list_limit
+        memories = await self.store.list_memories_by_sid(sid, shown)
+        out = [f"会话 {sid} 共有 {total} 条记忆（显示前 {len(memories)} 条，按重要性×层级排序）："]
+        for m in memories:
+            t = time.strftime('%Y-%m-%d', time.localtime(m["end_ts"]))
+            out.append(f"\n- L{m['level']} | 重要{m.get('importance', 0.5):.2f} | {t} | {m['summary']} | 用户 {m.get('user_id','') or '—'}")
+        if total > len(memories):
+            out.append(f"\n… 还有 {total - len(memories)} 条未显示（可增大 limit 查看）")
+        return "\n".join(out)
+
     @register.page("/index", menu=PageMenu(label={"zh": "长期记忆·Z", "en": "Memory·Z"}, icon="Brain", order=90))
     def page(self):
         return PluginPage.from_folder("./web")
@@ -1200,5 +1337,35 @@ class AlifeMemoryPlugin(BasePlugin):
                 self.cfg[key].update(value)
             else:
                 self.cfg[key] = value
+        # 持久化：原子写回配置文件，避免热保存后重启丢失
+        try:
+            self._persist_config()
+        except Exception:
+            logger.exception("[alife_memory] persist config failed")
+        # 热更新后重新读取设置，并重置 rerank 探测缓存（让新配置立即生效）
+        try:
+            self._load_settings()
+        except Exception:
+            logger.exception("[alife_memory] reload settings after config update failed")
+        self._rerank_checked = False
+        self._rerank_client = None
+        # embedding 探测缓存同样重置，让新配的向量模型立即生效
+        self._embed_checked = False
+        self._embed_client = None
         return {"ok": True}
+
+    def _persist_config(self):
+        """把当前 cfg 原子写回配置文件（tmp + os.replace），并同步框架内存缓存，避免写坏/不一致。"""
+        cfg_path = Path(getattr(self, "_config_path", "")) or (get_config_path() / "plugins" / f"{PLUGIN_ID}.json")
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cfg_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.cfg, ensure_ascii=False, indent=4), encoding="utf-8")
+        tmp.replace(cfg_path)
+        # 同步框架内存 plugin_configs（如果可达），确保框架侧读到最新配置
+        try:
+            pm = getattr(self.ctx, "plugin_mgr", None)
+            if pm is not None and hasattr(pm, "plugin_configs"):
+                pm.plugin_configs[PLUGIN_ID] = self.cfg
+        except Exception:
+            logger.debug("[alife_memory] sync plugin_configs cache skipped")
           

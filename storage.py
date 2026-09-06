@@ -15,8 +15,77 @@ from typing import Any
 
 _WORD_RE = re.compile(r"[\w\u4e00-\u9fff]+", re.UNICODE)
 
+# jieba 中文分词（可选依赖，缺失则降级为字符级 fallback）
+try:
+    import jieba  # type: ignore
+    _JIEBA_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _JIEBA_AVAILABLE = False
+
+
+def _fallback_tokenize(text: str) -> list[str]:
+    """无 jieba 时的兜底分词：英文按词、中文按字符切分（比整句当一个 token 强）。"""
+    if not text:
+        return []
+    tokens: list[str] = []
+    buf = ""
+    for ch in text:
+        if ch.isascii() and (ch.isalnum() or ch == "_"):
+            buf += ch
+        else:
+            if buf:
+                tokens.append(buf)
+                buf = ""
+            if ch.strip():
+                tokens.append(ch)
+    if buf:
+        tokens.append(buf)
+    return tokens
+
+
+def segment_for_fts(text: str) -> str:
+    """把文本用 jieba（可选）分词后用空格连接，使 FTS5 unicode61 能正确检索中文。
+    无 jieba 时降级为字符级 fallback。"""
+    if not text:
+        return ""
+    if _JIEBA_AVAILABLE:
+        toks = [t for t in jieba.lcut(text) if t.strip()]
+    else:
+        toks = [t for t in _fallback_tokenize(text) if t.strip()]
+    return " ".join(toks)
+
+
+def build_fts_query(text: str) -> str:
+    """构造 FTS5 查询：jieba 分词后过滤单字中文（保留英文单字符），OR 连接各 token。"""
+    if not text or not text.strip():
+        return ""
+    cleaned = text.strip()
+    for ch in ['"', "'", "(", ")", "*", "+", "-", ":", "^", "{", "}", "~",
+               "[", "]", "@", "<", ">", "/", "\\", "|", "!", "?", "#", "&",
+               "=", ";", ",", "."]:
+        cleaned = cleaned.replace(ch, " ")
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return ""
+    if _JIEBA_AVAILABLE:
+        toks = [t.strip() for t in jieba.lcut(cleaned) if t.strip()]
+    else:
+        toks = [t.strip() for t in _fallback_tokenize(cleaned) if t.strip()]
+    # 过滤单字符中文（停用词），保留英文单字符
+    toks = [t for t in toks if len(t) > 1 or t.isascii()]
+    if not toks:
+        return cleaned
+    if len(toks) == 1:
+        return toks[0]
+    return " OR ".join(toks)
+
 
 def tokenize(text: str) -> list[str]:
+    """返回分词 token 列表（jieba 优先，字符级兜底）。"""
+    if not text:
+        return []
+    if _JIEBA_AVAILABLE:
+        return [t for t in jieba.lcut(text) if t.strip()]
     return [x.lower() for x in _WORD_RE.findall(text or "") if x.strip()]
 
 
@@ -137,6 +206,32 @@ class MemoryStore:
                 if name not in columns:
                     conn.execute(statement)
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_source_fingerprint ON memories(source_fingerprint) WHERE source_fingerprint <> ''")
+            # FTS 中文检索迁移：统一重建为 unicode61（jieba 分词后空格连接入库，能正确检索中文）
+            try:
+                fts_sql_row = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories_fts'"
+                ).fetchone()
+                # 旧表可能是 trigram（存原文）或旧 unicode61（无分词）；统一重建为 jieba 分词入库
+                if fts_sql_row and ("trigram" in (fts_sql_row[0] or "").lower() or "tokenize" not in (fts_sql_row[0] or "").lower()):
+                    logger = __import__("logging").getLogger("alife_memory_storage")
+                    logger.info("[alife_memory_storage] 重建 memories_fts 为 jieba 分词索引（中文检索）")
+                    # 读取旧 FTS 里的原文本（从 memories 表，避免占用旧 FTS）
+                    old_rows = conn.execute("SELECT id,sid,level,summary,content FROM memories WHERE deleted=0").fetchall()
+                    conn.execute("DROP TABLE memories_fts")
+                    conn.execute("""
+                        CREATE VIRTUAL TABLE memories_fts USING fts5(
+                            summary, content, sid UNINDEXED, level UNINDEXED, memory_id UNINDEXED
+                        )
+                    """)
+                    for r in old_rows:
+                        seg_sum = segment_for_fts(r["summary"])
+                        seg_con = segment_for_fts(r["content"])
+                        conn.execute(
+                            "INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
+                            (seg_sum, seg_con, r["sid"], r["level"], r["id"])
+                        )
+            except Exception:
+                pass
             conn.commit()
         finally:
             conn.close()
@@ -317,9 +412,56 @@ class MemoryStore:
             )
             conn.execute("DELETE FROM memories_fts WHERE memory_id=?", (mid,))
             conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
-                         (summary, content, sid, level, mid))
+                         (segment_for_fts(summary), segment_for_fts(content), sid, level, mid))
             conn.commit()
             return mid
+        finally:
+            conn.close()
+
+    async def add_memories_batch(self, rows: list[dict]) -> int:
+        """批量写记忆（迁移专用）：单连接单事务处理多条，显著快于逐条 add_memory。
+        保留 source_fingerprint 去重，避免重复迁移。返回新增条数。"""
+        if not rows:
+            return 0
+        return await asyncio.to_thread(self._add_memories_batch, rows)
+
+    def _add_memories_batch(self, rows):
+        conn = self._connect()
+        added = 0
+        try:
+            for it in rows:
+                sid = it["sid"]; level = it["level"]; summary = it["summary"]
+                content = it["content"]; start_ts = it["start_ts"]; end_ts = it["end_ts"]
+                importance = it.get("importance", 0.5); embedding = it.get("embedding")
+                source_ids = it.get("source_ids", []); source_refs = it.get("source_refs", [])
+                user_id = it.get("user_id", ""); confidence = it.get("confidence", 0.65)
+                source_fingerprint = it.get("source_fingerprint", ""); memory_id = it.get("memory_id")
+                fact_key = normalized_fact_key(summary, content)
+                now = time.time()
+                # 去重：同指纹已存在 → 跳过（迁移幂等）
+                if source_fingerprint:
+                    existing = conn.execute("SELECT id FROM memories WHERE source_fingerprint=? LIMIT 1", (source_fingerprint,)).fetchone()
+                    if existing:
+                        continue
+                # dedupe_key 一级去重（同层级同事实）
+                dup = conn.execute("SELECT id FROM memories WHERE dedupe_key=? AND status='active' AND deleted=0 AND level=? LIMIT 1", (fact_key, level)).fetchone()
+                if dup:
+                    continue
+                mid = memory_id or f"L{level}-{int(start_ts)}-{int(end_ts)}-{uuid.uuid4().hex[:8]}"
+                refs = source_refs or [{"sid": sid, "user_id": str(user_id or ""), "start_ts": start_ts, "end_ts": end_ts}]
+                conn.execute(
+                    "INSERT OR REPLACE INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (mid, sid, str(user_id or ""), level, summary.strip(), content, start_ts, end_ts,
+                     max(0.0, min(1.0, importance)), json.dumps(source_ids, ensure_ascii=False),
+                     json.dumps(embedding) if embedding else None, now, now, "active",
+                     max(0.0, min(1.0, confidence)), None, "", source_fingerprint or "", fact_key,
+                     json.dumps(refs, ensure_ascii=False)))
+                conn.execute("DELETE FROM memories_fts WHERE memory_id=?", (mid,))
+                conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
+                             (segment_for_fts(summary), segment_for_fts(content), sid, level, mid))
+                added += 1
+            conn.commit()
+            return added
         finally:
             conn.close()
 
@@ -334,7 +476,6 @@ class MemoryStore:
         conn = self._connect()
         try:
             terms = tokenize(query)
-            match = " OR ".join('"' + t.replace('"', ' ') + '"' for t in terms[:12])
             level_sql = "" if not levels else " AND m.level IN (%s)" % ",".join("?" * len(levels))
             if scope in ("global", "linked"):
                 owner_sql, owner_params = "1=1", []
@@ -342,24 +483,49 @@ class MemoryStore:
                 owner_sql, owner_params = "m.user_id=?", [str(user_id)]
             else:
                 owner_sql, owner_params = "m.sid=?", [sid]
-            if match:
-                rows = conn.execute(
+            rows = []
+            seen_ids: set[str] = set()
+            # jieba 分词后的 FTS 查询（unicode61 能正确检索中文）；无有效 token 时跳过
+            fts_query = build_fts_query(query)
+            fts_bm25 = {}
+            if fts_query:
+                fts_rows = conn.execute(
                     f"""SELECT m.*, bm25(memories_fts) AS bm25_score
                         FROM memories_fts f JOIN memories m ON m.id=f.memory_id
                         WHERE {owner_sql} AND memories_fts MATCH ? AND m.deleted=0 AND m.status IN ('active','archived') {level_sql}
-                        ORDER BY bm25_score LIMIT 80""", [*owner_params, match, *([] if not levels else levels)]
+                        ORDER BY bm25_score LIMIT 80""",
+                    [*owner_params, fts_query, *([] if not levels else levels)]
                 ).fetchall()
-                if not rows:
-                    like_terms = [f"%{term}%" for term in terms[:8]]
-                    like_sql = " OR ".join("(m.summary LIKE ? OR m.content LIKE ?)" for _ in like_terms)
-                    rows = conn.execute(
+                for r in fts_rows:
+                    if r["id"] not in seen_ids:
+                        rows.append(r)
+                        seen_ids.add(r["id"])
+                        fts_bm25[r["id"]] = float(r["bm25_score"] or 0.0)
+            # LIKE 兜底：仅当 FTS 命中不足时才启用，避免全表扫和单字误召回刷屏。
+            # 若 FTS 已命中足够结果（>= limit*2），直接跳过（省性能、防误召回）。
+            target = max(limit * 2, limit)
+            if len(seen_ids) < target:
+                like_terms = list(dict.fromkeys(terms[:8]))  # 分词 token 去重
+                # 补充中文字符（去重，过滤空白），覆盖单字书名/人名等 jieba 未登录词
+                for ch in str(query):
+                    if ch.strip() and ('\u4e00' <= ch <= '\u9fff'):
+                        like_terms.append(ch)
+                like_terms_all = [f"%{term}%" for term in like_terms[:12]]
+                if like_terms_all:
+                    like_sql = " OR ".join("(m.summary LIKE ? OR m.content LIKE ?)" for _ in like_terms_all)
+                    like_rows = conn.execute(
                         f"""SELECT m.*, 0.0 AS bm25_score FROM memories m
                             WHERE {owner_sql} AND m.deleted=0 AND m.status IN ('active','archived')
                               AND ({like_sql}) {level_sql}
                             ORDER BY m.importance DESC, m.end_ts DESC LIMIT 80""",
-                        [*owner_params, *sum(([x, x] for x in like_terms), []), *([] if not levels else levels)]
+                        [*owner_params, *sum(([x, x] for x in like_terms_all), []), *([] if not levels else levels)]
                     ).fetchall()
-            else:
+                    for r in like_rows:
+                        if r["id"] not in seen_ids:
+                            rows.append(r)
+                            seen_ids.add(r["id"])
+                            fts_bm25[r["id"]] = 0.0
+            if not rows:
                 rows = conn.execute(
                     f"""SELECT m.*, 0.0 AS bm25_score FROM memories m
                         WHERE {owner_sql} AND m.deleted=0 AND m.status='active' {level_sql}
@@ -369,7 +535,11 @@ class MemoryStore:
             scored = []
             for row in rows:
                 item = dict(row)
-                lex = 1.0 / (1.0 + max(0.0, float(item.get("bm25_score") or 0.0)))
+                # 从 fts_bm25 取该记忆的 bm25 分（LIKE 兜底行未命中 FTS 则为 0）
+                bm25_val = fts_bm25.get(item["id"], 0.0)
+                lex = abs(float(bm25_val))
+                # FTS5 bm25 负值越小越相关，归一化到 [0,1]：相关→趋近1，不相关→趋近0
+                lex = lex / (1.0 + lex)
                 semantic = cosine(query_embedding, json.loads(item["embedding"])) if query_embedding and item.get("embedding") else 0.0
                 age_days = max(0.0, (now - float(item["end_ts"])) / 86400.0)
                 decay = 0.5 ** (age_days / max(1.0, half_life))
@@ -462,7 +632,7 @@ class MemoryStore:
                  normalized_fact_key(summary, content), old['source_refs']))
             conn.execute("DELETE FROM memories_fts WHERE memory_id IN (?,?)", (memory_id, new_id))
             conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
-                         (summary, content, old['sid'], old['level'], new_id))
+                         (segment_for_fts(summary), segment_for_fts(content), old['sid'], old['level'], new_id))
             conn.commit()
             return new_id
         finally:
@@ -504,6 +674,7 @@ class MemoryStore:
             def n(sql): return int(conn.execute(sql).fetchone()[0])
             return {"messages": n("SELECT COUNT(*) FROM messages"), "pending": n("SELECT COUNT(*) FROM messages WHERE compressed=0"),
                     "memories": n("SELECT COUNT(*) FROM memories WHERE deleted=0"), "sessions": n("SELECT COUNT(DISTINCT sid) FROM messages"),
+                    "users": n("SELECT COUNT(DISTINCT user_id) FROM memories WHERE deleted=0 AND user_id != ''"),
                     "db_bytes": self.path.stat().st_size if self.path.exists() else 0}
         finally:
             conn.close()
@@ -576,15 +747,170 @@ class MemoryStore:
         finally:
             conn.close()
 
-    async def count_memories_by_user(self, user_id: str, limit: int = 20) -> list[dict]:
-        return await asyncio.to_thread(self._count_memories_by_user, user_id, limit)
+    async def count_memories_by_users(self, user_ids: list[str], limit: int = 20) -> list[dict]:
+        """批量查询多个用户的跨会话记忆，一次 SQL 代替逐个查询。"""
+        return await asyncio.to_thread(self._count_memories_by_users, user_ids, limit)
 
-    def _count_memories_by_user(self, user_id, limit):
+    def _count_memories_by_users(self, user_ids, limit):
+        if not user_ids:
+            return []
+        conn = self._connect()
+        try:
+            placeholders = ",".join("?" * len(user_ids))
+            rows = conn.execute(
+                f"SELECT * FROM memories WHERE user_id IN ({placeholders}) AND deleted=0 AND status='active' "
+                "ORDER BY end_ts DESC LIMIT ?",
+                [*user_ids, limit * len(user_ids)]
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    item["source_ids"] = json.loads(item.get("source_ids") or "[]")
+                    item["source_refs"] = json.loads(item.get("source_refs") or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    item["source_ids"], item["source_refs"] = [], []
+                result.append(item)
+            return result
+        finally:
+            conn.close()
+
+    async def count_users(self) -> int:
+        """真实用户总数（去重，排除空）。"""
+        return await asyncio.to_thread(self._count_users)
+
+    def _count_users(self):
+        conn = self._connect()
+        try:
+            return int(conn.execute(
+                "SELECT COUNT(DISTINCT user_id) FROM memories WHERE deleted=0 AND user_id != ''"
+            ).fetchone()[0])
+        finally:
+            conn.close()
+
+    async def count_sessions(self) -> int:
+        """真实会话总数（去重）。"""
+        return await asyncio.to_thread(self._count_sessions)
+
+    def _count_sessions(self):
+        conn = self._connect()
+        try:
+            return int(conn.execute(
+                "SELECT COUNT(DISTINCT sid) FROM memories WHERE deleted=0 AND sid != ''"
+            ).fetchone()[0])
+        finally:
+            conn.close()
+
+    async def list_users(self, limit: int = 50) -> list[dict]:
+        """列出所有被记住的用户及其记忆概况。"""
+        return await asyncio.to_thread(self._list_users, limit)
+
+    def _list_users(self, limit):
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT * FROM memories WHERE user_id=? AND deleted=0 AND status='active' ORDER BY end_ts DESC LIMIT ?",
+                "SELECT user_id, COUNT(*) AS cnt, MAX(end_ts) AS last_ts, MAX(level) AS max_level "
+                "FROM memories WHERE deleted=0 AND user_id != '' AND status='active' "
+                "GROUP BY user_id ORDER BY cnt DESC, last_ts DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                uid = item["user_id"]
+                # 最近几条（按时间倒序，默认3条）
+                recent = conn.execute(
+                    "SELECT summary, end_ts FROM memories WHERE user_id=? AND deleted=0 AND status='active' "
+                    "ORDER BY end_ts DESC LIMIT 3",
+                    (uid,)
+                ).fetchall()
+                item["recent_summaries"] = [r["summary"] for r in recent]
+                item["recent_summary"] = item["recent_summaries"][0] if item["recent_summaries"] else ""
+                # 最高权重×层级 那条
+                top = conn.execute(
+                    "SELECT summary, level, importance, end_ts FROM memories WHERE user_id=? AND deleted=0 AND status='active' "
+                    "ORDER BY (importance * 0.6 + level * 0.4) DESC, end_ts DESC LIMIT 1",
+                    (uid,)
+                ).fetchone()
+                if top:
+                    item["top_summary"] = top["summary"]
+                    item["top_level"] = top["level"]
+                    item["top_importance"] = top["importance"]
+                else:
+                    item["top_summary"] = ""
+                    item["top_level"] = item.get("max_level", 1)
+                    item["top_importance"] = 0.0
+                result.append(item)
+            return result
+        finally:
+            conn.close()
+
+    async def count_memories_by_user(self, user_id: str) -> int:
+        """某用户的真实记忆总数（去删除）。"""
+        return await asyncio.to_thread(self._count_memories_by_user, user_id)
+
+    def _count_memories_by_user(self, user_id):
+        conn = self._connect()
+        try:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE user_id=? AND deleted=0",
+                (user_id,)
+            ).fetchone()[0])
+        finally:
+            conn.close()
+
+    async def count_memories_by_sid(self, sid: str) -> int:
+        """某会话的真实记忆总数（去删除）。"""
+        return await asyncio.to_thread(self._count_memories_by_sid, sid)
+
+    def _count_memories_by_sid(self, sid):
+        conn = self._connect()
+        try:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE sid=? AND deleted=0",
+                (sid,)
+            ).fetchone()[0])
+        finally:
+            conn.close()
+
+    async def list_memories_by_user(self, user_id: str, limit: int = 20, include_archived: bool = False) -> list[dict]:
+        """按用户精确列出其全部记忆（跨会话）。按 高权重×高层级 优先，兼顾最近。"""
+        return await asyncio.to_thread(self._list_memories_by_user, user_id, limit, include_archived)
+
+    def _list_memories_by_user(self, user_id, limit, include_archived):
+        conn = self._connect()
+        try:
+            status_sql = "IN ('active','archived')" if include_archived else "='active'"
+            rows = conn.execute(
+                f"SELECT * FROM memories WHERE user_id=? AND deleted=0 AND status{status_sql} "
+                "ORDER BY (importance * 0.6 + level * 0.4) DESC, end_ts DESC LIMIT ?",
                 (user_id, limit)
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    item["source_ids"] = json.loads(item.get("source_ids") or "[]")
+                    item["source_refs"] = json.loads(item.get("source_refs") or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    item["source_ids"], item["source_refs"] = [], []
+                result.append(item)
+            return result
+        finally:
+            conn.close()
+
+    async def list_memories_by_sid(self, sid: str, limit: int = 20, include_archived: bool = False) -> list[dict]:
+        """按会话（群聊）精确列出其记忆。按 高权重×高层级 优先，兼顾最近。"""
+        return await asyncio.to_thread(self._list_memories_by_sid, sid, limit, include_archived)
+
+    def _list_memories_by_sid(self, sid, limit, include_archived):
+        conn = self._connect()
+        try:
+            status_sql = "IN ('active','archived')" if include_archived else "='active'"
+            rows = conn.execute(
+                f"SELECT * FROM memories WHERE sid=? AND deleted=0 AND status{status_sql} "
+                "ORDER BY (importance * 0.6 + level * 0.4) DESC, end_ts DESC LIMIT ?",
+                (sid, limit)
             ).fetchall()
             result = []
             for row in rows:
