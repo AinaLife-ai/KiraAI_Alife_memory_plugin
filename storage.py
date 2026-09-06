@@ -15,8 +15,77 @@ from typing import Any
 
 _WORD_RE = re.compile(r"[\w\u4e00-\u9fff]+", re.UNICODE)
 
+# jieba 中文分词（可选依赖，缺失则降级为字符级 fallback）
+try:
+    import jieba  # type: ignore
+    _JIEBA_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _JIEBA_AVAILABLE = False
+
+
+def _fallback_tokenize(text: str) -> list[str]:
+    """无 jieba 时的兜底分词：英文按词、中文按字符切分（比整句当一个 token 强）。"""
+    if not text:
+        return []
+    tokens: list[str] = []
+    buf = ""
+    for ch in text:
+        if ch.isascii() and (ch.isalnum() or ch == "_"):
+            buf += ch
+        else:
+            if buf:
+                tokens.append(buf)
+                buf = ""
+            if ch.strip():
+                tokens.append(ch)
+    if buf:
+        tokens.append(buf)
+    return tokens
+
+
+def segment_for_fts(text: str) -> str:
+    """把文本用 jieba（可选）分词后用空格连接，使 FTS5 unicode61 能正确检索中文。
+    无 jieba 时降级为字符级 fallback。"""
+    if not text:
+        return ""
+    if _JIEBA_AVAILABLE:
+        toks = [t for t in jieba.lcut(text) if t.strip()]
+    else:
+        toks = [t for t in _fallback_tokenize(text) if t.strip()]
+    return " ".join(toks)
+
+
+def build_fts_query(text: str) -> str:
+    """构造 FTS5 查询：jieba 分词后过滤单字中文（保留英文单字符），OR 连接各 token。"""
+    if not text or not text.strip():
+        return ""
+    cleaned = text.strip()
+    for ch in ['"', "'", "(", ")", "*", "+", "-", ":", "^", "{", "}", "~",
+               "[", "]", "@", "<", ">", "/", "\\", "|", "!", "?", "#", "&",
+               "=", ";", ",", "."]:
+        cleaned = cleaned.replace(ch, " ")
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return ""
+    if _JIEBA_AVAILABLE:
+        toks = [t.strip() for t in jieba.lcut(cleaned) if t.strip()]
+    else:
+        toks = [t.strip() for t in _fallback_tokenize(cleaned) if t.strip()]
+    # 过滤单字符中文（停用词），保留英文单字符
+    toks = [t for t in toks if len(t) > 1 or t.isascii()]
+    if not toks:
+        return cleaned
+    if len(toks) == 1:
+        return toks[0]
+    return " OR ".join(toks)
+
 
 def tokenize(text: str) -> list[str]:
+    """返回分词 token 列表（jieba 优先，字符级兜底）。"""
+    if not text:
+        return []
+    if _JIEBA_AVAILABLE:
+        return [t for t in jieba.lcut(text) if t.strip()]
     return [x.lower() for x in _WORD_RE.findall(text or "") if x.strip()]
 
 
@@ -102,7 +171,7 @@ class MemoryStore:
                     ON memories(sid, level, end_ts DESC);
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                     summary, content, sid UNINDEXED, level UNINDEXED,
-                    memory_id UNINDEXED, tokenize='trigram'
+                    memory_id UNINDEXED
                 );
                 CREATE TABLE IF NOT EXISTS tasks (
                     id TEXT PRIMARY KEY,
@@ -137,32 +206,30 @@ class MemoryStore:
                 if name not in columns:
                     conn.execute(statement)
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_source_fingerprint ON memories(source_fingerprint) WHERE source_fingerprint <> ''")
-            # FTS 中文检索迁移：检测旧表未用 trigram tokenizer，重建为 trigram（支持中文子串匹配）
+            # FTS 中文检索迁移：统一重建为 unicode61（jieba 分词后空格连接入库，能正确检索中文）
             try:
                 fts_sql_row = conn.execute(
                     "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories_fts'"
                 ).fetchone()
-                if fts_sql_row and "trigram" not in (fts_sql_row[0] or "").lower():
+                # 旧表可能是 trigram（存原文）或旧 unicode61（无分词）；统一重建为 jieba 分词入库
+                if fts_sql_row and ("trigram" in (fts_sql_row[0] or "").lower() or "tokenize" not in (fts_sql_row[0] or "").lower()):
                     logger = __import__("logging").getLogger("alife_memory_storage")
-                    logger.info("[alife_memory_storage] 检测到旧版 FTS（无 trigram），重建 memories_fts 以支持中文检索")
-                    # 复制旧数据到临时表
-                    conn.execute("""
-                        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts_old USING fts5(
-                            summary, content, sid UNINDEXED, level UNINDEXED, memory_id UNINDEXED
-                        )
-                    """)
-                    conn.execute("INSERT INTO memories_fts_old(summary,content,sid,level,memory_id) "
-                                 "SELECT summary,content,sid,level,memory_id FROM memories_fts")
+                    logger.info("[alife_memory_storage] 重建 memories_fts 为 jieba 分词索引（中文检索）")
+                    # 读取旧 FTS 里的原文本（从 memories 表，避免占用旧 FTS）
+                    old_rows = conn.execute("SELECT id,sid,level,summary,content FROM memories WHERE deleted=0").fetchall()
                     conn.execute("DROP TABLE memories_fts")
                     conn.execute("""
                         CREATE VIRTUAL TABLE memories_fts USING fts5(
-                            summary, content, sid UNINDEXED, level UNINDEXED,
-                            memory_id UNINDEXED, tokenize='trigram'
+                            summary, content, sid UNINDEXED, level UNINDEXED, memory_id UNINDEXED
                         )
                     """)
-                    conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) "
-                                 "SELECT summary,content,sid,level,memory_id FROM memories_fts_old")
-                    conn.execute("DROP TABLE memories_fts_old")
+                    for r in old_rows:
+                        seg_sum = segment_for_fts(r["summary"])
+                        seg_con = segment_for_fts(r["content"])
+                        conn.execute(
+                            "INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
+                            (seg_sum, seg_con, r["sid"], r["level"], r["id"])
+                        )
             except Exception:
                 pass
             conn.commit()
@@ -345,7 +412,7 @@ class MemoryStore:
             )
             conn.execute("DELETE FROM memories_fts WHERE memory_id=?", (mid,))
             conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
-                         (summary, content, sid, level, mid))
+                         (segment_for_fts(summary), segment_for_fts(content), sid, level, mid))
             conn.commit()
             return mid
         finally:
@@ -391,7 +458,7 @@ class MemoryStore:
                      json.dumps(refs, ensure_ascii=False)))
                 conn.execute("DELETE FROM memories_fts WHERE memory_id=?", (mid,))
                 conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
-                             (summary, content, sid, level, mid))
+                             (segment_for_fts(summary), segment_for_fts(content), sid, level, mid))
                 added += 1
             conn.commit()
             return added
@@ -418,24 +485,24 @@ class MemoryStore:
                 owner_sql, owner_params = "m.sid=?", [sid]
             rows = []
             seen_ids: set[str] = set()
-            # trigram tokenizer 需要 ≥3 字符才能建 token；对 <3 字符的词用 LIKE 兜底
-            fts_terms = [t for t in terms[:12] if len(t) >= 3]
-            short_terms = [t for t in terms[:12] if 0 < len(t) < 3]
-            like_terms_all = [f"%{term}%" for term in terms[:8]]
-            if fts_terms:
-                fts_match = " OR ".join('"' + t.replace('"', ' ') + '"' for t in fts_terms)
+            # jieba 分词后的 FTS 查询（unicode61 能正确检索中文）；无有效 token 时跳过
+            fts_query = build_fts_query(query)
+            fts_bm25 = {}
+            if fts_query:
                 fts_rows = conn.execute(
                     f"""SELECT m.*, bm25(memories_fts) AS bm25_score
                         FROM memories_fts f JOIN memories m ON m.id=f.memory_id
                         WHERE {owner_sql} AND memories_fts MATCH ? AND m.deleted=0 AND m.status IN ('active','archived') {level_sql}
                         ORDER BY bm25_score LIMIT 80""",
-                    [*owner_params, fts_match, *([] if not levels else levels)]
+                    [*owner_params, fts_query, *([] if not levels else levels)]
                 ).fetchall()
                 for r in fts_rows:
                     if r["id"] not in seen_ids:
                         rows.append(r)
                         seen_ids.add(r["id"])
-            # LIKE 兜底：短词（<3，trigram 不建 token）+ 中文整句（FTS 无法匹配子串）都会被这里捕获
+                        fts_bm25[r["id"]] = float(r["bm25_score"] or 0.0)
+            # LIKE 兜底：分词后的 token 做子串匹配，捕获 FTS 未命中的词（含生僻、未登录词）
+            like_terms_all = [f"%{term}%" for term in terms[:8]]
             if like_terms_all:
                 like_sql = " OR ".join("(m.summary LIKE ? OR m.content LIKE ?)" for _ in like_terms_all)
                 like_rows = conn.execute(
@@ -449,6 +516,7 @@ class MemoryStore:
                     if r["id"] not in seen_ids:
                         rows.append(r)
                         seen_ids.add(r["id"])
+                        fts_bm25[r["id"]] = 0.0
             if not rows:
                 rows = conn.execute(
                     f"""SELECT m.*, 0.0 AS bm25_score FROM memories m
@@ -459,7 +527,9 @@ class MemoryStore:
             scored = []
             for row in rows:
                 item = dict(row)
-                lex = abs(float(item.get("bm25_score") or 0.0))
+                # 从 fts_bm25 取该记忆的 bm25 分（LIKE 兜底行未命中 FTS 则为 0）
+                bm25_val = fts_bm25.get(item["id"], 0.0)
+                lex = abs(float(bm25_val))
                 # FTS5 bm25 负值越小越相关，归一化到 [0,1]：相关→趋近1，不相关→趋近0
                 lex = lex / (1.0 + lex)
                 semantic = cosine(query_embedding, json.loads(item["embedding"])) if query_embedding and item.get("embedding") else 0.0
@@ -554,7 +624,7 @@ class MemoryStore:
                  normalized_fact_key(summary, content), old['source_refs']))
             conn.execute("DELETE FROM memories_fts WHERE memory_id IN (?,?)", (memory_id, new_id))
             conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
-                         (summary, content, old['sid'], old['level'], new_id))
+                         (segment_for_fts(summary), segment_for_fts(content), old['sid'], old['level'], new_id))
             conn.commit()
             return new_id
         finally:

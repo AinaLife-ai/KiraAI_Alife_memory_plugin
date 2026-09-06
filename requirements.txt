@@ -1,0 +1,12 @@
+# Alife Memory·Z plugin runtime dependencies
+#
+# Installed automatically by KiraAI's plugin installer when the plugin is
+# fetched via WebUI (Install from GitHub / upload ZIP). For existing installs
+# you can run manually:
+#
+#     python -m pip install -r data/plugins/alife_memory_z/requirements.txt
+
+# Chinese tokenizer driving FTS5 retrieval (memory_index falls back to a
+# character-level tokenizer if missing), but Chinese recall quality improves
+# significantly with it. Optional but strongly recommended.
+jieba>=0.42.1
