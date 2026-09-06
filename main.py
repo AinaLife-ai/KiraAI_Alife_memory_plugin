@@ -12,7 +12,10 @@ from typing import Any
 
 from fastapi import Request
 
-from core.plugin import BasePlugin, PageMenu, PluginPage, Priority, logger, on, register
+from core.plugin import BasePlugin, PageMenu, PluginPage, Priority, on, register
+from core.logging_manager import get_logger
+
+logger = get_logger("alife_memory", "light_purple")
 from core.chat import MessageChain
 from core.chat.message_elements import Text
 from core.chat.message_utils import KiraMessageBatchEvent, KiraMessageEvent
@@ -93,6 +96,7 @@ class AlifeMemoryPlugin(BasePlugin):
         self._cleanup_task: asyncio.Task | None = None
         self._closed = False
         self._seen_user_ids: set[str] = set()
+        self._recall_round_counter: dict[str, int] = {}
         self._load_settings()
         # 数据目录迁移：旧 alife_memory → alife_memory_z
         data_dir = Path(ctx.get_plugin_data_dir())
@@ -116,6 +120,8 @@ class AlifeMemoryPlugin(BasePlugin):
         self.capture_enabled = bool(basic.get("capture_enabled", True))
         self.auto_inject = bool(basic.get("auto_inject", True))
         self.passive_recall = bool(basic.get("passive_recall", True))
+        self.passive_recall_update_rounds = _num(basic.get("passive_recall_update_rounds", 10), 10, 1, 200, True)
+        self.passive_recall_keyword_limit = _num(basic.get("passive_recall_keyword_limit", 8), 8, 1, 30, True)
         self.max_injected_tokens = _num(basic.get("max_injected_tokens", 1500), 1500, 100, 8000, True)
         self.max_injected_items = _num(basic.get("max_injected_items", 8), 8, 1, 30, True)
         self.max_injected_chars = _num(basic.get("max_injected_chars", 3000), 3000, 200, 20000, True)
@@ -143,6 +149,8 @@ class AlifeMemoryPlugin(BasePlugin):
         self.retrieval_top_k = _num(retrieval.get("top_k", 5), 5, 1, 12, True)
         self.half_life = _num(retrieval.get("recency_half_life_days", 45), 45, 1, 3650)
         self.semantic_enabled = bool(retrieval.get("semantic_enabled", True))
+        self.embedding_model = str(retrieval.get("embedding_model", "") or "").strip()
+        self.rerank_model = str(retrieval.get("rerank_model", "") or "").strip()
         self.search_scope = str(retrieval.get("search_scope", "linked") or "linked").lower()
         if self.search_scope not in ("session", "linked", "global"):
             self.search_scope = "linked"
@@ -387,7 +395,10 @@ class AlifeMemoryPlugin(BasePlugin):
         if not self.semantic_enabled:
             return None
         try:
-            client = self.ctx.get_default_embedding_client()
+            if self.embedding_model:
+                client = self.ctx.get_embedding_client(model_uuid=self.embedding_model)
+            else:
+                client = self.ctx.get_default_embedding_client()
             if not client:
                 return None
             result = await client.embed([text])
@@ -396,6 +407,31 @@ class AlifeMemoryPlugin(BasePlugin):
         except Exception as exc:
             logger.debug("[alife_memory] embedding unavailable: %s", exc)
             return None
+
+    async def _rerank(self, query: str, items: list[dict]) -> list[dict]:
+        """Rerank search results using configured rerank model."""
+        if not items:
+            return items
+        try:
+            pm = getattr(self.ctx, "provider_mgr", None)
+            if not pm:
+                return items
+            if self.rerank_model:
+                parts = self.rerank_model.split(":")
+                client = pm.get_model_client(parts[0], ":".join(parts[1:]))
+            else:
+                client = pm.get_default_rerank()
+            if not client or not hasattr(client, "rerank"):
+                return items
+            texts = [f"{x.get('summary', '')} {x.get('content', '')}" for x in items]
+            scores = await client.rerank(query, texts)
+            if scores and len(scores) == len(items):
+                for i, x in enumerate(items):
+                    x["score"] = x.get("score", 0.0) * 0.5 + float(scores[i]) * 0.5
+                items.sort(key=lambda x: x["score"], reverse=True)
+        except Exception:
+            logger.warning("[alife_memory] rerank unavailable, skipped")
+        return items
 
     async def _remember_turn(self, sid: str, user_messages: list[dict[str, Any]], assistant_text: str,
                              ts: float, turn_key: str = ""):
@@ -583,7 +619,8 @@ class AlifeMemoryPlugin(BasePlugin):
                     vector = await self._embed(summary + "\n" + content)
                     await self.store.correct_memory(memory["id"], summary, content, note, confidence, vector)
 
-    async def _inject(self, sid: str, req: LLMRequest, user_id: str = "", recall_user_ids: list[str] | None = None):
+    async def _inject(self, sid: str, req: LLMRequest, user_id: str = "", recall_user_ids: list[str] | None = None,
+                     do_passive_update: bool = False):
         if not self.auto_inject:
             return
         query = ""
@@ -598,10 +635,11 @@ class AlifeMemoryPlugin(BasePlugin):
         all_results: list[dict] = []
         seen_ids: set[str] = set()
         scope = self.search_scope if self.cross_user_enabled else ("user" if user_id else "session")
+        query_embed = await self._embed(str(query))
 
-        # 第一轮：按用户查询内容检索
-        content_results = await self.store.search(sid, str(query), self.retrieval_top_k, list(range(self.inject_level_max + 1)), await self._embed(str(query)), self.half_life, scope, user_id)
-        # 只注入 active 记忆，archived 的不参与注入
+        # 1) 主注入：整句语义搜索
+        content_results = await self.store.search(sid, str(query), self.retrieval_top_k + 2,
+            list(range(self.inject_level_max + 1)), query_embed, self.half_life, scope, user_id)
         content_results = [r for r in content_results if r.get("status", "active") == "active"]
         best_score = 0.0
         for r in content_results:
@@ -609,64 +647,113 @@ class AlifeMemoryPlugin(BasePlugin):
                 all_results.append(r)
                 seen_ids.add(r["id"])
                 best_score = max(best_score, r.get("score", 0.0))
+        logger.debug("[alife_memory] 主注入: query='%s' → %d 条, 最高分 %.2f", query[:40], len(content_results), best_score)
 
-        # 被动召回加强：当主检索结果不够强时，自动做宽召回
-        if self.passive_recall:
-            # 1) 首次见到的用户额外召回他们的记忆
-            if recall_user_ids:
-                for uid in recall_user_ids:
-                    if uid and uid == user_id:
-                        continue
-                    for r in await self.store.count_memories_by_user(uid, 5):
-                        if r["id"] not in seen_ids:
-                            r["score"] = 0.3
-                            all_results.append(r)
-                            seen_ids.add(r["id"])
+        # 2) 关键词被动召回（每轮都做，提取关键词补新记忆）
+        if self.passive_recall and self.passive_recall_keyword_limit > 0:
+            keywords = re.split(r'[，。！？、：；\s,;:?()（）\n\t]+', str(query)[:200])
+            keywords = [k.strip() for k in keywords if len(k.strip()) >= 2 and not k.strip().isdigit()][:6]
+            kw_added = 0
+            for keyword in keywords:
+                if kw_added >= self.passive_recall_keyword_limit:
+                    break
+                kw_results = await self.store.search(sid, keyword, 3,
+                    list(range(self.inject_level_max + 1)), await self._embed(keyword),
+                    self.half_life, "linked", user_id)
+                for r in kw_results:
+                    if r["id"] not in seen_ids and r.get("status", "active") == "active":
+                        r["score"] = r.get("score", 0.0) * 0.4
+                        all_results.append(r)
+                        seen_ids.add(r["id"])
+                        kw_added += 1
+            if kw_added:
+                logger.debug("[alife_memory] 关键词被动召回: %d 关键词 → +%d 条", len(keywords), kw_added)
 
-            # 2) 检索结果弱时，以主题关键词做全局宽召回
-            if best_score < self.passive_recall_boost_threshold:
-                terms = [t.strip() for t in re.split(r'[，。！？、\s,;:?]+', str(query)[:80]) if len(t.strip()) >= 2][:5]
-                for term in terms:
-                    if len(seen_ids) >= self.retrieval_top_k * 2:
-                        break
-                    wide_results = await self.store.search(sid, term, 3, list(range(self.inject_level_max + 1)), await self._embed(term), self.half_life, "linked", user_id)
-                    for r in wide_results:
-                        if r["id"] not in seen_ids:
-                            r["score"] = r.get("score", 0.0) * 0.85
-                            all_results.append(r)
-                            seen_ids.add(r["id"])
+        # 3) 首次见到用户召回
+        if self.passive_recall and recall_user_ids:
+            for uid in recall_user_ids:
+                if uid and uid == user_id:
+                    continue
+                for r in await self.store.count_memories_by_user(uid, 5):
+                    if r["id"] not in seen_ids and r.get("status", "active") == "active":
+                        r["score"] = 0.3
+                        all_results.append(r)
+                        seen_ids.add(r["id"])
+                logger.debug("[alife_memory] 被动召回: 新用户 %s", uid)
+
+        # 4) 更新轮数已到时全量刷新
+        if self.passive_recall and do_passive_update:
+            refresh_terms = re.split(r'[，。！？、：；\s,;:?()（）\n\t]+', str(query)[:120])
+            refresh_terms = [t.strip() for t in refresh_terms if len(t.strip()) >= 2][:6]
+            added = 0
+            for term in refresh_terms:
+                if added >= self.passive_recall_keyword_limit:
+                    break
+                tr = await self.store.search(sid, term, 3, list(range(self.inject_level_max + 1)),
+                    await self._embed(term), self.half_life, "linked", user_id)
+                for r in tr:
+                    if r["id"] not in seen_ids and r.get("status", "active") == "active":
+                        r["score"] = r.get("score", 0.0) * 0.5
+                        all_results.append(r)
+                        seen_ids.add(r["id"])
+                        added += 1
+            logger.debug("[alife_memory] 被动召回更新: 补充 %d 条", added)
+
+        # 5) 弱结果宽召回
+        if self.passive_recall and best_score < self.passive_recall_boost_threshold and best_score > 0:
+            terms = [t.strip() for t in re.split(r'[，。！？、\s,;:?]+', str(query)[:80]) if len(t.strip()) >= 2][:5]
+            for term in terms:
+                wide = await self.store.search(sid, term, 3, list(range(self.inject_level_max + 1)),
+                    await self._embed(term), self.half_life, "linked", user_id)
+                for r in wide:
+                    if r["id"] not in seen_ids and r.get("status", "active") == "active":
+                        r["score"] = r.get("score", 0.0) * 0.85
+                        all_results.append(r)
+                        seen_ids.add(r["id"])
 
         if not all_results:
             return
+
+        # 排序后重排序（如有配置）
         all_results.sort(key=lambda x: (x.get("score", 0.0), x.get("importance", 0.0)), reverse=True)
+        reranked = await self._rerank(str(query), all_results[:self.retrieval_top_k * 3])
+        if reranked is not all_results[:self.retrieval_top_k * 3]:
+            all_results[:self.retrieval_top_k * 3] = reranked
+
+        # 预算截断注入
         lines = []
         token_budget = self.max_injected_tokens
         item_budget = self.max_injected_items
         char_budget = self.max_injected_chars
+        line_cnt = 0
         for item in all_results:
             if item_budget <= 0:
                 break
-            source = f"来源:{item.get('sid', 'unknown')} / 用户:{item.get('user_id', '') or 'unknown'} / 时间:{time.strftime('%Y-%m-%d', time.localtime(item['end_ts']))}"
-            text = f"[{item['summary']}] {item['content']}（{source}）"
+            source = f"来源:{item.get('sid', 'unknown')} / 时间:{time.strftime('%Y-%m-%d', time.localtime(item['end_ts']))}"
+            text = f"- [{item['summary']}]（{source}）"
             cost = estimate_tokens(text)
             char_cost = len(text)
             if cost > token_budget or char_cost > char_budget:
                 if not lines:
-                    snippet = text[:max(token_budget, char_budget)]
-                    lines.append(f"- {snippet}")
+                    lines.append(f"- {item['summary'][:200]}")
                 break
-            lines.append(f"- {text}")
+            lines.append(text)
+            line_cnt += 1
+            if line_cnt >= self.max_injected_lines:
+                break
+            item_budget -= 1
             token_budget -= cost
             char_budget -= char_cost
-            item_budget -= 1
         if not lines:
             return
-        # 行数预算 — 双截断兜底
-        line_budget = self.max_injected_lines
-        if len(lines) > line_budget:
-            lines = lines[:line_budget]
-            lines.append("（注：记忆索引太长，只展示了部分）")
-        # 注入到 messages 数组首条系统消息（不破坏 system_prompt 前缀缓存）
+        block = ("你曾经的一些记忆：\n" + "\n".join(lines) +
+                 '\n（完整的记忆细节可通过 search_long_term_memory 工具检索）')
+        system_msg = OpenAIMessage(role="system", content=block)
+        req.messages.insert(0, system_msg)
+        logger.debug("[alife_memory] 注入完成: %d 条, 约 %d tokens", len(lines), self.max_injected_tokens - token_budget)
+
+
+    async def _inject_context_marker(self, req: LLMRequest, sid: str):
         block = ("一些关于过去的事情，供你参考。如果新了解到的情况和下面不一致，以最新的为准：\n"
                  + "\n".join(lines)
                  + "\n"
@@ -728,17 +815,27 @@ class AlifeMemoryPlugin(BasePlugin):
         if not self.enabled:
             return
         sid = getattr(event, "sid", "") or getattr(getattr(event, "session", None), "sid", "")
+        if not sid:
+            return
         messages = getattr(event, "messages", []) or []
         user_id = _event_user_id(messages[-1] if messages else None)
-        recall_user_ids = []
+        # 轮次计数
         if self.passive_recall:
+            self._recall_round_counter[sid] = self._recall_round_counter.get(sid, 0) + 1
+            do_passive_update = self._recall_round_counter[sid] >= self.passive_recall_update_rounds
+            if do_passive_update:
+                self._recall_round_counter[sid] = 0
+                logger.info("[alife_memory] 被动召回更新到达 %d 轮", self.passive_recall_update_rounds)
+            recall_user_ids = []
             for msg in messages:
                 uid = _event_user_id(msg)
                 if uid and uid not in self._seen_user_ids:
                     self._seen_user_ids.add(uid)
                     recall_user_ids.append(uid)
-        if not sid:
-            return
+                    logger.debug("[alife_memory] 首次见到用户 %s，准备被动召回其记忆", uid)
+        else:
+            do_passive_update = False
+            recall_user_ids = []
         # P0: 上下文记忆标记
         if self.inject_context_marker:
             try:
@@ -749,17 +846,18 @@ class AlifeMemoryPlugin(BasePlugin):
             # 回忆关键词提醒
             if self.recall_hint_keywords:
                 query = ""
-                for message in reversed(getattr(req, "messages", []) or []):
-                    role = getattr(message, "role", None) or (message.get("role") if isinstance(message, dict) else "")
+                for m in reversed(getattr(req, "messages", []) or []):
+                    role = getattr(m, "role", None) or (m.get("role") if isinstance(m, dict) else "")
                     if role == "user":
-                        query = getattr(message, "content", None) or (message.get("content") if isinstance(message, dict) else "") or ""
+                        query = getattr(m, "content", None) or (m.get("content") if isinstance(m, dict) else "") or ""
                         break
                 if query and any(kw in query for kw in self.recall_hint_keywords):
                     hint = "（提示：用户的话可能涉及过往记忆，你可通过 search_long_term_memory 工具检索相关记忆）"
                     req.messages.insert(0, OpenAIMessage(role="system", content=hint))
+                    logger.debug("[alife_memory] 触发回忆关键词提醒: %s", query[:50])
             # 记忆注入
             if self.auto_inject:
-                await self._inject(sid, req, user_id, recall_user_ids)
+                await self._inject(sid, req, user_id, recall_user_ids, do_passive_update)
         except Exception:
             logger.exception("[alife_memory] memory injection failed")
 
