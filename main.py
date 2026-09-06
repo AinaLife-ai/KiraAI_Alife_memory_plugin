@@ -161,6 +161,8 @@ class AlifeMemoryPlugin(BasePlugin):
 
         self.compress_prompt = str(compression.get("prompt", "") or "").strip() or self._default_compress_prompt()
         self.reflect_prompt = str(reflection.get("prompt", "") or "").strip() or self._default_reflect_prompt()
+        # 若用户未自定义压缩/审校提示词，把默认词回填进 cfg，让 WebUI 可展示、可编辑（用户改过后不再覆盖）
+        self._sync_default_prompts(compression, reflection)
         self.compress_probability = _num(compression.get("compress_probability", 0.8), 0.8, 0.0, 1.0)
         self.compress_timeout = _num(compression.get("compress_timeout", 30), 30, 5, 120, True)
         self.max_compress_retry = _num(compression.get("max_compress_retry", 2), 2, 0, 10, True)
@@ -183,6 +185,26 @@ class AlifeMemoryPlugin(BasePlugin):
         return ("你是记忆审校器。比较旧记忆和新证据，只处理有明确矛盾的事实。\n"
                 "只输出 JSON：{\"action\":\"none|correct|stale\",\"summary\":\"修正后的概述\",\"content\":\"修正后的事实\",\"confidence\":0.0,\"reason\":\"证据依据\"}\n"
                 "若只是措辞不同、证据不足或可能是临时状态，输出 none。不得凭空补全。\n旧记忆：\n{memory}\n新证据：\n{evidence}")
+
+    def _sync_default_prompts(self, compression: dict, reflection: dict):
+        """当用户未自定义提示词时，把最新默认词回填进 cfg（供 WebUI 展示/编辑）。
+        用户一旦改过（cfg 里是非空且非默认的内容），就不再覆盖。"""
+        default_comp = self._default_compress_prompt()
+        default_refl = self._default_reflect_prompt()
+        comp_val = str(compression.get("prompt", "") or "").strip()
+        refl_val = str(reflection.get("prompt", "") or "").strip()
+        changed = False
+        # 空 或 等于旧默认（即从未真正自定义）→ 用最新默认
+        if not comp_val:
+            compression["prompt"] = default_comp
+            changed = True
+        if not refl_val:
+            reflection["prompt"] = default_refl
+            changed = True
+        if changed:
+            # 回写到模块级 cfg，让 WebUI /config 能拿到
+            self.cfg.setdefault("section_compression", {})["prompt"] = compression.get("prompt", default_comp)
+            self.cfg.setdefault("section_reflection", {})["prompt"] = reflection.get("prompt", default_refl)
 
     @staticmethod
     def _convert_relative_dates(text: str) -> str:
@@ -349,7 +371,7 @@ class AlifeMemoryPlugin(BasePlugin):
                                     continue
                                 content = t_text_match.group(1)
                                 # 跳过超长内容（KiraOS 海马体的长篇概况通常质量低、污染大）
-                                if len(content) > 200:
+                                if len(content) > 120:
                                     logger.debug("[alife_memory] KiraOS 迁移跳过超长内容 (%d 字符)", len(content))
                                     continue
                                 summary = content[:100]
@@ -450,6 +472,13 @@ class AlifeMemoryPlugin(BasePlugin):
         except Exception as exc:
             logger.debug("[alife_memory] embedding unavailable: %s", exc)
             return None
+
+    async def _embed_batch(self, texts: list[str]) -> dict[str, list[float] | None]:
+        """并发批量嵌入，返回 {text: embedding}。避免每词串行等待 embedding API 造成注入延迟。"""
+        if not texts:
+            return {}
+        results = await asyncio.gather(*(self._embed(t) for t in texts))
+        return {t: r for t, r in zip(texts, results)}
 
     async def _rerank(self, query: str, items: list[dict]) -> list[dict]:
         """Rerank search results using configured rerank model."""
@@ -715,12 +744,14 @@ class AlifeMemoryPlugin(BasePlugin):
         if self.passive_recall and self.passive_recall_keyword_limit > 0:
             keywords = re.split(r'[，。！？、：；\s,;:?()（）\n\t]+', str(query)[:200])
             keywords = [k.strip() for k in keywords if len(k.strip()) >= 2 and not k.strip().isdigit()][:6]
+            # 并发一次嵌入所有关键词，避免每词串行等待 embedding API
+            kw_embeds = await self._embed_batch(keywords)
             kw_added = 0
             for keyword in keywords:
                 if kw_added >= self.passive_recall_keyword_limit:
                     break
                 kw_results = await self.store.search(sid, keyword, 3,
-                    list(range(self.inject_level_max + 1)), await self._embed(keyword),
+                    list(range(self.inject_level_max + 1)), kw_embeds.get(keyword),
                     self.half_life, "linked", user_id)
                 for r in kw_results:
                     if r["id"] not in seen_ids and r.get("status", "active") == "active":
@@ -747,12 +778,13 @@ class AlifeMemoryPlugin(BasePlugin):
         if self.passive_recall and do_passive_update:
             refresh_terms = re.split(r'[，。！？、：；\s,;:?()（）\n\t]+', str(query)[:120])
             refresh_terms = [t.strip() for t in refresh_terms if len(t.strip()) >= 2][:6]
+            refresh_embeds = await self._embed_batch(refresh_terms)
             added = 0
             for term in refresh_terms:
                 if added >= self.passive_recall_keyword_limit:
                     break
                 tr = await self.store.search(sid, term, 3, list(range(self.inject_level_max + 1)),
-                    await self._embed(term), self.half_life, "linked", user_id)
+                    refresh_embeds.get(term), self.half_life, "linked", user_id)
                 for r in tr:
                     if r["id"] not in seen_ids and r.get("status", "active") == "active":
                         r["score"] = r.get("score", 0.0) * 0.5
@@ -764,9 +796,10 @@ class AlifeMemoryPlugin(BasePlugin):
         # 5) 弱结果宽召回
         if self.passive_recall and best_score < self.passive_recall_boost_threshold and best_score > 0:
             terms = [t.strip() for t in re.split(r'[，。！？、\s,;:?]+', str(query)[:80]) if len(t.strip()) >= 2][:5]
+            wide_embeds = await self._embed_batch(terms)
             for term in terms:
                 wide = await self.store.search(sid, term, 3, list(range(self.inject_level_max + 1)),
-                    await self._embed(term), self.half_life, "linked", user_id)
+                    wide_embeds.get(term), self.half_life, "linked", user_id)
                 for r in wide:
                     if r["id"] not in seen_ids and r.get("status", "active") == "active":
                         r["score"] = r.get("score", 0.0) * 0.85
