@@ -33,7 +33,10 @@
       "passive_recall_boost_threshold": {"type": "float", "name": "被动召回最低分阈值", "default": 0.4, "minimum": 0.0, "maximum": 1.0, "hint": "主检索结果最高分低于此值时自动以关键词做宽召回补充。", "locales": {"zh": {"name": "被动召回最低分阈值", "hint": "主检索结果最高分低于此值时自动以关键词做宽召回补充。"}}},
       "auto_archive_days": {"type": "integer", "name": "自动归档天数（0=关闭）", "default": 0, "minimum": 0, "maximum": 3650, "hint": "超过此天数未被触碰的 active 记忆自动归档。归档后仍可通过检索找到，0 为关闭。", "locales": {"zh": {"name": "自动归档天数（0=关闭）", "hint": "超过此天数未被触碰的 active 记忆自动归档。0 为关闭。"}}},
       "archive_level_min": {"type": "integer", "name": "归档影响最低层级", "default": 5, "minimum": 1, "maximum": 12, "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级（max_level），最高层受保护。", "locales": {"zh": {"name": "归档影响最低层级", "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级。"}}},
-      "llm_concurrency_limit": {"type": "integer", "name": "LLM 并发上限", "default": 4, "minimum": 1, "maximum": 20, "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。", "locales": {"zh": {"name": "LLM 并发上限", "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。"}}}
+      "llm_concurrency_limit": {"type": "integer", "name": "LLM 并发上限", "default": 4, "minimum": 1, "maximum": 20, "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。", "locales": {"zh": {"name": "LLM 并发上限", "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。"}}},
+      "user_list_limit": {"type": "integer", "name": "默认展示用户数", "default": 50, "minimum": 1, "maximum": 200, "hint": "list_users 默认一次列出多少个用户（总数始终显示，超出会提示）。", "locales": {"zh": {"name": "默认展示用户数", "hint": "list_users 默认一次列出多少个用户（总数始终显示，超出会提示）。"}}},
+      "memory_list_limit": {"type": "integer", "name": "默认展示记忆条数", "default": 20, "minimum": 1, "maximum": 100, "hint": "list_user_memories / list_session_memories 默认一次列出多少条记忆（总数始终显示）。", "locales": {"zh": {"name": "默认展示记忆条数", "hint": "list_user_memories / list_session_memories 默认一次列出多少条记忆（总数始终显示）。"}}},
+      "recent_summaries_count": {"type": "integer", "name": "默认最近记得条数", "default": 3, "minimum": 1, "maximum": 10, "hint": "list_users 里每个用户默认展示几条最近记得的记忆。", "locales": {"zh": {"name": "默认最近记得条数", "hint": "list_users 里每个用户默认展示几条最近记得的记忆。"}}}
     }
   },
   "section_trigger": {
