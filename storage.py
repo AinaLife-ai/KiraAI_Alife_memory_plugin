@@ -108,6 +108,21 @@ def cosine(a: list[float] | None, b: list[float] | None) -> float:
     return dot / (na * nb) if na and nb else 0.0
 
 
+def _normalize_item(item: dict) -> dict:
+    """解析并清理从 memories 表返回的行：反序列化 source_ids/source_refs，
+    去掉 embedding 大数组（对 LLM/前端无意义，避免浪费），保留 embed_model 标记。"""
+    try:
+        item["source_ids"] = json.loads(item.get("source_ids") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        item["source_ids"] = []
+    try:
+        item["source_refs"] = json.loads(item.get("source_refs") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        item["source_refs"] = []
+    item.pop("embedding", None)
+    return item
+
+
 class MemoryStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -165,7 +180,8 @@ class MemoryStore:
                     correction_note TEXT NOT NULL DEFAULT '',
                     source_fingerprint TEXT NOT NULL DEFAULT '',
                     dedupe_key TEXT NOT NULL DEFAULT '',
-                    source_refs TEXT NOT NULL DEFAULT '[]'
+                    source_refs TEXT NOT NULL DEFAULT '[]',
+                    embed_model TEXT DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_memories_sid_level_time
                     ON memories(sid, level, end_ts DESC);
@@ -201,6 +217,7 @@ class MemoryStore:
                 "source_fingerprint": "ALTER TABLE memories ADD COLUMN source_fingerprint TEXT NOT NULL DEFAULT ''",
                 "dedupe_key": "ALTER TABLE memories ADD COLUMN dedupe_key TEXT NOT NULL DEFAULT ''",
                 "source_refs": "ALTER TABLE memories ADD COLUMN source_refs TEXT NOT NULL DEFAULT '[]'",
+                "embed_model": "ALTER TABLE memories ADD COLUMN embed_model TEXT DEFAULT ''",
             }
             for name, statement in migrations.items():
                 if name not in columns:
@@ -351,15 +368,16 @@ class MemoryStore:
                          memory_id: str | None = None, confidence: float = 0.65,
                          supersedes: str | None = None, correction_note: str = "",
                          user_id: str = "", source_fingerprint: str = "",
-                         source_refs: list[dict[str, Any]] | None = None) -> str:
+                         source_refs: list[dict[str, Any]] | None = None,
+                         embed_model: str = "") -> str:
         return await asyncio.to_thread(self._add_memory, sid, level, summary, content,
                                        start_ts, end_ts, source_ids, importance, embedding,
                                        memory_id, confidence, supersedes, correction_note, user_id,
-                                       source_fingerprint, source_refs)
+                                       source_fingerprint, source_refs, embed_model)
 
     def _add_memory(self, sid, level, summary, content, start_ts, end_ts, source_ids,
                     importance, embedding, memory_id, confidence, supersedes, correction_note, user_id,
-                    source_fingerprint, source_refs):
+                    source_fingerprint, source_refs, embed_model=""):
         mid = memory_id or f"L{level}-{int(start_ts)}-{int(end_ts)}-{uuid.uuid4().hex[:8]}"
         fact_key = normalized_fact_key(summary, content)
         now = time.time()
@@ -404,12 +422,11 @@ class MemoryStore:
                 return str(duplicate['id'])
             refs = source_refs or [{'sid': sid, 'user_id': str(user_id or ''), 'start_ts': start_ts, 'end_ts': end_ts}]
             conn.execute(
-                "INSERT OR REPLACE INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs,embed_model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (mid, sid, str(user_id or ""), level, summary.strip(), content, start_ts, end_ts, max(0.0, min(1.0, importance)),
                  json.dumps(source_ids, ensure_ascii=False), json.dumps(embedding) if embedding else None, now, now,
                  "active", max(0.0, min(1.0, confidence)), supersedes, correction_note or "", source_fingerprint or "", fact_key,
-                 json.dumps(refs, ensure_ascii=False))
-            )
+                 json.dumps(refs, ensure_ascii=False), embed_model or ""))
             conn.execute("DELETE FROM memories_fts WHERE memory_id=?", (mid,))
             conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
                          (segment_for_fts(summary), segment_for_fts(content), sid, level, mid))
@@ -433,6 +450,7 @@ class MemoryStore:
                 sid = it["sid"]; level = it["level"]; summary = it["summary"]
                 content = it["content"]; start_ts = it["start_ts"]; end_ts = it["end_ts"]
                 importance = it.get("importance", 0.5); embedding = it.get("embedding")
+                embed_model = it.get("embed_model", "")
                 source_ids = it.get("source_ids", []); source_refs = it.get("source_refs", [])
                 user_id = it.get("user_id", ""); confidence = it.get("confidence", 0.65)
                 source_fingerprint = it.get("source_fingerprint", ""); memory_id = it.get("memory_id")
@@ -450,12 +468,12 @@ class MemoryStore:
                 mid = memory_id or f"L{level}-{int(start_ts)}-{int(end_ts)}-{uuid.uuid4().hex[:8]}"
                 refs = source_refs or [{"sid": sid, "user_id": str(user_id or ""), "start_ts": start_ts, "end_ts": end_ts}]
                 conn.execute(
-                    "INSERT OR REPLACE INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT OR REPLACE INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs,embed_model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (mid, sid, str(user_id or ""), level, summary.strip(), content, start_ts, end_ts,
                      max(0.0, min(1.0, importance)), json.dumps(source_ids, ensure_ascii=False),
                      json.dumps(embedding) if embedding else None, now, now, "active",
                      max(0.0, min(1.0, confidence)), None, "", source_fingerprint or "", fact_key,
-                     json.dumps(refs, ensure_ascii=False)))
+                     json.dumps(refs, ensure_ascii=False), embed_model or ""))
                 conn.execute("DELETE FROM memories_fts WHERE memory_id=?", (mid,))
                 conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
                              (segment_for_fts(summary), segment_for_fts(content), sid, level, mid))
@@ -469,10 +487,11 @@ class MemoryStore:
                      levels: list[int] | None = None,
                      query_embedding: list[float] | None = None,
                      recency_half_life_days: float = 45.0,
-                     scope: str = "session", user_id: str = "") -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._search, sid, query, limit, levels, query_embedding, recency_half_life_days, scope, user_id)
+                     scope: str = "session", user_id: str = "",
+                     embed_model: str = "") -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._search, sid, query, limit, levels, query_embedding, recency_half_life_days, scope, user_id, embed_model)
 
-    def _search(self, sid, query, limit, levels, query_embedding, half_life, scope, user_id):
+    def _search(self, sid, query, limit, levels, query_embedding, half_life, scope, user_id, embed_model):
         conn = self._connect()
         try:
             terms = tokenize(query)
@@ -540,7 +559,15 @@ class MemoryStore:
                 lex = abs(float(bm25_val))
                 # FTS5 bm25 负值越小越相关，归一化到 [0,1]：相关→趋近1，不相关→趋近0
                 lex = lex / (1.0 + lex)
-                semantic = cosine(query_embedding, json.loads(item["embedding"])) if query_embedding and item.get("embedding") else 0.0
+                # 语义项：仅当当前配置的 embedding 模型与记忆向量一致时才用（避免跨模型错误匹配）
+                item_emb_model = str(item.get("embed_model") or "")
+                if query_embedding and item.get("embedding") and (not embed_model or item_emb_model == embed_model):
+                    try:
+                        semantic = cosine(query_embedding, json.loads(item["embedding"]))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        semantic = 0.0
+                else:
+                    semantic = 0.0
                 age_days = max(0.0, (now - float(item["end_ts"])) / 86400.0)
                 decay = 0.5 ** (age_days / max(1.0, half_life))
                 level_bonus = min(0.18, int(item["level"]) * 0.045)
@@ -587,13 +614,7 @@ class MemoryStore:
                 rows = conn.execute("SELECT * FROM memories WHERE deleted=0 ORDER BY end_ts DESC LIMIT ?", (limit,)).fetchall()
             result = []
             for row in rows:
-                item = dict(row)
-                try:
-                    item["source_ids"] = json.loads(item.get("source_ids") or "[]")
-                    item["source_refs"] = json.loads(item.get("source_refs") or "[]")
-                except (TypeError, json.JSONDecodeError):
-                    item["source_ids"], item["source_refs"] = [], []
-                result.append(item)
+                result.append(_normalize_item(dict(row)))
             return result
         finally:
             conn.close()
@@ -605,7 +626,7 @@ class MemoryStore:
         conn = self._connect()
         try:
             row = conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
-            return dict(row) if row else None
+            return _normalize_item(dict(row)) if row else None
         finally:
             conn.close()
 
@@ -625,11 +646,12 @@ class MemoryStore:
             conn.execute("UPDATE memories SET status='superseded', updated_at=?, correction_note=? WHERE id=?",
                          (now, note, memory_id))
             conn.execute(
-                "INSERT INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs,embed_model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (new_id, old['sid'], old['user_id'], old['level'], summary.strip(), content, old['start_ts'], old['end_ts'],
                  old['importance'], old['source_ids'], json.dumps(embedding) if embedding else old['embedding'],
                  now, now, 'active', max(0.0, min(1.0, confidence)), memory_id, note or '', '',
-                 normalized_fact_key(summary, content), old['source_refs']))
+                 normalized_fact_key(summary, content), old['source_refs'],
+                 str(old['embed_model']) if 'embed_model' in old.keys() else ''))
             conn.execute("DELETE FROM memories_fts WHERE memory_id IN (?,?)", (memory_id, new_id))
             conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
                          (segment_for_fts(summary), segment_for_fts(content), old['sid'], old['level'], new_id))
@@ -764,13 +786,7 @@ class MemoryStore:
             ).fetchall()
             result = []
             for row in rows:
-                item = dict(row)
-                try:
-                    item["source_ids"] = json.loads(item.get("source_ids") or "[]")
-                    item["source_refs"] = json.loads(item.get("source_refs") or "[]")
-                except (TypeError, json.JSONDecodeError):
-                    item["source_ids"], item["source_refs"] = [], []
-                result.append(item)
+                result.append(_normalize_item(dict(row)))
             return result
         finally:
             conn.close()
@@ -888,13 +904,7 @@ class MemoryStore:
             ).fetchall()
             result = []
             for row in rows:
-                item = dict(row)
-                try:
-                    item["source_ids"] = json.loads(item.get("source_ids") or "[]")
-                    item["source_refs"] = json.loads(item.get("source_refs") or "[]")
-                except (TypeError, json.JSONDecodeError):
-                    item["source_ids"], item["source_refs"] = [], []
-                result.append(item)
+                result.append(_normalize_item(dict(row)))
             return result
         finally:
             conn.close()
@@ -914,13 +924,7 @@ class MemoryStore:
             ).fetchall()
             result = []
             for row in rows:
-                item = dict(row)
-                try:
-                    item["source_ids"] = json.loads(item.get("source_ids") or "[]")
-                    item["source_refs"] = json.loads(item.get("source_refs") or "[]")
-                except (TypeError, json.JSONDecodeError):
-                    item["source_ids"], item["source_refs"] = [], []
-                result.append(item)
+                result.append(_normalize_item(dict(row)))
             return result
         finally:
             conn.close()

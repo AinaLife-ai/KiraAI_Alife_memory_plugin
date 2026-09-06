@@ -367,9 +367,7 @@ class AlifeMemoryPlugin(BasePlugin):
                     lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
                     if lines:
                         now = time.time()
-                        # 1) 一次性并发嵌入所有内容（替代每条串行 embed）
-                        vectors = await self._embed_batch(lines)
-                        # 2) 批量组装 + 单事务写入（替代逐条 add_memory）
+                        # 迁移只导入文本 + 元数据，不计算向量（避免卡顿/白忙/依赖向量模型）
                         rows = []
                         for line in lines:
                             if len(line) > 120:
@@ -378,7 +376,7 @@ class AlifeMemoryPlugin(BasePlugin):
                             rows.append({
                                 "sid": "system", "level": 3, "summary": content_stripped[:100],
                                 "content": content_stripped, "start_ts": now, "end_ts": now,
-                                "source_ids": [], "importance": 0.5, "embedding": vectors.get(content_stripped),
+                                "source_ids": [], "importance": 0.5, "embedding": None,
                                 "user_id": "", "source_fingerprint": hashlib.sha256(("simple_memory_import|" + content_stripped).encode()).hexdigest()[:32],
                                 "source_refs": [{"sid": "simple_memory_import", "user_id": "", "ts": now,
                                                  "action": "从Simple Memory自动迁移，原始文件保留未清理"}],
@@ -399,18 +397,15 @@ class AlifeMemoryPlugin(BasePlugin):
                         parsed = await asyncio.gather(*[asyncio.to_thread(self._parse_kiraos_toml, tf) for tf in toml_files])
                         valid = [p for p in parsed if p]  # [(content, summary, importance, sid, ts)]
                         if valid:
-                            contents = [p[0] for p in valid]
-                            # 2) 一次性并发嵌入所有内容
-                            vectors = await self._embed_batch(contents)
-                            # 3) 批量组装 + 单事务写入
+                            # 迁移只导入文本 + 元数据，不计算向量（避免卡顿/白忙/依赖向量模型）
                             rows = []
                             now = time.time()
-                            for i, (content, summary, importance, source_sid, ts_val) in enumerate(valid):
+                            for (content, summary, importance, source_sid, ts_val) in valid:
                                 rows.append({
                                     "sid": source_sid, "level": 3, "summary": summary,
                                     "content": content, "start_ts": ts_val, "end_ts": ts_val,
                                     "source_ids": [], "importance": importance,
-                                    "embedding": vectors.get(content), "user_id": "",
+                                    "embedding": None, "user_id": "",
                                     "source_fingerprint": hashlib.sha256(("kiraos_import|" + content).encode()).hexdigest()[:32],
                                     "source_refs": [{"sid": source_sid, "user_id": "", "ts": ts_val,
                                                      "action": "从KiraOS记忆自动迁移，原始文件保留未清理"}],
@@ -646,7 +641,8 @@ class AlifeMemoryPlugin(BasePlugin):
                     sid, 1, summary, detail, batch[0]["ts"], batch[-1]["ts"],
                     [x["id"] for x in batch], importance, vector,
                     user_id=str(batch[0].get("user_id", "")) if len({x.get("user_id", "") for x in batch}) == 1 else "",
-                    source_fingerprint=fingerprint, source_refs=refs)
+                    source_fingerprint=fingerprint, source_refs=refs,
+                    embed_model=self.embedding_model)
                 await self.store.mark_compressed([x["id"] for x in batch], archive_id)
                 await self.store.update_task(task_id, "completed", archive_id)
                 logger.debug("[alife_memory] 压缩成功: %d 条 → %s", len(batch), archive_id)
@@ -691,7 +687,8 @@ class AlifeMemoryPlugin(BasePlugin):
             new_id = await self.store.add_memory(
                 sid, level + 1, summary, detail, group[0]["start_ts"], group[-1]["end_ts"],
                 [x["id"] for x in group], _num(result.get("importance", 0.65), 0.65, 0.0, 1.0), vector,
-                user_id=users[0] if len(users) == 1 else "", source_refs=refs)
+                user_id=users[0] if len(users) == 1 else "", source_refs=refs,
+                embed_model=self.embedding_model)
             for old in group:
                 await self.store.mark_stale(old["id"], f"merged into {new_id}")
 
@@ -780,7 +777,8 @@ class AlifeMemoryPlugin(BasePlugin):
 
         # 1) 主注入：整句语义搜索
         content_results = await self.store.search(sid, str(query), self.retrieval_top_k + 2,
-            list(range(self.inject_level_max + 1)), query_embed, self.half_life, scope, user_id)
+            list(range(self.inject_level_max + 1)), query_embed, self.half_life, scope, user_id,
+            self.embedding_model)
         content_results = [r for r in content_results if r.get("status", "active") == "active"]
         best_score = 0.0
         for r in content_results:
@@ -824,7 +822,8 @@ class AlifeMemoryPlugin(BasePlugin):
                 # 一次并发 search 所有 term
                 search_tasks = [
                     self.store.search(sid, term, 3, list(range(self.inject_level_max + 1)),
-                        embeds.get(term), self.half_life, "linked", user_id)
+                        embeds.get(term), self.half_life, "linked", user_id,
+                        self.embedding_model)
                     for term in terms
                 ]
                 search_results = await asyncio.gather(*search_tasks)
@@ -1052,7 +1051,8 @@ class AlifeMemoryPlugin(BasePlugin):
             sid, self.max_level, summary_with_meta, content_with_meta,
             now, now, [], importance, vector, user_id=user_id,
             source_refs=[{"sid": sid, "user_id": user_id, "ts": now,
-                          "action": "主动记录", "type": memory_type}])
+                          "action": "主动记录", "type": memory_type}],
+            embed_model=self.embedding_model)
         return f"已经记下了：{summary_with_meta[:80]}……（ID: {mid}，来源会话和保存时间已自动记录）"
 
     @register.tool(
@@ -1065,7 +1065,7 @@ class AlifeMemoryPlugin(BasePlugin):
         if scope not in ("session", "linked", "global"):
             scope = self.search_scope
         user_id = _event_user_id((getattr(event, "messages", []) or [None])[-1])
-        results = await self.store.search(sid, query, _num(top_k, 5, 1, 12, True), list(range(self.max_level + 1)), await self._embed(query), self.half_life, scope, user_id)
+        results = await self.store.search(sid, query, _num(top_k, 5, 1, 12, True), list(range(self.max_level + 1)), await self._embed(query), self.half_life, scope, user_id, self.embedding_model)
         if not results:
             return "没有找到相关长期记忆"
         out = [f"共找到 {len(results)} 条相关记忆："]
@@ -1268,7 +1268,7 @@ class AlifeMemoryPlugin(BasePlugin):
         if scope not in ("session", "linked", "global"):
             scope = self.search_scope
         user_id = str(body.get("user_id", ""))
-        result = await self.store.search(sid, query, _num(body.get("top_k", self.retrieval_top_k), self.retrieval_top_k, 1, 20, True), None, await self._embed(query), self.half_life, scope, user_id)
+        result = await self.store.search(sid, query, _num(body.get("top_k", self.retrieval_top_k), self.retrieval_top_k, 1, 20, True), None, await self._embed(query), self.half_life, scope, user_id, self.embedding_model)
         return {"query": query, "scope": scope, "results": result}
 
     @register.api(method="POST", path="/memory/{memory_id}/correct", auth=True, summary="Correct memory")
