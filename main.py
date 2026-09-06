@@ -1313,6 +1313,11 @@ class AlifeMemoryPlugin(BasePlugin):
                 self.cfg[key].update(value)
             else:
                 self.cfg[key] = value
+        # 持久化：原子写回配置文件，避免热保存后重启丢失
+        try:
+            self._persist_config()
+        except Exception:
+            logger.exception("[alife_memory] persist config failed")
         # 热更新后重新读取设置，并重置 rerank 探测缓存（让新配置立即生效）
         try:
             self._load_settings()
@@ -1321,4 +1326,19 @@ class AlifeMemoryPlugin(BasePlugin):
         self._rerank_checked = False
         self._rerank_client = None
         return {"ok": True}
+
+    def _persist_config(self):
+        """把当前 cfg 原子写回配置文件（tmp + os.replace），并同步框架内存缓存，避免写坏/不一致。"""
+        cfg_path = Path(getattr(self, "_config_path", "")) or (get_config_path() / "plugins" / f"{PLUGIN_ID}.json")
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cfg_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.cfg, ensure_ascii=False, indent=4), encoding="utf-8")
+        tmp.replace(cfg_path)
+        # 同步框架内存 plugin_configs（如果可达），确保框架侧读到最新配置
+        try:
+            pm = getattr(self.ctx, "plugin_mgr", None)
+            if pm is not None and hasattr(pm, "plugin_configs"):
+                pm.plugin_configs[PLUGIN_ID] = self.cfg
+        except Exception:
+            logger.debug("[alife_memory] sync plugin_configs cache skipped")
           
