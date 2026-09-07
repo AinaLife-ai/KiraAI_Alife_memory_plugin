@@ -1155,7 +1155,7 @@ class MemoryStore:
             conn.close()
 
     async def list_profiles(self, limit: int = 100, entity_type: str | None = None) -> list[dict]:
-        """列出所有画像（默认 user；可过滤 group/bot）。"""
+        """列出所有画像（默认 user；可过滤 group）。bot 自己不设类型，是 user/group 之外平行的存在。"""
         return await asyncio.to_thread(self._list_profiles, limit, entity_type)
 
     def _list_profiles(self, limit, entity_type):

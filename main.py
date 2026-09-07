@@ -111,17 +111,18 @@ _SIMPLE_REL_KW = ("朋友", "主人", "妹妹", "姐姐", "哥哥", "女友", "�
 
 def _infer_simple_memory_type(text: str) -> str:
     """从纯文本启发式推断 memory_type（Simple Memory 无元数据）。
-    优先级：实体 > 约定 > 偏好 > 关系 > 日常。"""
+    优先级：身份/职业(最明确) > 关系 > 约定 > 偏好 > 日常。"""
     t = (text or "").lower()
-    # 身份/职业背景 → 关于实体（但避免把"是"误判所有含是的句子）
+    # 身份/职业背景最明确 → 关于实体
     if any(k in t for k in ("职业", "公司", "学校", "专业", "性格", "身份", "背景", "博士", "硕士", "教师", "医生", "学生")):
         return "关于实体"
+    # 明确关系表述（谁是谁的什么人）
+    if any(k in t for k in _SIMPLE_REL_KW):
+        return "关系网络"
     if any(k in t for k in _SIMPLE_TASK_KW):
         return "约定任务"
     if any(k in t for k in _SIMPLE_PREF_KW):
         return "偏好风格"
-    if any(k in t for k in _SIMPLE_REL_KW):
-        return "关系网络"
     return "日常事件"
 
 
@@ -136,6 +137,26 @@ def _infer_simple_memory_tags(text: str) -> list[str]:
     if any(k in t for k in ("朋友", "主人", "家人", "女友", "男友", "恋人", "妹妹", "姐姐", "哥哥", "同事", "抚养", "情侣", "兄弟", "爸爸", "妈妈")):
         tags.append("关系")
     return tags
+
+
+def _infer_simple_importance(text: str) -> float:
+    """从纯文本启发式估算记忆重要性（Simple Memory 无元数据，只能按内容估值）。
+    返回 0-1。身份/关系/明确偏好 → 更重要；无特征 → 中等。"""
+    t = (text or "")
+    # 关系类（谁是谁的什么人，表述明确）→ 优先，较高
+    if any(k in t for k in _SIMPLE_REL_KW):
+        return 0.7
+    # 身份/职业背景（最值得长期记住的人物资料）→ 高
+    if any(k in t for k in _SIMPLE_ENT_KW):
+        return 0.8
+    # 明确偏好/习惯 → 中高
+    if any(k in t for k in _SIMPLE_PREF_KW):
+        return 0.65
+    # 约定/任务/计划 → 中等
+    if any(k in t for k in _SIMPLE_TASK_KW):
+        return 0.6
+    # 无特征 → 默认中等
+    return 0.5
 
 
 def _map_level_from_importance(importance: float, max_level: int = 5) -> int:
@@ -528,11 +549,13 @@ class AlifeMemoryPlugin(BasePlugin):
                             if len(line) > 120:
                                 continue
                             content_stripped = line
+                            # 启发式估值重要性（Simple Memory 无元数据）→ 映射层级
+                            imp = _infer_simple_importance(content_stripped)
                             rows.append({
-                                "sid": "system", "level": _map_level_from_importance(0.5, self.max_level),
+                                "sid": "system", "level": _map_level_from_importance(imp, self.max_level),
                                 "summary": content_stripped[:100],
                                 "content": content_stripped, "start_ts": file_mtime, "end_ts": file_mtime,
-                                "source_ids": [], "importance": 0.5, "embedding": None,
+                                "source_ids": [], "importance": imp, "embedding": None,
                                 "user_id": "", "memory_type": _infer_simple_memory_type(content_stripped),
                                 "tags": _infer_simple_memory_tags(content_stripped),
                                 "entity_id": "",
@@ -575,9 +598,75 @@ class AlifeMemoryPlugin(BasePlugin):
                             if count:
                                 migrated = True
                                 logger.info("[alife_memory] 已从 KiraOS 记忆迁移 %d 条记忆（原始文件未删除）", count)
+                            # 迁移 KiraOS 实体画像 + 关系（profile.json）→ user_profiles + relationships
+                            try:
+                                pn = await self._migrate_kiraos_profiles(data_root)
+                                if pn:
+                                    migrated = True
+                            except Exception as exc:
+                                logger.warning("[alife_memory] 迁移 KiraOS 画像失败: %s", exc)
         except Exception as exc:
             logger.warning("[alife_memory] 从 %s 迁移失败: %s", plugin_id, exc)
         return migrated
+
+    async def _migrate_kiraos_profiles(self, data_root: Path, max_profiles: int = 200) -> int:
+        """迁移 KiraOS 实体画像（data/memory/entities/{type}_{id}/profile.json）到 user_profiles +
+        relationships 表。KiraOS entity_type = user/group/channel，映射到我们的 user/group。
+        返回迁移的画像数。"""
+        entities_dir = data_root / "memory" / "entities"
+        if not await asyncio.to_thread(lambda: entities_dir.exists()):
+            return 0
+        profile_files = await asyncio.to_thread(lambda: list(entities_dir.glob("*/profile.json")))
+        if not profile_files:
+            return 0
+        n = 0
+        for pf in profile_files[:max_profiles]:
+            try:
+                raw = await asyncio.to_thread(lambda f=pf: f.read_text(encoding="utf-8", errors="replace"))
+                import json as _json
+                data = _json.loads(raw)
+                if not isinstance(data, dict):
+                    continue
+                # entity 目录名格式 {type}_{quoted_id}，从 profile 里的 entity_id 取更可靠
+                entity_id = str(data.get("entity_id", "")).strip()
+                if not entity_id:
+                    # 从目录名解析
+                    seg = pf.parent.name
+                    if "_" in seg:
+                        entity_id = seg.split("_", 1)[1]
+                if not entity_id:
+                    continue
+                kira_type = str(data.get("entity_type", "user")).lower()
+                # KiraOS channel(频道/群) → 我们的 group；user → user；group → group
+                our_type = "user" if kira_type == "user" else "group"
+                profile = {
+                    "name": str(data.get("name", "") or ""),
+                    "nickname": str(data.get("nickname", "") or ""),
+                    "description": str(data.get("description", "") or ""),
+                    "platform": str(data.get("platform", "") or ""),
+                    "traits": data.get("traits") if isinstance(data.get("traits"), list) else [],
+                    "preferences": data.get("preferences") if isinstance(data.get("preferences"), dict) else {},
+                    "facts": data.get("facts") if isinstance(data.get("facts"), list) else [],
+                    "aliases": data.get("aliases") if isinstance(data.get("aliases"), list) else [],
+                    "interaction_count": int(data.get("interaction_count", 0) or 0),
+                    "last_interaction": float(data.get("last_interaction", 0.0) or 0.0),
+                    "generated_from": "KiraOS profile.json 迁移",
+                }
+                await self.store.upsert_profile(entity_id, our_type, **profile)
+                # 关系图（dict: {target_id: relation}）→ relationships 三元组
+                rel_map = data.get("relationships") if isinstance(data.get("relationships"), dict) else {}
+                for target_id, relation in list(rel_map.items())[:40]:
+                    if target_id and relation:
+                        await self.store.upsert_relationship(
+                            entity_id, str(target_id), str(relation),
+                            source_mid="kiraos_profile:" + pf.name, confidence=0.8)
+                n += 1
+            except Exception as exc:
+                logger.warning("[alife_memory] 迁移 KiraOS 画像 %s 失败: %s", pf, exc)
+                continue
+        if n:
+            logger.info("[alife_memory] 已从 KiraOS 迁移 %d 个画像 + 关系", n)
+        return n
 
     async def terminate(self):
         self._closed = True
