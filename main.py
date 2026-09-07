@@ -325,6 +325,8 @@ class AlifeMemoryPlugin(BasePlugin):
         self.search_scope = str(retrieval.get("search_scope", "linked") or "linked").lower()
         if self.search_scope not in ("session", "linked", "global"):
             self.search_scope = "linked"
+        # bot 主动搜记忆工具的最低相关分门槛：默认 0.1 尽量多召回（用户偏好宁可多不可漏）
+        self.search_min_score = _num(retrieval.get("search_min_score", 0.1), 0.1, 0.0, 0.9)
         self.cross_user_enabled = bool(retrieval.get("cross_user_enabled", True))
         self.inject_level_max = _num(retrieval.get("inject_level_max", 12), 12, 0, 12, True)
 
@@ -1666,9 +1668,8 @@ class AlifeMemoryPlugin(BasePlugin):
             scope = self.search_scope
         user_id = _event_user_id((getattr(event, "messages", []) or [None])[-1])
         results = await self.store.search(sid, query, _num(top_k, 5, 1, 12, True), list(range(self.max_level + 1)), await self._embed(query), self.half_life, scope, user_id, self.embedding_model)
-        # 低分兜底记忆视为无关（全表 fallback 的 score≈0.1-0.25，是"没搜到"的信号）
-        # 工具是 bot 的精确查询——宁可说没有，也不拿无关记忆糊弄
-        results = [r for r in results if float(r.get("score", 0)) >= 0.30]
+        # 按可配置相关分门槛过滤（默认 0.1 尽量召回；getattr 兜底兼容旧配置/测试旁路）
+        results = [r for r in results if float(r.get("score", 0)) >= getattr(self, "search_min_score", 0.1)]
         out: list[str] = []
         if results:
             out.append(f"共找到 {len(results)} 条相关记忆：")
