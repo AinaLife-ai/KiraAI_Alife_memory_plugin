@@ -415,6 +415,17 @@ class AlifeMemoryPlugin(BasePlugin):
             type_map = {"fact": "日常事件", "relationship": "关系网络", "preference": "偏好风格",
                         "entity": "关于实体", "task": "约定任务", "source": "溯源查询"}
             memory_type = type_map.get(kira_type, "日常事件")
+            # 用 tags 辅助推断类型（KiraOS 的 fact 多是 fact，靠 tags 提升分类准确度）
+            if memory_type == "日常事件" and tags:
+                tag_str = " ".join(tags)
+                if any(k in tag_str for k in ("关系", "成员", "role", "relationship", "人际", "称呼")):
+                    memory_type = "关系网络"
+                elif any(k in tag_str for k in ("偏好", "喜欢", "爱好", "习惯", "preference", "禁止", "风格")):
+                    memory_type = "偏好风格"
+                elif any(k in tag_str for k in ("事", "任务", "进行", "约定", "work", "截止", "项目")):
+                    memory_type = "约定任务"
+                elif any(k in tag_str for k in ("身份", "背景", "性格", "职业", "entity", "知识", "技能")):
+                    memory_type = "关于实体"
             importance = float(t_imp.group(1)) / 10.0 if t_imp else 0.5
             source_sid = t_sid.group(1) if t_sid else "kiraos_import"
             from datetime import datetime as _dt

@@ -36,7 +36,12 @@
       "llm_concurrency_limit": {"type": "integer", "name": "LLM 并发上限", "default": 4, "minimum": 1, "maximum": 20, "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。", "locales": {"zh": {"name": "LLM 并发上限", "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。"}}},
       "user_list_limit": {"type": "integer", "name": "默认展示用户数", "default": 50, "minimum": 1, "maximum": 200, "hint": "list_users 默认一次列出多少个用户（总数始终显示，超出会提示）。", "locales": {"zh": {"name": "默认展示用户数", "hint": "list_users 默认一次列出多少个用户（总数始终显示，超出会提示）。"}}},
       "memory_list_limit": {"type": "integer", "name": "默认展示记忆条数", "default": 20, "minimum": 1, "maximum": 100, "hint": "list_user_memories / list_session_memories 默认一次列出多少条记忆（总数始终显示）。", "locales": {"zh": {"name": "默认展示记忆条数", "hint": "list_user_memories / list_session_memories 默认一次列出多少条记忆（总数始终显示）。"}}},
-      "recent_summaries_count": {"type": "integer", "name": "默认最近记得条数", "default": 3, "minimum": 1, "maximum": 10, "hint": "list_users 里每个用户默认展示几条最近记得的记忆。", "locales": {"zh": {"name": "默认最近记得条数", "hint": "list_users 里每个用户默认展示几条最近记得的记忆。"}}}
+      "recent_summaries_count": {"type": "integer", "name": "默认最近记得条数", "default": 3, "minimum": 1, "maximum": 10, "hint": "list_users 里每个用户默认展示几条最近记得的记忆。", "locales": {"zh": {"name": "默认最近记得条数", "hint": "list_users 里每个用户默认展示几条最近记得的记忆。"}}},
+      "profile_enabled": {"type": "switch", "name": "启用画像", "default": true, "hint": "为实体（用户/群/机器人）生成结构化画像，由记忆聚合而成。", "locales": {"zh": {"name": "启用画像", "hint": "为实体生成结构化画像，由记忆聚合而成。"}}},
+      "profile_inject": {"type": "switch", "name": "注入画像", "default": true, "hint": "对话时把当前用户及其提到的人的画像注入上下文。", "locales": {"zh": {"name": "注入画像", "hint": "对话时把当前用户及其提到的人的画像注入上下文。"}}},
+      "profile_inject_max": {"type": "integer", "name": "画像注入上限", "default": 3, "minimum": 0, "maximum": 6, "hint": "最多注入多少个实体的画像（含当前用户）。", "locales": {"zh": {"name": "画像注入上限", "hint": "最多注入多少个实体的画像（含当前用户）。"}}},
+      "profile_generate_model": {"type": "string", "name": "画像生成模型", "default": "", "hint": "生成画像用的 LLM 模型（留空=默认模型）。", "locales": {"zh": {"name": "画像生成模型", "hint": "生成画像用的 LLM 模型（留空=默认模型）。"}}},
+      "profile_gen_trigger": {"type": "integer", "name": "画像生成触发记忆数", "default": 5, "minimum": 1, "maximum": 50, "hint": "某实体累计多少条记忆时触发一次画像生成（首次见即生成）。", "locales": {"zh": {"name": "画像生成触发记忆数", "hint": "某实体累计多少条记忆时触发一次画像生成。"}}}
     }
   },
   "section_trigger": {
