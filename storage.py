@@ -357,6 +357,8 @@ class MemoryStore:
                 "reason": "ALTER TABLE memories ADD COLUMN reason TEXT NOT NULL DEFAULT ''",
                 "scenario": "ALTER TABLE memories ADD COLUMN scenario TEXT NOT NULL DEFAULT ''",
                 "entity_id": "ALTER TABLE memories ADD COLUMN entity_id TEXT NOT NULL DEFAULT ''",
+                "reflect_count": "ALTER TABLE memories ADD COLUMN reflect_count INTEGER NOT NULL DEFAULT 0",
+                "reflect_last_ts": "ALTER TABLE memories ADD COLUMN reflect_last_ts REAL NOT NULL DEFAULT 0",
             }
             for name, statement in migrations.items():
                 if name not in columns:
@@ -922,6 +924,21 @@ class MemoryStore:
         finally:
             conn.close()
 
+    async def mark_superseded(self, memory_id: str, note: str) -> bool:
+        """标记记忆为 superseded（被合并/修正吸收），保留审计链。"""
+        return await asyncio.to_thread(self._mark_superseded, memory_id, note)
+
+    def _mark_superseded(self, memory_id, note):
+        conn = self._connect()
+        try:
+            cur = conn.execute("UPDATE memories SET status='superseded', updated_at=?, correction_note=? WHERE id=? AND deleted=0",
+                               (time.time(), note or '', memory_id))
+            conn.execute("DELETE FROM memories_fts WHERE memory_id=?", (memory_id,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
     async def delete_memory(self, memory_id: str) -> bool:
         return await asyncio.to_thread(self._delete_memory, memory_id)
 
@@ -1332,6 +1349,116 @@ class MemoryStore:
             for row in rows:
                 result.append(_normalize_item(dict(row)))
             return result
+        finally:
+            conn.close()
+
+    # ---- 后台审计调度（轮转）----
+    async def pick_reflection_candidates(self, limit: int = 20, period_days: float = 3.0) -> list[dict]:
+        """全局池挑选"应审计"的记忆：从未审过 或 距上次审已超周期。
+        排序：reflect_count 升序(审得越少越优先) → importance 降序 → 时间降序。
+        返回的项带 reflect_count / reflect_last_ts，供审计流程记账。"""
+        return await asyncio.to_thread(self._pick_reflection_candidates, limit, period_days)
+
+    def _pick_reflection_candidates(self, limit, period_days):
+        conn = self._connect()
+        try:
+            cutoff = time.time() - float(period_days) * 86400.0
+            rows = conn.execute(
+                "SELECT * FROM memories WHERE deleted=0 AND status='active' "
+                "AND (reflect_count=0 OR reflect_last_ts=0 OR reflect_last_ts < ?) "
+                "ORDER BY reflect_count ASC, importance DESC, end_ts DESC LIMIT ?",
+                (cutoff, limit)).fetchall()
+            result = []
+            for row in rows:
+                result.append(_normalize_item(dict(row)))
+            return result
+        finally:
+            conn.close()
+
+    async def mark_reflected(self, memory_id: str, reflect_count: int, last_ts: float) -> None:
+        """审计记账：更新某记忆的审计次数和上次审计时间。"""
+        return await asyncio.to_thread(self._mark_reflected, memory_id, reflect_count, last_ts)
+
+    def _mark_reflected(self, memory_id, reflect_count, last_ts):
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE memories SET reflect_count=?, reflect_last_ts=? WHERE id=?",
+                (int(reflect_count), float(last_ts), memory_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def find_similar_memories(self, summary: str, content: str, entity_id: str = "",
+                                    limit: int = 3, exclude_id: str = "") -> list[dict]:
+        """FTS5 语义召回同实体的相似记忆（去重/审计用，纯本地，不依赖向量）。"""
+        return await asyncio.to_thread(self._find_similar_memories, summary, content, entity_id, limit, exclude_id)
+
+    def _find_similar_memories(self, summary, content, entity_id, limit, exclude_id):
+        conn = self._connect()
+        try:
+            # 基础过滤：同实体 + active + 非自身
+            where = ["m.deleted=0 AND m.status='active'"]
+            params = []
+            if entity_id:
+                where.append("(m.entity_id=? OR m.user_id=?)")
+                params.extend([entity_id, entity_id])
+            if exclude_id:
+                where.append("m.id<>?")
+                params.append(exclude_id)
+            base_where = " AND ".join(where)
+            query = (summary + " " + content)[:200]
+            # 分词 + 拆字，得到候选 term（用于 LIKE 兜底）
+            import re as _re
+            terms = tokenize(query) or []
+            like_terms = list(dict.fromkeys(terms[:8]))
+            for ch in str(query):
+                if ch.strip() and ('\u4e00' <= ch <= '\u9fff') and ch not in like_terms:
+                    like_terms.append(ch)
+            like_terms = like_terms[:12]
+            # 1) FTS5 主召回
+            ftss = []
+            fts_query = build_fts_query(query)
+            if fts_query:
+                try:
+                    rows = conn.execute(
+                        f"SELECT m.*, bm25(memories_fts) AS bm25_score FROM memories_fts f "
+                        f"JOIN memories m ON m.id=f.memory_id "
+                        f"WHERE memories_fts MATCH ? AND {base_where} ORDER BY bm25_score LIMIT {int(limit)}",
+                        [fts_query, *params]).fetchall()
+                    ftss = [dict(r) for r in rows]
+                except Exception:
+                    ftss = []
+            # 2) LIKE 兜底：FTS 命中不足时补（短文本 FTS 常召回不到，靠 LIKE 提高召回）
+            if len(ftss) < limit and like_terms:
+                like_terms_all = [f"%{t}%" for t in like_terms]
+                like_sql = " OR ".join("(m.summary LIKE ? OR m.content LIKE ?)" for _ in like_terms_all)
+                like_rows = conn.execute(
+                    f"SELECT m.*, 0.0 AS bm25_score FROM memories m WHERE {base_where} AND ({like_sql}) "
+                    f"ORDER BY m.importance DESC, m.end_ts DESC LIMIT {int(limit)}",
+                    [*params, *sum(([x, x] for x in like_terms_all), [])]).fetchall()
+                ftss.extend(dict(r) for r in like_rows)
+            # 3) 去重 + 用 token 重叠算 similarity（不依赖 bm25，短文本更可靠）
+            seen = set()
+            result = []
+            for row in ftss:
+                item = _normalize_item(row)
+                mid = item["id"]
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                # token 重叠相似度：query 的 term 里有多少出现在候选的 summary/content
+                q_terms = set(t for t in tokenize(query) if t)
+                cand_text = (item.get("summary", "") + " " + item.get("content", ""))
+                if q_terms:
+                    overlap = sum(1 for t in q_terms if t in cand_text)
+                    item["similarity"] = round(overlap / len(q_terms), 3)
+                else:
+                    item["similarity"] = 0.0
+                result.append(item)
+            # 按 similarity 降序 + importance 降序
+            result.sort(key=lambda x: (x.get("similarity", 0), x.get("importance", 0)), reverse=True)
+            return result[:limit]
         finally:
             conn.close()
 

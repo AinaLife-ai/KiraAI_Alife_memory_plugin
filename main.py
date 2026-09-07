@@ -263,7 +263,11 @@ class AlifeMemoryPlugin(BasePlugin):
 
         self.reflect_enabled = bool(reflection.get("enabled", True))
         self.reflect_interval = _num(reflection.get("interval_seconds", 1800), 1800, 300, 86400, True)
-        self.reflect_max_items = _num(reflection.get("max_items", 4), 4, 1, 20, True)
+        # 审计轮转：period(天) = 记忆审过后多久再进入池子；batch = 每轮最多审多少条
+        self.reflect_period = _num(reflection.get("period_days", 3), 3, 0.5, 90)
+        self.reflect_batch = _num(reflection.get("batch_size", 20), 20, 1, 100, True)
+        # 语义去重/审计的相似度阈值（FTS5 归一化分超出此值才审/判）
+        self.dedup_similarity_threshold = _num(reflection.get("dedup_similarity_threshold", 0.1), 0.1, 0.0, 1.0)
 
         self.message_retention_days = _num(basic.get("message_retention_days", 7), 7, 1, 365, True)
         self.stale_retention_days = _num(basic.get("stale_retention_days", 30), 30, 1, 730, True)
@@ -280,9 +284,8 @@ class AlifeMemoryPlugin(BasePlugin):
         self.inject_level_max = _num(retrieval.get("inject_level_max", 12), 12, 0, 12, True)
 
         self.compress_prompt = str(compression.get("prompt", "") or "").strip() or self._default_compress_prompt()
-        self.reflect_prompt = str(reflection.get("prompt", "") or "").strip() or self._default_reflect_prompt()
-        # 若用户未自定义压缩/审校提示词，把默认词回填进 cfg，让 WebUI 可展示、可编辑（用户改过后不再覆盖）
-        self._sync_default_prompts(compression, reflection)
+        # 若用户未自定义压缩提示词，把默认词回填进 cfg，让 WebUI 可展示、可编辑（用户改过后不再覆盖）
+        self._sync_default_compress_prompt(compression)
         self.compress_probability = _num(compression.get("compress_probability", 0.8), 0.8, 0.0, 1.0)
         self.compress_timeout = _num(compression.get("compress_timeout", 30), 30, 5, 120, True)
         self.max_compress_retry = _num(compression.get("max_compress_retry", 2), 2, 0, 10, True)
@@ -309,37 +312,16 @@ class AlifeMemoryPlugin(BasePlugin):
                 "tags 是 2-4 个简短中文标签，方便以后按标签翻找，不要超过 6 个。\n"
                 "不要臆测，不要把闲聊或临时情绪写成长期事实；保留时间、主体和限定条件。\n待整理内容：\n{content}")
 
-    @staticmethod
-    def _default_reflect_prompt():
-        return ("你是记忆审校器。比较旧记忆和新证据，只处理有明确矛盾的事实。\n"
-                "只输出 JSON：{\"action\":\"none|correct|stale\",\"items\":[{\"memory_id\":\"\",\"summary\":\"修正后的概述\",\"content\":\"修正后的事实\",\"memory_type\":\"关于实体|偏好风格|约定任务|关系网络|溯源查询|日常事件\",\"tags\":[\"标签\"],\"confidence\":0.0,\"reason\":\"证据依据\",\"scenario\":\"何时想起\",\"entity_id\":\"\"}]}\n"
-                "action=correct 时 items 里给出修正后的完整结构化字段（含 memory_type/tags/reason/scenario）；action=stale 时 items 可只给 memory_id。\n"
-                "若只是措辞不同、证据不足或可能是临时状态，输出 none。不得凭空补全。\n旧记忆：\n{memory}\n新证据：\n{evidence}")
-
-    def _sync_default_prompts(self, compression: dict, reflection: dict):
-        """当用户未自定义提示词时，把最新默认词回填进 cfg（供 WebUI 展示/编辑）。
+    def _sync_default_compress_prompt(self, compression: dict):
+        """当用户未自定义压缩提示词时，把最新默认词回填进 cfg（供 WebUI 展示/编辑）。
         用户一旦改过（cfg 里是非空且非默认的内容），就不再覆盖。"""
         default_comp = self._default_compress_prompt()
-        default_refl = self._default_reflect_prompt()
         comp_val = str(compression.get("prompt", "") or "").strip()
-        refl_val = str(reflection.get("prompt", "") or "").strip()
-        # 旧的非结构化默认词（用户从未自定义、仍是内置默认时也升级到新结构化词）
         old_comp_defaults = [
             '你是长期记忆整理器。把{range}中提取成可验证、简洁、无重复的记忆。\n只输出 JSON，不要 Markdown：{"summary":"一句话概述","content":"事实、偏好、决定和关系变化，分行列出","importance":0.0}\n不要臆测，不要把闲聊或临时情绪写成长期事实；保留时间、主体和限定条件。\n待整理内容：\n{content}']
-        old_refl_defaults = [
-            '你是记忆审校器。比较旧记忆和新证据，只处理有明确矛盾的事实。\n只输出 JSON：{"action":"none|correct|stale","summary":"修正后的概述","content":"修正后的事实","confidence":0.0,"reason":"证据依据"}\n若只是措辞不同、证据不足或可能是临时状态，输出 none。不得凭空补全。\n旧记忆：\n{memory}\n新证据：\n{evidence}']
-        changed = False
-        # 空 或 等于旧默认词（即从未真正自定义）→ 用最新结构化默认词
         if not comp_val or any(comp_val == o.strip() for o in old_comp_defaults if o.strip()):
             compression["prompt"] = default_comp
-            changed = True
-        if not refl_val or any(refl_val == o.strip() for o in old_refl_defaults if o.strip()):
-            reflection["prompt"] = default_refl
-            changed = True
-        if changed:
-            # 回写到模块级 cfg，让 WebUI /config 能拿到
-            self.cfg.setdefault("section_compression", {})["prompt"] = compression.get("prompt", default_comp)
-            self.cfg.setdefault("section_reflection", {})["prompt"] = reflection.get("prompt", default_refl)
+            self.cfg.setdefault("section_compression", {})["prompt"] = default_comp
 
     @staticmethod
     def _convert_relative_dates(text: str) -> str:
@@ -621,6 +603,23 @@ class AlifeMemoryPlugin(BasePlugin):
             logger.warning("[alife_memory] model request failed: %s", exc)
             return None
 
+    async def _llm_text(self, prompt: str, model: str, timeout: float = 20.0) -> str:
+        """纯文本 LLM 调用（不解析 JSON），用于去重/合并判断时拿自然语言答案。"""
+        client = self._client(model)
+        if not client:
+            return ""
+        try:
+            async with getattr(self, "_llm_semaphore", asyncio.Semaphore(3)):
+                response = await asyncio.wait_for(
+                    client.chat(LLMRequest(messages=[OpenAIMessage(role="user", content=prompt)])),
+                    timeout=timeout)
+            return str(getattr(response, "text_response", "") or "").strip()
+        except asyncio.TimeoutError:
+            return ""
+        except Exception as exc:
+            logger.warning("[alife_memory] llm_text failed: %s", exc)
+            return ""
+
     async def _embed(self, text: str) -> list[float] | None:
         if not self.semantic_enabled:
             return None
@@ -866,23 +865,73 @@ class AlifeMemoryPlugin(BasePlugin):
                 await self.store.mark_stale(old["id"], f"merged into {new_id}")
 
     async def _reflection_loop(self):
+        """后台审计：全局池轮转，每轮审 reflect_batch 条"到期应审"的记忆。
+        到期 = 从未审过 或 距上次审已超 reflect_period(天)。
+        优先审 reflect_count 少的；审完 mark_reflected 记账，周期内跳过。"""
         try:
             while not self._closed:
                 await asyncio.sleep(self.reflect_interval)
-                sessions = set()
-                for sid_item in await self.store.list_memories(None, 1000):
-                    sessions.add(sid_item["sid"])
-                for sid in sessions:
-                    try:
-                        await self._reflect_session(sid)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        logger.exception("[alife_memory] reflection failed for %s", sid)
+                if self._closed:
+                    break
+                if not self.reflect_enabled:
+                    continue
+                try:
+                    candidates = await self.store.pick_reflection_candidates(
+                        self.reflect_batch, self.reflect_period)
+                    if not candidates:
+                        logger.debug("[alife_memory] 审计: 无到期记忆，跳过")
+                        continue
+                    reflected = 0
+                    for mem in candidates:
+                        try:
+                            await self._reflect_memory(mem)
+                            reflected += 1
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.warning("[alife_memory] 审计单条失败 %s: %s", mem.get("id"), exc)
+                    logger.info("[alife_memory] 审计轮转: %d 条候选 → 审 %d 条", len(candidates), reflected)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("[alife_memory] 审计轮转失败: %s", exc)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("[alife_memory] reflection loop failed")
+
+    async def _reflect_memory(self, memory: dict):
+        """对单条记忆做审计：情感内聚去重（不用最近对话作证据）。
+        用 FTS5 找同实体语义近邻 → LLM 判断 duplicate/update/new → 该合并的合并。
+        审完记账 mark_reflected。"""
+        mid = memory.get("id")
+        if not mid:
+            return
+        # 语义去重：找同实体的相似记忆（排除自身）
+        similar = await self.store.find_similar_memories(
+            memory.get("summary", ""), memory.get("content", ""),
+            entity_id=memory.get("entity_id") or memory.get("user_id", ""),
+            limit=3, exclude_id=mid)
+        # 只对最相似的候选调 LLM 判断（省 token），相似度过低的跳过
+        min_sim = getattr(self, "dedup_similarity_threshold", 0.1)
+        candidates = sorted(similar, key=lambda s: s.get("similarity", 0), reverse=True)
+        # 取 similarity 达标的前 2 个候选去判断
+        candidates = [c for c in candidates if c.get("similarity", 0) >= min_sim][:2]
+        if candidates:
+            for cand in candidates:
+                decision = await self._check_conflict_llm(
+                    memory.get("summary", "") + "\n" + memory.get("content", ""),
+                    cand.get("summary", "") + "\n" + cand.get("content", ""))
+                if decision == "duplicate":
+                    await self._merge_duplicate(memory, cand)
+                    break
+                elif decision == "update":
+                    merged_summary, merged_content = await self._merge_facts_llm(memory, cand)
+                    if merged_summary and merged_content:
+                        await self._apply_merge(memory, cand, merged_summary, merged_content)
+                    break
+        # 记账：无论是否合并，都记录本次审计
+        await self.store.mark_reflected(mid, int(memory.get("reflect_count", 0)) + 1, time.time())
 
     async def _cleanup_loop(self):
         try:
@@ -906,44 +955,74 @@ class AlifeMemoryPlugin(BasePlugin):
         except asyncio.CancelledError:
             pass
 
-    async def _reflect_session(self, sid: str):
-        memories = [x for x in await self.store.list_memories(sid, self.reflect_max_items) if x.get("status") == "active"]
-        recent = await self.store.recent(sid, 10)
-        evidence = "\n".join(f"[{x['role']}] {x['content']}" for x in recent)
-        for memory in memories:
-            prompt = self.reflect_prompt.replace("{memory}", memory["summary"] + "\n" + memory["content"]).replace("{evidence}", evidence)
-            result = await self._llm_json(prompt, self.reflect_model)
-            if not result:
-                continue
-            action = str(result.get("action", "none")).lower()
-            # 结构化审计：items 里给出修正条目（含 memory_type/tags/reason/scenario 修正）
-            corr_items = _cos_structured_json(result)
-            if action == "none" and not corr_items:
-                continue
-            if action == "none":
-                action = "correct"
-            # 置信度：整体或单条
-            base_confidence = _num(result.get("confidence", 0), 0, 0, 1)
-            if action == "stale":
-                await self.store.mark_stale(memory["id"], "后台审校发现旧/过期")
-                continue
-            if action == "correct" and corr_items:
-                ci = corr_items[0]
-                confidence = _num(ci.get("confidence", base_confidence), 0, 0, 1)
-                if confidence < 0.86:
-                    continue
-                note = str(ci.get("reason") or result.get("reason") or "后台审校发现新证据")[:500]
-                summary = str(ci.get("summary", "")).strip()
-                content = str(ci.get("content", "")).strip()
-                if summary and content:
-                    vector = await self._embed(summary + "\n" + content)
-                    await self.store.correct_memory(
-                        memory["id"], summary, content, note, confidence, vector,
-                        memory_type=ci.get("memory_type", memory.get("memory_type", "")),
-                        tags=ci.get("tags") or memory.get("tags") or [],
-                        reason=ci.get("reason", memory.get("reason", "")),
-                        scenario=ci.get("scenario", memory.get("scenario", "")),
-                        entity_id=ci.get("entity_id", memory.get("entity_id", "")))
+    # ---- 审计辅助（语义去重/合并）----
+    async def _check_conflict_llm(self, existing_text: str, new_text: str) -> str:
+        """LLM 判断新旧记忆关系：duplicate / update / new（对齐 KiraOS _check_conflict）。
+        用纯文本调用（非 JSON），让模型直接输出选项文本。"""
+        prompt = (
+            f"比较以下两条信息，判断它们的关系：\n\n已有信息: {existing_text[:600]}\n新信息: {new_text[:600]}\n\n"
+            "只输出以下三个选项之一（不要其他内容、不要解释）：\n"
+            "- duplicate：新信息与已有信息基本相同\n"
+            "- update：新信息是对已有信息的更新或补充，需要合并\n"
+            "- new：新信息与已有信息无关，是全新信息")
+        raw = await self._llm_text(prompt, self.reflect_model or "")
+        raw = (raw or "").strip().strip('"').lower()
+        if "duplicate" in raw:
+            return "duplicate"
+        if "update" in raw:
+            return "update"
+        return "new"
+
+    async def _merge_facts_llm(self, memory_a: dict, memory_b: dict) -> tuple[str, str]:
+        """LLM 合并两条记忆为一条，返回 (summary, content)。用纯文本调用并解析 JSON。"""
+        prompt = (
+            f"将以下两条记忆合并为一条，保留所有有用信息：\n\n记忆A: {memory_a.get('summary','')} — {memory_a.get('content','')}\n"
+            f"记忆B: {memory_b.get('summary','')} — {memory_b.get('content','')}\n\n"
+            "只输出 JSON（不要 Markdown）：{\"summary\":\"合并后的一句话概述\",\"content\":\"合并后的完整内容\"}")
+        raw = await self._llm_text(prompt, self.reflect_model or "")
+        result = _json_object(raw)
+        if isinstance(result, dict) and result.get("summary") and result.get("content"):
+            return str(result["summary"]).strip(), str(result["content"]).strip()
+        # 兜底：并置
+        return (memory_a.get("summary", "") + "；" + memory_b.get("summary", ""),
+                memory_a.get("content", "") + "\n" + memory_b.get("content", ""))
+
+    async def _apply_merge(self, target: dict, other: dict, summary: str, content: str) -> None:
+        """把 two 合并进 target：target 更新为新内容，other 标记 superseded（保留审计链），
+        取更高 confidence / importance。"""
+        tid = target.get("id")
+        oid = other.get("id")
+        if not tid or not oid or tid == oid:
+            return
+        confidence = max(float(target.get("confidence", 0.65)), float(other.get("confidence", 0.65)))
+        importance = max(float(target.get("importance", 0.5)), float(other.get("importance", 0.5)))
+        # 合并 tags / memory_type（取非空的）
+        tags = list(dict.fromkeys((target.get("tags") or []) + (other.get("tags") or [])))
+        mtype = target.get("memory_type") or other.get("memory_type") or "日常事件"
+        reason = target.get("reason") or other.get("reason")
+        scenario = target.get("scenario") or other.get("scenario")
+        entity_id = target.get("entity_id") or other.get("entity_id")
+        vector = await self._embed(summary + "\n" + content)
+        # correct_memory 会 superseded 旧的并写新版本
+        await self.store.correct_memory(
+            tid, summary, content, f"审计合并: 与 {oid} 整合", confidence, vector,
+            memory_type=mtype, tags=tags, reason=reason, scenario=scenario, entity_id=entity_id)
+        # other 也标记 superseded（被 target 吸收，保留审计链）
+        await self.store.mark_superseded(oid, f"审计合并进 {tid}")
+        logger.info("[alife_memory] 审计合并: %s + %s → %s", tid, oid, tid)
+
+    async def _merge_duplicate(self, target: dict, other: dict) -> None:
+        """两条完全相同 → 合并来源引用，保留内容更完整的一条，另一条 superseded。"""
+        tid = target.get("id")
+        oid = other.get("id")
+        if not tid or not oid or tid == oid:
+            return
+        # 保留 confidence/importance 高的那条作为 target
+        if float(other.get("confidence", 0)) > float(target.get("confidence", 0)) or \
+           float(other.get("importance", 0)) > float(target.get("importance", 0)):
+            tid, oid = oid, tid
+        await self.store.mark_superseded(oid, f"重复，由 {tid} 吸收")
+        logger.info("[alife_memory] 审计去重: %s → %s (重复)", oid, tid)
 
     # ---- 画像（批次 B）----
     async def _ensure_profile(self, entity_id: str, entity_type: str = "user") -> None:
@@ -1610,13 +1689,15 @@ class AlifeMemoryPlugin(BasePlugin):
     @register.api(method="POST", path="/reflect", auth=True, summary="Run reflection")
     async def api_reflect(self, request: Request):
         body = await request.json()
-        sid = str(body.get("sid", "")).strip()
-        if sid:
-            self._track(self._reflect_session(sid))
-        else:
-            for item in await self.store.list_memories(None, 1000):
-                self._track(self._reflect_session(item["sid"]))
-        return {"ok": True, "message": "后台审校任务已排队"}
+        # WebUI 手动触发一次审计：立即全局池挑到期记忆审一批
+        try:
+            candidates = await self.store.pick_reflection_candidates(
+                self.reflect_batch, self.reflect_period)
+        except Exception:
+            candidates = []
+        for mem in candidates:
+            self._track(self._reflect_memory(mem))
+        return {"ok": True, "message": f"后台审校已排队（本轮 {len(candidates)} 条到期记忆）"}
 
     @register.api(method="GET", path="/tasks", auth=True, summary="List memory tasks")
     async def api_tasks(self, limit: int = 50):
