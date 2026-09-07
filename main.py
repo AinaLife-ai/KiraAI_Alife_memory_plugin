@@ -390,7 +390,9 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @staticmethod
     def _parse_kiraos_toml(tf: Path):
-        """解析单个 KiraOS TOML 记忆文件，返回 (content, summary, importance, sid, ts) 或 None。"""
+        """解析单个 KiraOS TOML 记忆文件。
+        返回 (content, summary, importance, sid, ts, tags, memory_type) 或 None。
+        同时解析 KiraOS 的 tags 数组（之前丢失），供结构化落库。"""
         try:
             text = tf.read_text(encoding="utf-8", errors="replace")
             import re as _re
@@ -403,7 +405,16 @@ class AlifeMemoryPlugin(BasePlugin):
                 return None
             t_imp = _re.search(r'importance\s*=\s*(\d+)', text)
             t_sid = _re.search(r'session\s*=\s*"([^"]*)"', text)
-            t_ts = _re.search(r'time\s*=\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', text)
+            t_ts = _re.search(r'time\s*=\s*"([^"]*)"', text)
+            # 解析 KiraOS tags 数组（多行 ['tag1','tag2']），之前完全丢失
+            t_tags = _re.findall(r'"([^"]+)"', _re.search(r'tags\s*=\s*\[(.*?)\]', text, _re.S).group(1) if _re.search(r'tags\s*=\s*\[(.*?)\]', text, _re.S) else '')
+            tags = [t.strip() for t in t_tags if t.strip()]
+            # KiraOS type: fact / relationship / preference 等
+            t_type = _re.search(r'type\s*=\s*"([^"]*)"', text)
+            kira_type = t_type.group(1) if t_type else "fact"
+            type_map = {"fact": "日常事件", "relationship": "关系网络", "preference": "偏好风格",
+                        "entity": "关于实体", "task": "约定任务", "source": "溯源查询"}
+            memory_type = type_map.get(kira_type, "日常事件")
             importance = float(t_imp.group(1)) / 10.0 if t_imp else 0.5
             source_sid = t_sid.group(1) if t_sid else "kiraos_import"
             from datetime import datetime as _dt
@@ -411,7 +422,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 ts_val = _dt.fromisoformat(t_ts.group(1)).timestamp() if t_ts else time.time()
             except Exception:
                 ts_val = time.time()
-            return (content, content[:100], importance, source_sid, ts_val)
+            return (content, content[:100], importance, source_sid, ts_val, tags, memory_type)
         except Exception:
             return None
 
@@ -483,17 +494,18 @@ class AlifeMemoryPlugin(BasePlugin):
                         # 1) 并行读取所有文件并解析（替代逐条串行 read_text）
                         from datetime import datetime as _dt
                         parsed = await asyncio.gather(*[asyncio.to_thread(self._parse_kiraos_toml, tf) for tf in toml_files])
-                        valid = [p for p in parsed if p]  # [(content, summary, importance, sid, ts)]
+                        valid = [p for p in parsed if p]  # [(content, summary, importance, sid, ts, tags, memory_type)]
                         if valid:
                             # 迁移只导入文本 + 元数据，不计算向量（避免卡顿/白忙/依赖向量模型）
                             rows = []
                             now = time.time()
-                            for (content, summary, importance, source_sid, ts_val) in valid:
+                            for (content, summary, importance, source_sid, ts_val, ktags, ktype) in valid:
                                 rows.append({
                                     "sid": source_sid, "level": 3, "summary": summary,
                                     "content": content, "start_ts": ts_val, "end_ts": ts_val,
                                     "source_ids": [], "importance": importance,
                                     "embedding": None, "user_id": "",
+                                    "memory_type": ktype, "tags": ktags,
                                     "source_fingerprint": hashlib.sha256(("kiraos_import|" + content).encode()).hexdigest()[:32],
                                     "source_refs": [{"sid": source_sid, "user_id": "", "ts": ts_val,
                                                      "action": "从KiraOS记忆自动迁移，原始文件保留未清理"}],
