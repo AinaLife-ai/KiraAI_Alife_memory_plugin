@@ -85,6 +85,115 @@ def _json_object(text: str) -> dict[str, Any] | None:
             return None
 
 
+_MEMORY_TYPES = ("关于实体", "偏好风格", "约定任务", "关系网络", "溯源查询", "日常事件")
+_LEGACY_MT = {"关于我的": "关于实体", "我喜欢的": "偏好风格", "正在发生的": "约定任务",
+              "去哪查": "溯源查询", "日常的": "日常事件"}
+
+
+def _norm_mt(mt: str) -> str:
+    """规范化 memory_type 到 6 类。非法值回退「日常事件」。"""
+    mt = (mt or "").strip()
+    if mt in _MEMORY_TYPES:
+        return mt
+    if mt in _LEGACY_MT:
+        return _LEGACY_MT[mt]
+    en = {"entity": "关于实体", "preference": "偏好风格", "task": "约定任务",
+          "relation": "关系网络", "source": "溯源查询", "daily": "日常事件", "fact": "日常事件"}
+    return en.get(mt.lower(), "日常事件")
+
+
+# Simple Memory 迁移用的启发式类型/标签推断（core.txt 是纯文本逐行，无元数据，只能从内容判断）
+_SIMPLE_ENT_KW = ("是", "职业", "工作", "公司", "学校", "专业", "性格", "名字", "身份", "背景", "博士", "硕士", "教师", "医生", "学生")
+_SIMPLE_PREF_KW = ("喜欢", "讨厌", "爱", "爱吃", "习惯", "不习惯", "愿意", "不愿意", "偏好", "爱好", "忌口", "喜欢看", "爱看", "口味", "睡觉", "熬夜", "作息", "喜欢喝", "喜欢穿", "喜欢用", "上班", "下班")
+_SIMPLE_TASK_KW = ("正在", "打算", "计划", "项目", "截止", "明天", "后天", "要做", "任务", "记得", "约定", "安排", "下周", "月底", "完成")
+_SIMPLE_REL_KW = ("朋友", "主人", "妹妹", "姐姐", "哥哥", "女友", "男友", "恋人", "家人", "同事", "搭档", "家人", "抚养", "关系", "情侣", "兄弟", "爸爸", "妈妈")
+
+
+def _infer_simple_memory_type(text: str) -> str:
+    """从纯文本启发式推断 memory_type（Simple Memory 无元数据）。
+    优先级：实体 > 约定 > 偏好 > 关系 > 日常。"""
+    t = (text or "").lower()
+    # 身份/职业背景 → 关于实体（但避免把"是"误判所有含是的句子）
+    if any(k in t for k in ("职业", "公司", "学校", "专业", "性格", "身份", "背景", "博士", "硕士", "教师", "医生", "学生")):
+        return "关于实体"
+    if any(k in t for k in _SIMPLE_TASK_KW):
+        return "约定任务"
+    if any(k in t for k in _SIMPLE_PREF_KW):
+        return "偏好风格"
+    if any(k in t for k in _SIMPLE_REL_KW):
+        return "关系网络"
+    return "日常事件"
+
+
+def _infer_simple_memory_tags(text: str) -> list[str]:
+    """从纯文本启发式打少量标签（Simple Memory 无 tags）。"""
+    tags = []
+    t = (text or "")
+    if any(k in t for k in _SIMPLE_PREF_KW):
+        tags.append("偏好")
+    if any(k in t for k in ("项目", "计划", "截止", "任务", "约定", "安排")):
+        tags.append("约事")
+    if any(k in t for k in ("朋友", "主人", "家人", "女友", "男友", "恋人", "妹妹", "姐姐", "哥哥", "同事", "抚养", "情侣", "兄弟", "爸爸", "妈妈")):
+        tags.append("关系")
+    return tags
+
+
+def _norm_clamp(v, lo: float, hi: float, default: float) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, f))
+
+
+def _cos_structured_json(text: str, schema: str = "items") -> list[dict[str, Any]]:
+    """解析 LLM 输出的结构化记忆/审计 JSON，做 schema 校验 + 缺失字段兜底。
+    schema='items' 期望 {"items":[{summary,content,memory_type,tags,...,confidence,importance,...}]}。
+    支持顶层直接是数组，或 {"items":[...]}。解析失败返回 []（调用方降级）。"""
+    raw = _json_object(text) if isinstance(text, str) else text
+    if not isinstance(raw, dict):
+        return []
+    items = raw.get("items")
+    if items is None and schema == "items":
+        # 兼容旧的单条输出 {summary,content,...} 包装成 items
+        items = [raw] if raw.get("summary") else []
+    if not isinstance(items, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        item = dict(it)
+        # 摘要/内容兜底
+        item["summary"] = str(item.get("summary", "") or "").strip()
+        item["content"] = str(item.get("content", "") or "").strip()
+        # memory_type 规范化
+        item["memory_type"] = _norm_mt(str(item.get("memory_type", "") or ""))
+        # tags 数组化
+        raw_tags = item.get("tags", [])
+        if isinstance(raw_tags, str):
+            raw_tags = [t.strip() for t in raw_tags.replace("，", ",").split(",") if t.strip()]
+        if isinstance(raw_tags, list):
+            raw_tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+        else:
+            raw_tags = []
+        item["tags"] = raw_tags[:8]
+        # importance/confidence 钳制（缺省也补默认值，保证后续 _num/落库有值）
+        item["importance"] = _norm_clamp(item.get("importance"), 0.0, 1.0, 0.55)
+        item["confidence"] = _norm_clamp(item.get("confidence"), 0.0, 1.0, 0.65)
+        item["reason"] = str(item.get("reason", "") or "").strip()
+        item["scenario"] = str(item.get("scenario", "") or "").strip()
+        item["entity_id"] = str(item.get("entity_id", "") or "").strip()
+        # 偏好/约定类缺 reason/scenario 时补默认说明（不让空字段进库）
+        if item["memory_type"] in ("偏好风格", "约定任务"):
+            if not item["reason"]:
+                item["reason"] = "用户明确表达/正在进行的约定"
+            if not item["scenario"]:
+                item["scenario"] = "聊到该话题或相关情境时"
+        out.append(item)
+    return out
+
+
 class AlifeMemoryPlugin(BasePlugin):
     def __init__(self, ctx, cfg: dict):
         super().__init__(ctx, cfg)
@@ -154,7 +263,11 @@ class AlifeMemoryPlugin(BasePlugin):
 
         self.reflect_enabled = bool(reflection.get("enabled", True))
         self.reflect_interval = _num(reflection.get("interval_seconds", 1800), 1800, 300, 86400, True)
-        self.reflect_max_items = _num(reflection.get("max_items", 4), 4, 1, 20, True)
+        # 审计轮转：period(天) = 记忆审过后多久再进入池子；batch = 每轮最多审多少条
+        self.reflect_period = _num(reflection.get("period_days", 3), 3, 0.5, 90)
+        self.reflect_batch = _num(reflection.get("batch_size", 20), 20, 1, 100, True)
+        # 语义去重/审计的相似度阈值（FTS5 归一化分超出此值才审/判）
+        self.dedup_similarity_threshold = _num(reflection.get("dedup_similarity_threshold", 0.1), 0.1, 0.0, 1.0)
 
         self.message_retention_days = _num(basic.get("message_retention_days", 7), 7, 1, 365, True)
         self.stale_retention_days = _num(basic.get("stale_retention_days", 30), 30, 1, 730, True)
@@ -171,9 +284,8 @@ class AlifeMemoryPlugin(BasePlugin):
         self.inject_level_max = _num(retrieval.get("inject_level_max", 12), 12, 0, 12, True)
 
         self.compress_prompt = str(compression.get("prompt", "") or "").strip() or self._default_compress_prompt()
-        self.reflect_prompt = str(reflection.get("prompt", "") or "").strip() or self._default_reflect_prompt()
-        # 若用户未自定义压缩/审校提示词，把默认词回填进 cfg，让 WebUI 可展示、可编辑（用户改过后不再覆盖）
-        self._sync_default_prompts(compression, reflection)
+        # 若用户未自定义压缩提示词，把默认词回填进 cfg，让 WebUI 可展示、可编辑（用户改过后不再覆盖）
+        self._sync_default_compress_prompt(compression)
         self.compress_probability = _num(compression.get("compress_probability", 0.8), 0.8, 0.0, 1.0)
         self.compress_timeout = _num(compression.get("compress_timeout", 30), 30, 5, 120, True)
         self.max_compress_retry = _num(compression.get("max_compress_retry", 2), 2, 0, 10, True)
@@ -184,38 +296,32 @@ class AlifeMemoryPlugin(BasePlugin):
         # archive_level_min 默认 = max_level（最高层保护，其余层级可归档）
         # 必须在 max_level 已赋值后才设置
         self.archive_level_min = _num(basic.get("archive_level_min", self.max_level), 1, 1, 12, True)
+        # 用户画像（批次 B）：是否启用画像生成/注入
+        self.profile_enabled = bool(basic.get("profile_enabled", True))
+        self.profile_inject = bool(basic.get("profile_inject", True))
+        self.profile_inject_max = _num(basic.get("profile_inject_max", 3), 3, 0, 6, True)
+        self.profile_generate_model = str(basic.get("profile_generate_model", "") or "").strip()
+        self.profile_gen_trigger = _num(basic.get("profile_gen_trigger", 5), 5, 1, 50, True)  # 某实体累计多少条记忆触发一次画像生成
 
     @staticmethod
     def _default_compress_prompt():
         return ("你是长期记忆整理器。把{range}中提取成可验证、简洁、无重复的记忆。\n"
-                "只输出 JSON，不要 Markdown：{\"summary\":\"一句话概述\",\"content\":\"事实、偏好、决定和关系变化，分行列出\",\"importance\":0.0}\n"
+                "只输出 JSON，不要 Markdown：{\"items\":[{\"summary\":\"一句话概述\",\"content\":\"事实、偏好、决定和关系变化，分行列出\",\"memory_type\":\"关于实体|偏好风格|约定任务|关系网络|溯源查询|日常事件\",\"tags\":[\"标签1\",\"标签2\"],\"importance\":0.0,\"confidence\":0.0,\"reason\":\"为什么记（偏好/约定类必填）\",\"scenario\":\"什么时候该想起（偏好/约定类必填）\",\"entity_id\":\"关联到谁（用户/群/机器人标识，可空）\"}]}\n"
+                "memory_type 只能从 6 类里选：关于实体(这个人/群是谁、身份背景) / 偏好风格(喜欢什么、习惯、禁止项) / 约定任务(正在做的事、项目、约定、截止) / 关系网络(谁是谁的什么人、成员列表、角色设定) / 溯源查询(去哪查资料、哪个系统管什么) / 日常事件(其他值得记住的)。\n"
+                "偏好风格和约定任务两类必须填 reason(为什么记这件事)和 scenario(什么时候该想起它)。\n"
+                "tags 是 2-4 个简短中文标签，方便以后按标签翻找，不要超过 6 个。\n"
                 "不要臆测，不要把闲聊或临时情绪写成长期事实；保留时间、主体和限定条件。\n待整理内容：\n{content}")
 
-    @staticmethod
-    def _default_reflect_prompt():
-        return ("你是记忆审校器。比较旧记忆和新证据，只处理有明确矛盾的事实。\n"
-                "只输出 JSON：{\"action\":\"none|correct|stale\",\"summary\":\"修正后的概述\",\"content\":\"修正后的事实\",\"confidence\":0.0,\"reason\":\"证据依据\"}\n"
-                "若只是措辞不同、证据不足或可能是临时状态，输出 none。不得凭空补全。\n旧记忆：\n{memory}\n新证据：\n{evidence}")
-
-    def _sync_default_prompts(self, compression: dict, reflection: dict):
-        """当用户未自定义提示词时，把最新默认词回填进 cfg（供 WebUI 展示/编辑）。
+    def _sync_default_compress_prompt(self, compression: dict):
+        """当用户未自定义压缩提示词时，把最新默认词回填进 cfg（供 WebUI 展示/编辑）。
         用户一旦改过（cfg 里是非空且非默认的内容），就不再覆盖。"""
         default_comp = self._default_compress_prompt()
-        default_refl = self._default_reflect_prompt()
         comp_val = str(compression.get("prompt", "") or "").strip()
-        refl_val = str(reflection.get("prompt", "") or "").strip()
-        changed = False
-        # 空 或 等于旧默认（即从未真正自定义）→ 用最新默认
-        if not comp_val:
+        old_comp_defaults = [
+            '你是长期记忆整理器。把{range}中提取成可验证、简洁、无重复的记忆。\n只输出 JSON，不要 Markdown：{"summary":"一句话概述","content":"事实、偏好、决定和关系变化，分行列出","importance":0.0}\n不要臆测，不要把闲聊或临时情绪写成长期事实；保留时间、主体和限定条件。\n待整理内容：\n{content}']
+        if not comp_val or any(comp_val == o.strip() for o in old_comp_defaults if o.strip()):
             compression["prompt"] = default_comp
-            changed = True
-        if not refl_val:
-            reflection["prompt"] = default_refl
-            changed = True
-        if changed:
-            # 回写到模块级 cfg，让 WebUI /config 能拿到
-            self.cfg.setdefault("section_compression", {})["prompt"] = compression.get("prompt", default_comp)
-            self.cfg.setdefault("section_reflection", {})["prompt"] = reflection.get("prompt", default_refl)
+            self.cfg.setdefault("section_compression", {})["prompt"] = default_comp
 
     @staticmethod
     def _convert_relative_dates(text: str) -> str:
@@ -302,7 +408,9 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @staticmethod
     def _parse_kiraos_toml(tf: Path):
-        """解析单个 KiraOS TOML 记忆文件，返回 (content, summary, importance, sid, ts) 或 None。"""
+        """解析单个 KiraOS TOML 记忆文件。
+        返回 (content, summary, importance, sid, ts, tags, memory_type) 或 None。
+        同时解析 KiraOS 的 tags 数组（之前丢失），供结构化落库。"""
         try:
             text = tf.read_text(encoding="utf-8", errors="replace")
             import re as _re
@@ -315,7 +423,27 @@ class AlifeMemoryPlugin(BasePlugin):
                 return None
             t_imp = _re.search(r'importance\s*=\s*(\d+)', text)
             t_sid = _re.search(r'session\s*=\s*"([^"]*)"', text)
-            t_ts = _re.search(r'time\s*=\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', text)
+            t_ts = _re.search(r'time\s*=\s*"([^"]*)"', text)
+            # 解析 KiraOS tags 数组（多行 ['tag1','tag2']），之前完全丢失
+            t_tags = _re.findall(r'"([^"]+)"', _re.search(r'tags\s*=\s*\[(.*?)\]', text, _re.S).group(1) if _re.search(r'tags\s*=\s*\[(.*?)\]', text, _re.S) else '')
+            tags = [t.strip() for t in t_tags if t.strip()]
+            # KiraOS type: fact / relationship / preference 等
+            t_type = _re.search(r'type\s*=\s*"([^"]*)"', text)
+            kira_type = t_type.group(1) if t_type else "fact"
+            type_map = {"fact": "日常事件", "relationship": "关系网络", "preference": "偏好风格",
+                        "entity": "关于实体", "task": "约定任务", "source": "溯源查询"}
+            memory_type = type_map.get(kira_type, "日常事件")
+            # 用 tags 辅助推断类型（KiraOS 的 fact 多是 fact，靠 tags 提升分类准确度）
+            if memory_type == "日常事件" and tags:
+                tag_str = " ".join(tags)
+                if any(k in tag_str for k in ("关系", "成员", "role", "relationship", "人际", "称呼")):
+                    memory_type = "关系网络"
+                elif any(k in tag_str for k in ("偏好", "喜欢", "爱好", "习惯", "preference", "禁止", "风格")):
+                    memory_type = "偏好风格"
+                elif any(k in tag_str for k in ("事", "任务", "进行", "约定", "work", "截止", "项目")):
+                    memory_type = "约定任务"
+                elif any(k in tag_str for k in ("身份", "背景", "性格", "职业", "entity", "知识", "技能")):
+                    memory_type = "关于实体"
             importance = float(t_imp.group(1)) / 10.0 if t_imp else 0.5
             source_sid = t_sid.group(1) if t_sid else "kiraos_import"
             from datetime import datetime as _dt
@@ -323,7 +451,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 ts_val = _dt.fromisoformat(t_ts.group(1)).timestamp() if t_ts else time.time()
             except Exception:
                 ts_val = time.time()
-            return (content, content[:100], importance, source_sid, ts_val)
+            return (content, content[:100], importance, source_sid, ts_val, tags, memory_type)
         except Exception:
             return None
 
@@ -359,15 +487,18 @@ class AlifeMemoryPlugin(BasePlugin):
             data_root = Path(get_data_path())
 
             if plugin_id == "kira_plugin_simple_memory":
-                # Simple Memory: data/memory/core.txt，单文件逐行
+                # Simple Memory: data/memory/core.txt，单文件逐行（纯文本，无元数据/标签/时间）
                 core_txt = data_root / "memory" / "core.txt"
                 if core_txt.exists():
                     logger.info("[alife_memory] 发现 Simple Memory 数据文件: %s，正在迁移……", core_txt)
                     raw_text = await asyncio.to_thread(lambda: core_txt.read_text(encoding="utf-8", errors="replace"))
                     lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
                     if lines:
-                        now = time.time()
-                        # 迁移只导入文本 + 元数据，不计算向量（避免卡顿/白忙/依赖向量模型）
+                        # 用文件修改时间近似这批记忆的时间（core.txt 无逐条时间戳）
+                        try:
+                            file_mtime = await asyncio.to_thread(lambda: core_txt.stat().st_mtime)
+                        except Exception:
+                            file_mtime = time.time()
                         rows = []
                         for line in lines:
                             if len(line) > 120:
@@ -375,11 +506,14 @@ class AlifeMemoryPlugin(BasePlugin):
                             content_stripped = line
                             rows.append({
                                 "sid": "system", "level": 3, "summary": content_stripped[:100],
-                                "content": content_stripped, "start_ts": now, "end_ts": now,
+                                "content": content_stripped, "start_ts": file_mtime, "end_ts": file_mtime,
                                 "source_ids": [], "importance": 0.5, "embedding": None,
-                                "user_id": "", "source_fingerprint": hashlib.sha256(("simple_memory_import|" + content_stripped).encode()).hexdigest()[:32],
-                                "source_refs": [{"sid": "simple_memory_import", "user_id": "", "ts": now,
-                                                 "action": "从Simple Memory自动迁移，原始文件保留未清理"}],
+                                "user_id": "", "memory_type": _infer_simple_memory_type(content_stripped),
+                                "tags": _infer_simple_memory_tags(content_stripped),
+                                "entity_id": "",
+                                "source_fingerprint": hashlib.sha256(("simple_memory_import|" + content_stripped).encode()).hexdigest()[:32],
+                                "source_refs": [{"sid": "simple_memory_import", "user_id": "", "ts": file_mtime,
+                                                 "action": "从Simple Memory自动迁移（core.txt 纯文本，无 标签/时间 元数据，时间为文件修改时间）"}],
                             })
                         count = await self.store.add_memories_batch(rows)
                         if count:
@@ -395,17 +529,18 @@ class AlifeMemoryPlugin(BasePlugin):
                         # 1) 并行读取所有文件并解析（替代逐条串行 read_text）
                         from datetime import datetime as _dt
                         parsed = await asyncio.gather(*[asyncio.to_thread(self._parse_kiraos_toml, tf) for tf in toml_files])
-                        valid = [p for p in parsed if p]  # [(content, summary, importance, sid, ts)]
+                        valid = [p for p in parsed if p]  # [(content, summary, importance, sid, ts, tags, memory_type)]
                         if valid:
                             # 迁移只导入文本 + 元数据，不计算向量（避免卡顿/白忙/依赖向量模型）
                             rows = []
                             now = time.time()
-                            for (content, summary, importance, source_sid, ts_val) in valid:
+                            for (content, summary, importance, source_sid, ts_val, ktags, ktype) in valid:
                                 rows.append({
                                     "sid": source_sid, "level": 3, "summary": summary,
                                     "content": content, "start_ts": ts_val, "end_ts": ts_val,
                                     "source_ids": [], "importance": importance,
                                     "embedding": None, "user_id": "",
+                                    "memory_type": ktype, "tags": ktags,
                                     "source_fingerprint": hashlib.sha256(("kiraos_import|" + content).encode()).hexdigest()[:32],
                                     "source_refs": [{"sid": source_sid, "user_id": "", "ts": ts_val,
                                                      "action": "从KiraOS记忆自动迁移，原始文件保留未清理"}],
@@ -467,6 +602,23 @@ class AlifeMemoryPlugin(BasePlugin):
         except Exception as exc:
             logger.warning("[alife_memory] model request failed: %s", exc)
             return None
+
+    async def _llm_text(self, prompt: str, model: str, timeout: float = 20.0) -> str:
+        """纯文本 LLM 调用（不解析 JSON），用于去重/合并判断时拿自然语言答案。"""
+        client = self._client(model)
+        if not client:
+            return ""
+        try:
+            async with getattr(self, "_llm_semaphore", asyncio.Semaphore(3)):
+                response = await asyncio.wait_for(
+                    client.chat(LLMRequest(messages=[OpenAIMessage(role="user", content=prompt)])),
+                    timeout=timeout)
+            return str(getattr(response, "text_response", "") or "").strip()
+        except asyncio.TimeoutError:
+            return ""
+        except Exception as exc:
+            logger.warning("[alife_memory] llm_text failed: %s", exc)
+            return ""
 
     async def _embed(self, text: str) -> list[float] | None:
         if not self.semantic_enabled:
@@ -625,27 +777,42 @@ class AlifeMemoryPlugin(BasePlugin):
                     logger.info("[alife_memory] 压缩超时/失败，重试 %d/%d: %d 条", new_attempts, self.max_compress_retry, len(batch_ids))
                     pending = await self.store.pending_messages(sid, self.compression_batch)
                     continue
-                summary = str((result or {}).get("summary", "")).strip()
-                detail = str((result or {}).get("content", "")).strip()
-                if not summary or not detail:
+                # 结构化解析：支持 {"items":[...]}，每条带 memory_type/tags/reason/scenario/entity_id
+                items = _cos_structured_json(result)
+                if not items:
                     await self.store.update_task(task_id, "failed", "模型未返回有效结构化记忆")
                     batch_ids = [x["id"] for x in batch]
                     await self.store.increment_attempts(batch_ids)
                     pending = await self.store.pending_messages(sid, self.compression_batch)
                     continue
-                importance = _num((result or {}).get("importance", 0.55), 0.55, 0.0, 1.0)
-                vector = await self._embed(summary + "\n" + detail)
                 fingerprint = hashlib.sha256((sid + "|" + "|".join(x["id"] for x in batch)).encode()).hexdigest()
                 refs = [{"sid": sid, "user_id": str(x.get("user_id", "")), "message_id": x["id"], "turn_no": x.get("turn_no", 0), "ts": x["ts"]} for x in batch]
-                archive_id = await self.store.add_memory(
-                    sid, 1, summary, detail, batch[0]["ts"], batch[-1]["ts"],
-                    [x["id"] for x in batch], importance, vector,
-                    user_id=str(batch[0].get("user_id", "")) if len({x.get("user_id", "") for x in batch}) == 1 else "",
-                    source_fingerprint=fingerprint, source_refs=refs,
-                    embed_model=self.embedding_model)
-                await self.store.mark_compressed([x["id"] for x in batch], archive_id)
-                await self.store.update_task(task_id, "completed", archive_id)
-                logger.debug("[alife_memory] 压缩成功: %d 条 → %s", len(batch), archive_id)
+                archived: list[str] = []
+                for item in items:
+                    if not item.get("summary") or not item.get("content"):
+                        continue
+                    vector = await self._embed(item["summary"] + "\n" + item["content"])
+                    one_refs = refs + [{"sid": item["entity_id"] or "", "user_id": str(item.get("entity_id", "") or ""), "note": "关联实体", "ts": batch[-1]["ts"]}] if item.get("entity_id") else refs
+                    aid = await self.store.add_memory(
+                        sid, 1, item["summary"], item["content"], batch[0]["ts"], batch[-1]["ts"],
+                        [x["id"] for x in batch], _num(item.get("importance", 0.55), 0.55, 0.0, 1.0), vector,
+                        user_id=str(batch[0].get("user_id", "")) if len({x.get("user_id", "") for x in batch}) == 1 else "",
+                        source_fingerprint=(fingerprint + "|" + item["summary"][:40]), source_refs=one_refs,
+                        embed_model=self.embedding_model,
+                        memory_type=item.get("memory_type", "日常事件"),
+                        tags=item.get("tags") or [],
+                        reason=item.get("reason", ""), scenario=item.get("scenario", ""),
+                        entity_id=item.get("entity_id", ""))
+                    archived.append(aid)
+                if not archived:
+                    await self.store.update_task(task_id, "failed", "结构化输出无有效记忆")
+                    batch_ids = [x["id"] for x in batch]
+                    await self.store.increment_attempts(batch_ids)
+                    pending = await self.store.pending_messages(sid, self.compression_batch)
+                    continue
+                await self.store.mark_compressed([x["id"] for x in batch], archived[0])
+                await self.store.update_task(task_id, "completed", archived[0])
+                logger.debug("[alife_memory] 压缩成功: %d 条 → %s", len(batch), archived[0])
             except Exception as exc:
                 await self.store.update_task(task_id, "failed", str(exc)[:500])
                 logger.exception("[alife_memory] compression failed")
@@ -666,10 +833,11 @@ class AlifeMemoryPlugin(BasePlugin):
             result = await self._llm_json(self.compress_prompt.replace("{content}", content), self.compress_model or "fast")
             if not result:
                 continue
-            summary = str(result.get("summary", "")).strip()
-            detail = str(result.get("content", "")).strip()
-            if not summary or not detail:
+            items = _cos_structured_json(result)
+            if not items or not items[0].get("summary"):
                 continue
+            merge_item = items[0]
+            summary = merge_item["summary"]; detail = merge_item["content"]
             vector = await self._embed(summary + "\n" + detail)
             users = sorted({str(x.get("user_id", "")) for x in group if x.get("user_id")})
             refs = []
@@ -686,30 +854,84 @@ class AlifeMemoryPlugin(BasePlugin):
                     refs.append({"sid": item.get("sid", sid), "user_id": item.get("user_id", ""), "start_ts": item["start_ts"], "end_ts": item["end_ts"]})
             new_id = await self.store.add_memory(
                 sid, level + 1, summary, detail, group[0]["start_ts"], group[-1]["end_ts"],
-                [x["id"] for x in group], _num(result.get("importance", 0.65), 0.65, 0.0, 1.0), vector,
+                [x["id"] for x in group], _num(merge_item.get("importance", 0.65), 0.65, 0.0, 1.0), vector,
                 user_id=users[0] if len(users) == 1 else "", source_refs=refs,
-                embed_model=self.embedding_model)
+                embed_model=self.embedding_model,
+                memory_type=merge_item.get("memory_type", "日常事件"),
+                tags=merge_item.get("tags") or [],
+                reason=merge_item.get("reason", ""), scenario=merge_item.get("scenario", ""),
+                entity_id=merge_item.get("entity_id", ""))
             for old in group:
                 await self.store.mark_stale(old["id"], f"merged into {new_id}")
 
     async def _reflection_loop(self):
+        """后台审计：全局池轮转，每轮审 reflect_batch 条"到期应审"的记忆。
+        到期 = 从未审过 或 距上次审已超 reflect_period(天)。
+        优先审 reflect_count 少的；审完 mark_reflected 记账，周期内跳过。"""
         try:
             while not self._closed:
                 await asyncio.sleep(self.reflect_interval)
-                sessions = set()
-                for sid_item in await self.store.list_memories(None, 1000):
-                    sessions.add(sid_item["sid"])
-                for sid in sessions:
-                    try:
-                        await self._reflect_session(sid)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        logger.exception("[alife_memory] reflection failed for %s", sid)
+                if self._closed:
+                    break
+                if not self.reflect_enabled:
+                    continue
+                try:
+                    candidates = await self.store.pick_reflection_candidates(
+                        self.reflect_batch, self.reflect_period)
+                    if not candidates:
+                        logger.debug("[alife_memory] 审计: 无到期记忆，跳过")
+                        continue
+                    reflected = 0
+                    for mem in candidates:
+                        try:
+                            await self._reflect_memory(mem)
+                            reflected += 1
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.warning("[alife_memory] 审计单条失败 %s: %s", mem.get("id"), exc)
+                    logger.info("[alife_memory] 审计轮转: %d 条候选 → 审 %d 条", len(candidates), reflected)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("[alife_memory] 审计轮转失败: %s", exc)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("[alife_memory] reflection loop failed")
+
+    async def _reflect_memory(self, memory: dict):
+        """对单条记忆做审计：情感内聚去重（不用最近对话作证据）。
+        用 FTS5 找同实体语义近邻 → LLM 判断 duplicate/update/new → 该合并的合并。
+        审完记账 mark_reflected。"""
+        mid = memory.get("id")
+        if not mid:
+            return
+        # 语义去重：找同实体的相似记忆（排除自身）
+        similar = await self.store.find_similar_memories(
+            memory.get("summary", ""), memory.get("content", ""),
+            entity_id=memory.get("entity_id") or memory.get("user_id", ""),
+            limit=3, exclude_id=mid)
+        # 只对最相似的候选调 LLM 判断（省 token），相似度过低的跳过
+        min_sim = getattr(self, "dedup_similarity_threshold", 0.1)
+        candidates = sorted(similar, key=lambda s: s.get("similarity", 0), reverse=True)
+        # 取 similarity 达标的前 2 个候选去判断
+        candidates = [c for c in candidates if c.get("similarity", 0) >= min_sim][:2]
+        if candidates:
+            for cand in candidates:
+                decision = await self._check_conflict_llm(
+                    memory.get("summary", "") + "\n" + memory.get("content", ""),
+                    cand.get("summary", "") + "\n" + cand.get("content", ""))
+                if decision == "duplicate":
+                    await self._merge_duplicate(memory, cand)
+                    break
+                elif decision == "update":
+                    merged_summary, merged_content = await self._merge_facts_llm(memory, cand)
+                    if merged_summary and merged_content:
+                        await self._apply_merge(memory, cand, merged_summary, merged_content)
+                    break
+        # 记账：无论是否合并，都记录本次审计
+        await self.store.mark_reflected(mid, int(memory.get("reflect_count", 0)) + 1, time.time())
 
     async def _cleanup_loop(self):
         try:
@@ -733,27 +955,195 @@ class AlifeMemoryPlugin(BasePlugin):
         except asyncio.CancelledError:
             pass
 
-    async def _reflect_session(self, sid: str):
-        memories = [x for x in await self.store.list_memories(sid, self.reflect_max_items) if x.get("status") == "active"]
-        recent = await self.store.recent(sid, 10)
-        evidence = "\n".join(f"[{x['role']}] {x['content']}" for x in recent)
-        for memory in memories:
-            prompt = self.reflect_prompt.replace("{memory}", memory["summary"] + "\n" + memory["content"]).replace("{evidence}", evidence)
-            result = await self._llm_json(prompt, self.reflect_model)
-            if not result or str(result.get("action", "none")) == "none":
+    # ---- 审计辅助（语义去重/合并）----
+    async def _check_conflict_llm(self, existing_text: str, new_text: str) -> str:
+        """LLM 判断新旧记忆关系：duplicate / update / new（对齐 KiraOS _check_conflict）。
+        用纯文本调用（非 JSON），让模型直接输出选项文本。"""
+        prompt = (
+            f"比较以下两条信息，判断它们的关系：\n\n已有信息: {existing_text[:600]}\n新信息: {new_text[:600]}\n\n"
+            "只输出以下三个选项之一（不要其他内容、不要解释）：\n"
+            "- duplicate：新信息与已有信息基本相同\n"
+            "- update：新信息是对已有信息的更新或补充，需要合并\n"
+            "- new：新信息与已有信息无关，是全新信息")
+        raw = await self._llm_text(prompt, self.reflect_model or "")
+        raw = (raw or "").strip().strip('"').lower()
+        if "duplicate" in raw:
+            return "duplicate"
+        if "update" in raw:
+            return "update"
+        return "new"
+
+    async def _merge_facts_llm(self, memory_a: dict, memory_b: dict) -> tuple[str, str]:
+        """LLM 合并两条记忆为一条，返回 (summary, content)。用纯文本调用并解析 JSON。"""
+        prompt = (
+            f"将以下两条记忆合并为一条，保留所有有用信息：\n\n记忆A: {memory_a.get('summary','')} — {memory_a.get('content','')}\n"
+            f"记忆B: {memory_b.get('summary','')} — {memory_b.get('content','')}\n\n"
+            "只输出 JSON（不要 Markdown）：{\"summary\":\"合并后的一句话概述\",\"content\":\"合并后的完整内容\"}")
+        raw = await self._llm_text(prompt, self.reflect_model or "")
+        result = _json_object(raw)
+        if isinstance(result, dict) and result.get("summary") and result.get("content"):
+            return str(result["summary"]).strip(), str(result["content"]).strip()
+        # 兜底：并置
+        return (memory_a.get("summary", "") + "；" + memory_b.get("summary", ""),
+                memory_a.get("content", "") + "\n" + memory_b.get("content", ""))
+
+    async def _apply_merge(self, target: dict, other: dict, summary: str, content: str) -> None:
+        """把 two 合并进 target：target 更新为新内容，other 标记 superseded（保留审计链），
+        取更高 confidence / importance。"""
+        tid = target.get("id")
+        oid = other.get("id")
+        if not tid or not oid or tid == oid:
+            return
+        confidence = max(float(target.get("confidence", 0.65)), float(other.get("confidence", 0.65)))
+        importance = max(float(target.get("importance", 0.5)), float(other.get("importance", 0.5)))
+        # 合并 tags / memory_type（取非空的）
+        tags = list(dict.fromkeys((target.get("tags") or []) + (other.get("tags") or [])))
+        mtype = target.get("memory_type") or other.get("memory_type") or "日常事件"
+        reason = target.get("reason") or other.get("reason")
+        scenario = target.get("scenario") or other.get("scenario")
+        entity_id = target.get("entity_id") or other.get("entity_id")
+        vector = await self._embed(summary + "\n" + content)
+        # correct_memory 会 superseded 旧的并写新版本
+        await self.store.correct_memory(
+            tid, summary, content, f"审计合并: 与 {oid} 整合", confidence, vector,
+            memory_type=mtype, tags=tags, reason=reason, scenario=scenario, entity_id=entity_id)
+        # other 也标记 superseded（被 target 吸收，保留审计链）
+        await self.store.mark_superseded(oid, f"审计合并进 {tid}")
+        logger.info("[alife_memory] 审计合并: %s + %s → %s", tid, oid, tid)
+
+    async def _merge_duplicate(self, target: dict, other: dict) -> None:
+        """两条完全相同 → 合并来源引用，保留内容更完整的一条，另一条 superseded。"""
+        tid = target.get("id")
+        oid = other.get("id")
+        if not tid or not oid or tid == oid:
+            return
+        # 保留 confidence/importance 高的那条作为 target
+        if float(other.get("confidence", 0)) > float(target.get("confidence", 0)) or \
+           float(other.get("importance", 0)) > float(target.get("importance", 0)):
+            tid, oid = oid, tid
+        await self.store.mark_superseded(oid, f"重复，由 {tid} 吸收")
+        logger.info("[alife_memory] 审计去重: %s → %s (重复)", oid, tid)
+
+    # ---- 画像（批次 B）----
+    async def _ensure_profile(self, entity_id: str, entity_type: str = "user") -> None:
+        """确保某实体有画像。若不存在，用其记忆聚合并由 LLM 生成画像。"""
+        if not getattr(self, "profile_enabled", True) or not entity_id:
+            return
+        profile = await self.store.get_profile(entity_id)
+        if profile:
+            return
+        try:
+            await self._generate_profile(entity_id, entity_type)
+        except Exception as exc:
+            logger.warning("[alife_memory] 生成画像失败 %s: %s", entity_id, exc)
+
+    async def _generate_profile(self, entity_id: str, entity_type: str = "user") -> dict | None:
+        """从该实体的记忆聚合并由 LLM 生成结构化画像，落库。"""
+        memories = await self.store.list_memories_by_entity(entity_id, 200)
+        if not memories:
+            return None
+        cand = [m for m in memories if m.get("status") == "active"][:60]
+        if not cand:
+            return None
+        snippet = "\n".join(
+            f"- [{m.get('memory_type','日常事件')}] {m['summary']} | 来源:{m.get('sid','')} 时间:{time.strftime('%Y-%m-%d', time.localtime(m['end_ts']))}"
+            for m in cand)
+        prompt = (
+            f"你是用户画像提炼师。根据下面的记忆片段，提炼出实体「{entity_id}」（类型:{entity_type}）的结构化画像。\n"
+            "只输出 JSON，不要 Markdown：{\"name\":\"\",\"nickname\":\"\",\"description\":\"一句话画像概述\","
+            "\"traits\":[\"特质，如：关系_莎娜: 莎娜的主人\"],\"preferences\":{\"偏好键\":\"值\"},"
+            "\"relationships\":[{\"target_id\":\"对象\",\"relation\":\"关系\",\"confidence\":0.9}],"
+            "\"facts\":[\"关键事实\"],\"aliases\":[\"别名\"]}\n"
+            "traits 是稳定特质/角色；preferences 是喜好/习惯/禁止项；relationships 是与其他实体（人或AI）的关系；facts 是关键事实。\n"
+            "只基于给定记忆提炼，不要臆测。每条画像信息应能在记忆里找到依据。\n记忆片段：\n{snippet}"
+        ).replace("{snippet}", snippet)
+        result = await self._llm_json(prompt, self.profile_generate_model or "")
+        if not isinstance(result, dict):
+            return None
+        profile = {
+            "entity_id": entity_id, "entity_type": entity_type,
+            "name": str(result.get("name", "") or ""),
+            "nickname": str(result.get("nickname", "") or ""),
+            "description": str(result.get("description", "") or ""),
+            "traits": result.get("traits") if isinstance(result.get("traits"), list) else [],
+            "preferences": result.get("preferences") if isinstance(result.get("preferences"), dict) else {},
+            "relationships": result.get("relationships") if isinstance(result.get("relationships"), list) else [],
+            "facts": result.get("facts") if isinstance(result.get("facts"), list) else [],
+            "aliases": result.get("aliases") if isinstance(result.get("aliases"), list) else [],
+            "platform": str(result.get("platform", "") or ""),
+            "generated_from": ",".join(m["id"] for m in cand[:40]),
+            "memory_type": entity_type,
+        }
+        await self.store.upsert_profile(entity_id, entity_type, **profile)
+        for rel in profile.get("relationships", []):
+            if isinstance(rel, dict) and rel.get("target_id") and rel.get("relation"):
+                await self.store.upsert_relationship(entity_id, str(rel["target_id"]), str(rel["relation"]),
+                                                     source_mid=profile.get("generated_from", ""),
+                                                     confidence=float(rel.get("confidence", 0.7)))
+        logger.info("[alife_memory] 已生成画像 %s: %d traits / %d relations", entity_id,
+                    len(profile.get("traits", [])), len(profile.get("relationships", [])))
+        return profile
+
+    async def _format_profile_block(self, entity_id: str, scoped: str = "画像") -> str | None:
+        """格式化某实体画像为注入块文本。"""
+        p = await self.store.get_profile(entity_id)
+        if not p or not (p.get("description") or p.get("traits") or p.get("preferences") or p.get("facts")):
+            return None
+        lines = [f"[{scoped}:{entity_id}] {p.get('description', '')}".strip()]
+        if p.get("traits"):
+            lines.append("  特质：" + "；".join(str(t) for t in p["traits"][:8]))
+        if p.get("preferences"):
+            prefs = p["preferences"]
+            if isinstance(prefs, dict):
+                lines.append("  偏好：" + "；".join(f"{k}→{v}" for k, v in list(prefs.items())[:10]))
+        if p.get("facts"):
+            lines.append("  事实：" + "；".join(str(f)[:60] for f in p["facts"][:8]))
+        return "\n".join(lines)
+
+    async def _collect_profile_blocks(self, query: str, user_id: str, req, extra_entities: list[str] | None = None) -> list[str]:
+        """收集需注入的画像块：当前用户 + query 中提及的关联实体 + 首次见的新用户（上限 profile_inject_max）。"""
+        profile_blocks: list[str] = []
+        cur_entity = user_id or _event_user_id(getattr(req, "messages", [])[-1] if getattr(req, "messages", []) else None)
+        if cur_entity:
+            # 首次见 → 记录并确保画像
+            self._seen_profiles = getattr(self, "_seen_profiles", {})
+            if cur_entity not in self._seen_profiles:
+                await self._ensure_profile(cur_entity, "user")
+                self._seen_profiles[cur_entity] = True
+            pb = await self._format_profile_block(cur_entity, "画像")
+            if pb:
+                profile_blocks.append(pb)
+        # 首次见的新用户画像（被动召回时优先带上"这个人是谁"）
+        for eid in (extra_entities or [])[:getattr(self, "profile_inject_max", 3)]:
+            if not eid or eid == cur_entity:
                 continue
-            confidence = _num(result.get("confidence", 0), 0, 0, 1)
-            if confidence < 0.86:
-                continue
-            note = str(result.get("reason", "后台审校发现新证据"))[:500]
-            if result.get("action") == "stale":
-                await self.store.mark_stale(memory["id"], note)
-            elif result.get("action") == "correct":
-                summary = str(result.get("summary", "")).strip()
-                content = str(result.get("content", "")).strip()
-                if summary and content:
-                    vector = await self._embed(summary + "\n" + content)
-                    await self.store.correct_memory(memory["id"], summary, content, note, confidence, vector)
+            try:
+                pb = await self._format_profile_block(eid, "画像:关联")
+            except Exception:
+                pb = None
+            if pb:
+                profile_blocks.append(pb)
+                if len(profile_blocks) >= getattr(self, "profile_inject_max", 3) + 1:
+                    break
+        # 扫码提取提及的关联实体（从 query 中出现的已知实体 id/名字/昵称）
+        pmax = getattr(self, "profile_inject_max", 3)
+        if pmax and pmax > 0 and len(profile_blocks) < pmax + 1:
+            known = await self.store.list_profiles(pmax + 8)
+            seen_entities = set()
+            for kp in known:
+                eid = kp.get("entity_id", "")
+                if not eid or eid == cur_entity or eid in seen_entities:
+                    continue
+                match_keys = [eid] + [str(kp.get("name", "")) for _x in (1,)] + [str(kp.get("nickname", ""))]
+                match_keys = [k for k in match_keys if k]
+                if any(k and k != cur_entity and k in str(query) for k in match_keys):
+                    seen_entities.add(eid)
+                    pb = await self._format_profile_block(eid, "画像:关联")
+                    if pb:
+                        profile_blocks.append(pb)
+                    if len(profile_blocks) >= pmax + 1:
+                        break
+        return profile_blocks
 
     async def _inject(self, sid: str, req: LLMRequest, user_id: str = "", recall_user_ids: list[str] | None = None,
                      do_passive_update: bool = False):
@@ -836,6 +1226,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 logger.debug("[alife_memory] 关键词召回池: %d 词 → +%d 条", len(recall_terms), len(seen_ids))
 
         # 3) 首次见到用户召回（per-session：仅当该会话还没召回过这个用户的记忆）
+        new_user_ids: list[str] = []
         if self.passive_recall and recall_user_ids:
             new_uids = [u for u in recall_user_ids if u and u != user_id]
             if new_uids:
@@ -845,12 +1236,15 @@ class AlifeMemoryPlugin(BasePlugin):
                         r["score"] = 0.3
                         all_results.append(r)
                         seen_ids.add(r["id"])
+                new_user_ids = new_uids
                 logger.debug("[alife_memory] 被动召回: %d 个新用户 → 补 %d 条跨会话记忆", len(new_uids), len(seen_ids))
 
-        if not all_results:
-            return
+        # 不再因无记忆命中就提前 return：让画像注入也能执行（画像可能独立存在）。
+        # 末尾有 "if not lines and not profile_blocks: return" 兜底。
 
         # 排序后重排序（如有配置）
+        if not all_results:
+            all_results = []
         all_results.sort(key=lambda x: (x.get("score", 0.0), x.get("importance", 0.0)), reverse=True)
         reranked = await self._rerank(str(query), all_results[:self.retrieval_top_k * 3])
         if reranked is not all_results[:self.retrieval_top_k * 3]:
@@ -880,13 +1274,26 @@ class AlifeMemoryPlugin(BasePlugin):
             item_budget -= 1
             token_budget -= cost
             char_budget -= char_cost
-        if not lines:
+        # 画像注入（批次 B）：当前用户画像 + 提及的关联实体（上限 profile_inject_max）
+        # 独立于记忆注入——即使本轮无记忆命中，只要有当前用户/关联实体画像，也注入
+        profile_blocks: list[str] = []
+        if getattr(self, "profile_inject", True) and getattr(self, "profile_enabled", True):
+            profile_blocks = await self._collect_profile_blocks(query, user_id, req, extra_entities=new_user_ids)
+
+        if not lines and not profile_blocks:
             return
-        block = ("你曾经的一些记忆：\n" + "\n".join(lines) +
-                 '\n（完整的记忆细节可通过 search_long_term_memory 工具检索）')
+
+        block_parts = []
+        if lines:
+            block_parts.append("你曾经的一些记忆：\n" + "\n".join(lines) +
+                               '\n（完整的记忆细节可通过 search_long_term_memory 工具检索）')
+        if profile_blocks:
+            block_parts.append("\n\n".join(profile_blocks) +
+                               "\n（以上是相关人物/实体的画像，帮助你记住这些人的身份和关系）")
+        block = "\n\n".join(block_parts)
         system_msg = OpenAIMessage(role="system", content=block)
         req.messages.insert(0, system_msg)
-        logger.debug("[alife_memory] 注入完成: %d 条, 约 %d tokens", len(lines), self.max_injected_tokens - token_budget)
+        logger.debug("[alife_memory] 注入完成: %d 条记忆 + %d 画像块, 约 %d tokens", len(lines), len(profile_blocks), self.max_injected_tokens - token_budget)
 
 
     async def _inject_context_marker(self, req: LLMRequest, sid: str):
@@ -1006,18 +1413,22 @@ class AlifeMemoryPlugin(BasePlugin):
             "when_it_matters": {"type": "string", "description": "（偏好和项目类必填）什么时候该想起这条？什么场景下适用？", "default": ""}},
             "required": ["content"]})
     async def remember_fact(self, event: KiraMessageBatchEvent, content: str, summary: str = "",
-                            memory_type: str = "日常的", tags: str = "",
+                            memory_type: str = "日常事件", tags: str = "",
                             importance: float = 0.5, reason: str = "", when_it_matters: str = "") -> str:
         sid = getattr(event, "sid", "")
         if not sid or not content.strip():
             return "还不知道是在哪个会话说的，先聊起来再记吧"
-        # 校验类型
-        valid_types = {"关于我的", "我喜欢的", "正在发生的", "去哪查", "日常的"}
+        # 校验类型（新 6 类 + 兼容旧 5 类）
+        valid_types = {"关于实体", "偏好风格", "约定任务", "关系网络", "溯源查询", "日常事件"}
+        legacy_types = {"关于我的": "关于实体", "我喜欢的": "偏好风格", "正在发生的": "约定任务",
+                        "去哪查": "溯源查询", "日常的": "日常事件"}
         memory_type = memory_type.strip()
+        if memory_type in legacy_types:
+            memory_type = legacy_types[memory_type]
         if memory_type not in valid_types:
-            memory_type = "日常的"
-        # 偏好和项目类强制要求原因和适用场景
-        if memory_type in ("我喜欢的", "正在发生的"):
+            memory_type = "日常事件"
+        # 偏好和约定类强制要求原因和适用场景
+        if memory_type in ("偏好风格", "约定任务"):
             if not reason.strip() or not when_it_matters.strip():
                 return f"关于「{memory_type}」类的事情，最好也告诉我为什么是这样、什么时候该想起它，这样以后用起来才不迷糊。"
         summary = summary.strip() or content.strip().splitlines()[0][:100]
@@ -1029,31 +1440,21 @@ class AlifeMemoryPlugin(BasePlugin):
         processed_reason = self._convert_relative_dates(reason) if reason else ""
         processed_when = self._convert_relative_dates(when_it_matters) if when_it_matters else ""
 
-        # 组装摘要
-        type_tag = f"[{memory_type}]"
-        extra = ""
-        if reason:
-            extra += f" [原因:{processed_reason[:200]}]"
-        if when_it_matters:
-            extra += f" [何时想起:{processed_when[:200]}]"
-        content_with_meta = f"{type_tag} {processed_content.strip()}{extra}"
-        summary_with_meta = f"{type_tag} {summary}"
+        # 标签解析（逗号分隔字符串 → 数组）
+        tag_list = [t.strip() for t in tags.replace("，", ",").split(",") if t.strip()] if tags else []
 
-        # 标签追加到内容
-        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-        if tag_list:
-            tag_text = f"[标签:{','.join(tag_list)}] "
-            content_with_meta = tag_text + content_with_meta
-            summary_with_meta = tag_text + summary_with_meta
-
-        vector = await self._embed(summary_with_meta + "\n" + content_with_meta)
+        # 结构化落库：不塞字符串前缀，直接存字段
+        vector = await self._embed(summary + "\n" + processed_content)
         mid = await self.store.add_memory(
-            sid, self.max_level, summary_with_meta, content_with_meta,
+            sid, self.max_level, summary, processed_content,
             now, now, [], importance, vector, user_id=user_id,
+            memory_type=memory_type, tags=tag_list,
+            reason=processed_reason, scenario=processed_when,
+            entity_id=user_id,
             source_refs=[{"sid": sid, "user_id": user_id, "ts": now,
                           "action": "主动记录", "type": memory_type}],
             embed_model=self.embedding_model)
-        return f"已经记下了：{summary_with_meta[:80]}……（ID: {mid}，来源会话和保存时间已自动记录）"
+        return f"已经记下了：{summary[:80]}……（ID: {mid}，来源会话和保存时间已自动记录）"
 
     @register.tool(
         name="search_long_term_memory",
@@ -1137,12 +1538,11 @@ class AlifeMemoryPlugin(BasePlugin):
                 if s and s not in seen_sids:
                     seen_sids.add(s)
                     source_info += f"\n  来源会话: {s} | 用户: {ref.get('user_id', '') or 'unknown'} | 时间: {time.strftime('%Y-%m-%d %H:%M', time.localtime(ref.get('ts', 0)))}"
-        tags = ""
-        if memory["summary"].startswith("[标签:"):
-            tags = memory["summary"].split("]")[0].strip("[]")
+        tags = memory.get("tags") or []
+        mt = memory.get("memory_type") or "日常事件"
         parts = [
             f"记忆 ID: {memory['id']}",
-            f"层级: L{memory['level']}",
+            f"层级: L{memory['level']} | 类型: {mt}",
             f"状态: {memory.get('status', 'active')}",
             f"置信度: {memory.get('confidence', 0.65)*100:.0f}%",
             f"时间范围: {t_start} → {t_end}",
@@ -1150,7 +1550,13 @@ class AlifeMemoryPlugin(BasePlugin):
             f"详细内容: {memory['content']}",
         ]
         if tags:
-            parts.insert(0, f"标签: {tags}")
+            parts.insert(0, f"标签: {'、'.join(tags)}")
+        if memory.get("reason"):
+            parts.append(f"为什么记: {memory['reason']}")
+        if memory.get("scenario"):
+            parts.append(f"何时想起: {memory['scenario']}")
+        if memory.get("entity_id"):
+            parts.append(f"关联实体: {memory['entity_id']}")
         if source_info:
             parts.append(f"来源引用:{source_info}")
         if memory.get("correction_note"):
@@ -1173,7 +1579,32 @@ class AlifeMemoryPlugin(BasePlugin):
         for u in users:
             ts = time.strftime('%Y-%m-%d', time.localtime(u["last_ts"])) if u["last_ts"] else "未知"
             max_lv = u.get("max_level") or 1
-            out.append(f"\n- {u['user_id']} | {u['cnt']} 条记忆 | 最高层 L{max_lv} | 最近 {ts}")
+            # 并入画像（简洁）：名字（昵称）[QQ号] · 描述 · 关键特质/偏好（各截断，避免 token 爆炸）
+            profile = None
+            try:
+                profile = await self.store.get_profile(u['user_id'])
+            except Exception:
+                profile = None
+            head = f"\n- {u['user_id']} | {u['cnt']} 条记忆 | 最高层 L{max_lv} | 最近 {ts}"
+            if profile:
+                name = str(profile.get("name") or "")
+                nick = str(profile.get("nickname") or "")
+                desc = str(profile.get("description") or "")
+                label = (name + (f"（{nick}）" if nick and nick != name else "") + f"[{u['user_id']}]") if name else u['user_id']
+                # 画像概述一行
+                extra = ""
+                if desc:
+                    extra += desc[:50]
+                # 特质（前3） + 偏好（前3条），简洁
+                traits = [str(t) for t in (profile.get("traits") or []) if str(t)][:5]
+                prefs = profile.get("preferences") or {}
+                pref_items = [f"{k}→{v}" for k, v in list(prefs.items())[:3]] if isinstance(prefs, dict) else []
+                if traits:
+                    extra += (" · " + "、".join(traits)) if extra else "特质：" + "、".join(traits)
+                if pref_items:
+                    extra += (" · " + "；".join(pref_items)) if extra else "偏好：" + "；".join(pref_items)
+                head = f"\n- {label} | {u['cnt']} 条记忆" + (f" | {extra[:120]}" if extra else "")
+            out.append(head)
             # 最高权重×层级的那条
             if u.get("top_summary"):
                 out.append(f"  ★ 高权重: L{u.get('top_level',1)} 重要{u.get('top_importance',0.0):.2f} → {u['top_summary'][:90]}")
@@ -1188,6 +1619,32 @@ class AlifeMemoryPlugin(BasePlugin):
             out.append(f"\n… 还有 {total - len(users)} 个用户未显示（可增大 limit 查看）")
         return "\n".join(out)
 
+    async def _format_full_profile(self, entity_id: str) -> str | None:
+        """完整画像格式化（查单用户用）：描述/特质/偏好/关系/事实/别名，全量给 bot 深入了解。"""
+        p = await self.store.get_profile(entity_id)
+        if not p:
+            return None
+        name = str(p.get("name") or "") or entity_id
+        nick = str(p.get("nickname") or "")
+        parts = [f"{name}" + (f"（{nick}）" if nick and nick != name else "")]
+        if p.get("description"):
+            parts.append(f"概述：{p['description']}")
+        if p.get("traits"):
+            parts.append("特质：" + "；".join(str(t) for t in p["traits"]))
+        if p.get("preferences") and isinstance(p["preferences"], dict):
+            parts.append("偏好：" + "；".join(f"{k}→{v}" for k, v in p["preferences"].items()))
+        if p.get("relationships"):
+            rels = [str(r.get("target_id", "")) + "→" + str(r.get("relation", "")) for r in p["relationships"] if isinstance(r, dict)]
+            if rels:
+                parts.append("关系：" + "；".join(rels))
+        if p.get("facts"):
+            parts.append("事实：" + "；".join(str(f) for f in p["facts"]))
+        if p.get("aliases"):
+            aliases = [str(a) for a in p["aliases"] if str(a)]
+            if aliases:
+                parts.append("别名：" + "、".join(aliases[:6]))
+        return "\n".join(parts)
+
     @register.tool(
         name="list_user_memories",
         description="精确列出某个用户（指定 user_id）的全部记忆，跨会话。按重要性×层级优先，兼顾最近。当你要回忆某个具体用户的相关事情时使用，比笼统检索更准。",
@@ -1195,17 +1652,37 @@ class AlifeMemoryPlugin(BasePlugin):
     async def list_user_memories(self, event: KiraMessageBatchEvent, user_id: str, limit: int | None = None) -> str:
         total = await self.store.count_memories_by_user(user_id)
         if total == 0:
+            # 无记忆也可能有画像 → 给完整画像（即使没记忆也告诉 bot 这人是谁）
+            profile_text = await self._format_full_profile(user_id)
+            if profile_text:
+                return f"用户 {user_id} 目前没有记忆，但他的画像：\n{profile_text}"
             return f"没有找到用户 {user_id} 的记忆。"
         shown = _num(limit, self.memory_list_limit, 1, 200, True) if limit is not None else self.memory_list_limit
         memories = await self.store.list_memories_by_user(user_id, shown)
-        out = [f"用户 {user_id} 共有 {total} 条记忆（显示前 {len(memories)} 条，按重要性×层级排序）："]
+        out = []
+        # 完整画像（查单用户 → 给 bot 深入了解的机会）
+        profile_text = await self._format_full_profile(user_id)
+        if profile_text:
+            out.append(f"这是{user_id}的画像：\n{profile_text}")
+        out.append(f"\n他{user_id if total==0 else ''}共有 {total} 条记忆（显示前 {len(memories)} 条）：")
         for m in memories:
             t = time.strftime('%Y-%m-%d', time.localtime(m["end_ts"]))
             conf = m.get("confidence", 0.65)
-            out.append(f"\n- L{m['level']} | 重要{m.get('importance', 0.5):.2f} | 置信{conf*100:.0f}% | {t} | {m['summary']}")
+            mtype = m.get("memory_type") or "日常事件"
+            out.append(f"\n- L{m['level']} [{mtype}] | 重要{m.get('importance', 0.5):.2f} | 置信{conf*100:.0f}% | {t} | {m['summary']}")
         if total > len(memories):
             out.append(f"\n… 还有 {total - len(memories)} 条未显示（可增大 limit 查看）")
         return "\n".join(out)
+
+    @register.tool(
+        name="get_user_profile",
+        description="查某个用户/实体的完整画像（性格、偏好、关系、关键事实、别名），了解这个人是谁。当你想深入了解某人或回忆他的资料时使用，比翻记忆更集中。",
+        params={"type": "object", "properties": {"user_id": {"type": "string", "description": "要查询的用户/实体标识，可通过 list_users 获取"}}, "required": ["user_id"]})
+    async def get_user_profile(self, event: KiraMessageBatchEvent, user_id: str) -> str:
+        profile_text = await self._format_full_profile(user_id)
+        if not profile_text:
+            return f"还没有关于 {user_id} 的画像（可能记忆还不够，仍在积累中）。"
+        return f"这是{user_id}的画像：\n{profile_text}"
 
     @register.tool(
         name="list_session_memories",
@@ -1234,13 +1711,17 @@ class AlifeMemoryPlugin(BasePlugin):
     @register.api(method="GET", path="/status", auth=True, summary="Memory status")
     async def api_status(self):
         result = await self.store.stats()
+        # 画像/关系统计（批次 B）
+        profiles = await self.store.list_profiles(10000)
+        rels = await asyncio.to_thread(self.store._list_relationships, None, None)
         result.update({"enabled": self.enabled, "capture_enabled": self.capture_enabled, "auto_inject": self.auto_inject,
                        "passive_recall": self.passive_recall, "workers": len(self._workers),
                        "reflection": self.reflect_enabled, "trigger_mode": self.trigger_mode,
                        "round_threshold": self.round_threshold, "token_threshold": self.token_threshold,
                        "message_threshold": self.message_threshold,
                        "max_level": self.max_level, "auto_archive_days": self.auto_archive_days,
-                       "archive_level_min": self.archive_level_min})
+                       "archive_level_min": self.archive_level_min,
+                       "profiles": len(profiles), "relationships": len(rels) if isinstance(rels, list) else 0})
         return result
 
     @register.api(method="GET", path="/pending", auth=True, summary="Pending compression stats")
@@ -1250,8 +1731,29 @@ class AlifeMemoryPlugin(BasePlugin):
                 "message_count": pending.get("message_count", 0)}
 
     @register.api(method="GET", path="/memories", auth=True, summary="List memories")
-    async def api_memories(self, sid: str | None = None, limit: int = 100):
-        return await self.store.list_memories(sid or None, _num(limit, 100, 1, 500, True))
+    async def api_memories(self, sid: str | None = None, limit: int = 100,
+                           level: int | None = None, memory_type: str | None = None,
+                           tag: str | None = None, user_id: str | None = None):
+        return await self.store.list_memories_filtered(
+            sid or None, level, memory_type, tag, user_id,
+            _num(limit, 100, 1, 500, True))
+
+    @register.api(method="GET", path="/profiles", auth=True, summary="List entity profiles")
+    async def api_profiles(self, limit: int = 100, entity_type: str | None = None):
+        return await self.store.list_profiles(_num(limit, 100, 1, 500, True), entity_type or None)
+
+    @register.api(method="GET", path="/profile/{entity_id}", auth=True, summary="Get one profile")
+    async def api_profile(self, entity_id: str):
+        return await self.store.get_profile(entity_id) or {"error": "not found"}
+
+    @register.api(method="GET", path="/relationships", auth=True, summary="List relationship graph")
+    async def api_relationships(self, entity_id: str | None = None, target_id: str | None = None):
+        return await self.store.list_relationships(entity_id or None, target_id or None)
+
+    @register.api(method="POST", path="/profile/{entity_id}/regenerate", auth=True, summary="Regenerate a profile")
+    async def api_profile_regenerate(self, entity_id: str):
+        p = await self._generate_profile(entity_id, "user")
+        return {"ok": bool(p)}
 
     @register.api(method="GET", path="/memory/{memory_id}", auth=True, summary="Get memory")
     async def api_memory(self, memory_id: str):
@@ -1285,13 +1787,15 @@ class AlifeMemoryPlugin(BasePlugin):
     @register.api(method="POST", path="/reflect", auth=True, summary="Run reflection")
     async def api_reflect(self, request: Request):
         body = await request.json()
-        sid = str(body.get("sid", "")).strip()
-        if sid:
-            self._track(self._reflect_session(sid))
-        else:
-            for item in await self.store.list_memories(None, 1000):
-                self._track(self._reflect_session(item["sid"]))
-        return {"ok": True, "message": "后台审校任务已排队"}
+        # WebUI 手动触发一次审计：立即全局池挑到期记忆审一批
+        try:
+            candidates = await self.store.pick_reflection_candidates(
+                self.reflect_batch, self.reflect_period)
+        except Exception:
+            candidates = []
+        for mem in candidates:
+            self._track(self._reflect_memory(mem))
+        return {"ok": True, "message": f"后台审校已排队（本轮 {len(candidates)} 条到期记忆）"}
 
     @register.api(method="GET", path="/tasks", auth=True, summary="List memory tasks")
     async def api_tasks(self, limit: int = 50):

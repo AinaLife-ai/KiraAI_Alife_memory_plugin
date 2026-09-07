@@ -16,27 +16,352 @@
     "name": "记忆总控",
     "collapsed": false,
     "fields": {
-      "enabled": {"type": "switch", "name": "启用记忆系统", "default": true, "hint": "关闭后不注入、不记录、不运行后台任务。", "locales": {"zh": {"name": "启用记忆系统", "hint": "关闭后不注入、不记录、不运行后台任务。"}}},
-      "capture_enabled": {"type": "switch", "name": "自动记录对话", "default": true, "hint": "仅在完整的用户消息和机器人回复之后异步写入。", "locales": {"zh": {"name": "自动记录对话", "hint": "仅在完整的用户消息和机器人回复之后异步写入。"}}},
-      "auto_inject": {"type": "switch", "name": "自动注入相关记忆", "default": true, "hint": "每轮检索与当前问题最相关的记忆注入，不破坏缓存 prefix。", "locales": {"zh": {"name": "自动注入相关记忆", "hint": "每轮检索与当前问题最相关的记忆注入。"}}},
-      "inject_context_marker": {"type": "switch", "name": "上下文记忆标记", "default": true, "hint": "让 AI 感知自己有关联的记忆，不破坏 system_prompt 缓存。", "locales": {"zh": {"name": "上下文记忆标记", "hint": "让 AI 感知自己有关联的记忆，不破坏 system_prompt 缓存。"}}},
-      "recall_hint_keywords": {"type": "string", "name": "回忆提醒关键词", "default": "记得,回忆,以前,上次,忘记", "hint": "用户消息包含这些关键词时自动追加搜索提示，逗号分隔", "locales": {"zh": {"name": "回忆提醒关键词", "hint": "用户消息包含这些关键词时自动追加搜索提示，逗号分隔"}}},
-      "message_retention_days": {"type": "integer", "name": "消息保留天数", "default": 7, "minimum": 1, "maximum": 365, "hint": "已压缩的原始消息超过此天数后自动清理。", "locales": {"zh": {"name": "消息保留天数", "hint": "已压缩的原始消息超过此天数后自动清理。"}}},
-      "stale_retention_days": {"type": "integer", "name": "旧版本保留天数", "default": 30, "minimum": 1, "maximum": 730, "hint": "被替换/合并的旧记忆版本超过此天数后自动清理。", "locales": {"zh": {"name": "旧版本保留天数", "hint": "被替换/合并的旧记忆版本超过此天数后自动清理。"}}},
-      "passive_recall": {"type": "switch", "name": "被动召回", "default": true, "hint": "新用户自动召回；检索结果弱时关键词宽召回；每轮从用户消息提取关键词补充记忆。", "locales": {"zh": {"name": "被动召回", "hint": "新用户自动召回；检索结果弱时关键词宽召回；每轮从用户消息提取关键词补充记忆。"}}},
-      "passive_recall_update_rounds": {"type": "integer", "name": "被动召回更新轮数", "default": 10, "minimum": 1, "maximum": 200, "hint": "每 N 轮对话自动从用户消息提取关键词重新召回记忆，刷新注入组合。", "locales": {"zh": {"name": "被动召回更新轮数", "hint": "每 N 轮对话自动从用户消息提取关键词重新召回记忆，刷新注入组合。"}}},
-      "passive_recall_keyword_limit": {"type": "integer", "name": "关键词被动召回上限", "default": 8, "minimum": 1, "maximum": 30, "hint": "每轮从用户消息提取关键词搜索补充记忆的上限，不占主注入条数。", "locales": {"zh": {"name": "关键词被动召回上限", "hint": "每轮从用户消息提取关键词搜索补充记忆的上限，不占主注入条数。"}}},
-      "max_injected_tokens": {"type": "integer", "name": "注入 Token 上限", "default": 1500, "minimum": 100, "maximum": 8000, "hint": "每条注入块的 Token 预算硬上限。", "locales": {"zh": {"name": "注入 Token 上限", "hint": "每条注入块的 Token 预算硬上限。"}}},
-      "max_injected_items": {"type": "integer", "name": "注入条数上限", "default": 8, "minimum": 1, "maximum": 30, "hint": "每条注入最多包含的记忆条数。", "locales": {"zh": {"name": "注入条数上限", "hint": "每条注入最多包含的记忆条数。"}}},
-      "max_injected_chars": {"type": "integer", "name": "注入字符数上限", "default": 3000, "minimum": 200, "maximum": 20000, "hint": "每条注入块的字符数预算硬上限。", "locales": {"zh": {"name": "注入字符数上限", "hint": "每条注入块的字符数预算硬上限。"}}},
-      "max_injected_lines": {"type": "integer", "name": "注入行数上限", "default": 30, "minimum": 5, "maximum": 100, "hint": "双截断：行数+Token+字符三重保险，任一项超限即截断。", "locales": {"zh": {"name": "注入行数上限", "hint": "行数+Token+字符三重保险，任一项超限即截断。"}}},
-      "passive_recall_boost_threshold": {"type": "float", "name": "被动召回最低分阈值", "default": 0.4, "minimum": 0.0, "maximum": 1.0, "hint": "主检索结果最高分低于此值时自动以关键词做宽召回补充。", "locales": {"zh": {"name": "被动召回最低分阈值", "hint": "主检索结果最高分低于此值时自动以关键词做宽召回补充。"}}},
-      "auto_archive_days": {"type": "integer", "name": "自动归档天数（0=关闭）", "default": 0, "minimum": 0, "maximum": 3650, "hint": "超过此天数未被触碰的 active 记忆自动归档。归档后仍可通过检索找到，0 为关闭。", "locales": {"zh": {"name": "自动归档天数（0=关闭）", "hint": "超过此天数未被触碰的 active 记忆自动归档。0 为关闭。"}}},
-      "archive_level_min": {"type": "integer", "name": "归档影响最低层级", "default": 5, "minimum": 1, "maximum": 12, "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级（max_level），最高层受保护。", "locales": {"zh": {"name": "归档影响最低层级", "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级。"}}},
-      "llm_concurrency_limit": {"type": "integer", "name": "LLM 并发上限", "default": 4, "minimum": 1, "maximum": 20, "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。", "locales": {"zh": {"name": "LLM 并发上限", "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。"}}},
-      "user_list_limit": {"type": "integer", "name": "默认展示用户数", "default": 50, "minimum": 1, "maximum": 200, "hint": "list_users 默认一次列出多少个用户（总数始终显示，超出会提示）。", "locales": {"zh": {"name": "默认展示用户数", "hint": "list_users 默认一次列出多少个用户（总数始终显示，超出会提示）。"}}},
-      "memory_list_limit": {"type": "integer", "name": "默认展示记忆条数", "default": 20, "minimum": 1, "maximum": 100, "hint": "list_user_memories / list_session_memories 默认一次列出多少条记忆（总数始终显示）。", "locales": {"zh": {"name": "默认展示记忆条数", "hint": "list_user_memories / list_session_memories 默认一次列出多少条记忆（总数始终显示）。"}}},
-      "recent_summaries_count": {"type": "integer", "name": "默认最近记得条数", "default": 3, "minimum": 1, "maximum": 10, "hint": "list_users 里每个用户默认展示几条最近记得的记忆。", "locales": {"zh": {"name": "默认最近记得条数", "hint": "list_users 里每个用户默认展示几条最近记得的记忆。"}}}
+      "enabled": {
+        "type": "switch",
+        "name": "启用记忆系统",
+        "default": true,
+        "hint": "关闭后不注入、不记录、不运行后台任务。",
+        "locales": {
+          "zh": {
+            "name": "启用记忆系统",
+            "hint": "关闭后不注入、不记录、不运行后台任务。"
+          }
+        }
+      },
+      "capture_enabled": {
+        "type": "switch",
+        "name": "自动记录对话",
+        "default": true,
+        "hint": "仅在完整的用户消息和机器人回复之后异步写入。",
+        "locales": {
+          "zh": {
+            "name": "自动记录对话",
+            "hint": "仅在完整的用户消息和机器人回复之后异步写入。"
+          }
+        }
+      },
+      "auto_inject": {
+        "type": "switch",
+        "name": "自动注入相关记忆",
+        "default": true,
+        "hint": "每轮检索与当前问题最相关的记忆注入，不破坏缓存 prefix。",
+        "locales": {
+          "zh": {
+            "name": "自动注入相关记忆",
+            "hint": "每轮检索与当前问题最相关的记忆注入。"
+          }
+        }
+      },
+      "inject_context_marker": {
+        "type": "switch",
+        "name": "上下文记忆标记",
+        "default": true,
+        "hint": "让 AI 感知自己有关联的记忆，不破坏 system_prompt 缓存。",
+        "locales": {
+          "zh": {
+            "name": "上下文记忆标记",
+            "hint": "让 AI 感知自己有关联的记忆，不破坏 system_prompt 缓存。"
+          }
+        }
+      },
+      "recall_hint_keywords": {
+        "type": "string",
+        "name": "回忆提醒关键词",
+        "default": "记得,回忆,以前,上次,忘记",
+        "hint": "用户消息包含这些关键词时自动追加搜索提示，逗号分隔",
+        "locales": {
+          "zh": {
+            "name": "回忆提醒关键词",
+            "hint": "用户消息包含这些关键词时自动追加搜索提示，逗号分隔"
+          }
+        }
+      },
+      "message_retention_days": {
+        "type": "integer",
+        "name": "消息保留天数",
+        "default": 7,
+        "minimum": 1,
+        "maximum": 365,
+        "hint": "已压缩的原始消息超过此天数后自动清理。",
+        "locales": {
+          "zh": {
+            "name": "消息保留天数",
+            "hint": "已压缩的原始消息超过此天数后自动清理。"
+          }
+        }
+      },
+      "stale_retention_days": {
+        "type": "integer",
+        "name": "旧版本保留天数",
+        "default": 30,
+        "minimum": 1,
+        "maximum": 730,
+        "hint": "被替换/合并的旧记忆版本超过此天数后自动清理。",
+        "locales": {
+          "zh": {
+            "name": "旧版本保留天数",
+            "hint": "被替换/合并的旧记忆版本超过此天数后自动清理。"
+          }
+        }
+      },
+      "passive_recall": {
+        "type": "switch",
+        "name": "被动召回",
+        "default": true,
+        "hint": "新用户自动召回；检索结果弱时关键词宽召回；每轮从用户消息提取关键词补充记忆。",
+        "locales": {
+          "zh": {
+            "name": "被动召回",
+            "hint": "新用户自动召回；检索结果弱时关键词宽召回；每轮从用户消息提取关键词补充记忆。"
+          }
+        }
+      },
+      "passive_recall_update_rounds": {
+        "type": "integer",
+        "name": "被动召回更新轮数",
+        "default": 10,
+        "minimum": 1,
+        "maximum": 200,
+        "hint": "每 N 轮对话自动从用户消息提取关键词重新召回记忆，刷新注入组合。",
+        "locales": {
+          "zh": {
+            "name": "被动召回更新轮数",
+            "hint": "每 N 轮对话自动从用户消息提取关键词重新召回记忆，刷新注入组合。"
+          }
+        }
+      },
+      "passive_recall_keyword_limit": {
+        "type": "integer",
+        "name": "关键词被动召回上限",
+        "default": 8,
+        "minimum": 1,
+        "maximum": 30,
+        "hint": "每轮从用户消息提取关键词搜索补充记忆的上限，不占主注入条数。",
+        "locales": {
+          "zh": {
+            "name": "关键词被动召回上限",
+            "hint": "每轮从用户消息提取关键词搜索补充记忆的上限，不占主注入条数。"
+          }
+        }
+      },
+      "max_injected_tokens": {
+        "type": "integer",
+        "name": "注入 Token 上限",
+        "default": 1500,
+        "minimum": 100,
+        "maximum": 8000,
+        "hint": "每条注入块的 Token 预算硬上限。",
+        "locales": {
+          "zh": {
+            "name": "注入 Token 上限",
+            "hint": "每条注入块的 Token 预算硬上限。"
+          }
+        }
+      },
+      "max_injected_items": {
+        "type": "integer",
+        "name": "注入条数上限",
+        "default": 8,
+        "minimum": 1,
+        "maximum": 30,
+        "hint": "每条注入最多包含的记忆条数。",
+        "locales": {
+          "zh": {
+            "name": "注入条数上限",
+            "hint": "每条注入最多包含的记忆条数。"
+          }
+        }
+      },
+      "max_injected_chars": {
+        "type": "integer",
+        "name": "注入字符数上限",
+        "default": 3000,
+        "minimum": 200,
+        "maximum": 20000,
+        "hint": "每条注入块的字符数预算硬上限。",
+        "locales": {
+          "zh": {
+            "name": "注入字符数上限",
+            "hint": "每条注入块的字符数预算硬上限。"
+          }
+        }
+      },
+      "max_injected_lines": {
+        "type": "integer",
+        "name": "注入行数上限",
+        "default": 30,
+        "minimum": 5,
+        "maximum": 100,
+        "hint": "双截断：行数+Token+字符三重保险，任一项超限即截断。",
+        "locales": {
+          "zh": {
+            "name": "注入行数上限",
+            "hint": "行数+Token+字符三重保险，任一项超限即截断。"
+          }
+        }
+      },
+      "passive_recall_boost_threshold": {
+        "type": "float",
+        "name": "被动召回最低分阈值",
+        "default": 0.4,
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "hint": "主检索结果最高分低于此值时自动以关键词做宽召回补充。",
+        "locales": {
+          "zh": {
+            "name": "被动召回最低分阈值",
+            "hint": "主检索结果最高分低于此值时自动以关键词做宽召回补充。"
+          }
+        }
+      },
+      "auto_archive_days": {
+        "type": "integer",
+        "name": "自动归档天数（0=关闭）",
+        "default": 0,
+        "minimum": 0,
+        "maximum": 3650,
+        "hint": "超过此天数未被触碰的 active 记忆自动归档。归档后仍可通过检索找到，0 为关闭。",
+        "locales": {
+          "zh": {
+            "name": "自动归档天数（0=关闭）",
+            "hint": "超过此天数未被触碰的 active 记忆自动归档。0 为关闭。"
+          }
+        }
+      },
+      "archive_level_min": {
+        "type": "integer",
+        "name": "归档影响最低层级",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 12,
+        "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级（max_level），最高层受保护。",
+        "locales": {
+          "zh": {
+            "name": "归档影响最低层级",
+            "hint": "低于此层级的记忆才会被归档。默认等于最高压缩层级。"
+          }
+        }
+      },
+      "llm_concurrency_limit": {
+        "type": "integer",
+        "name": "LLM 并发上限",
+        "default": 4,
+        "minimum": 1,
+        "maximum": 20,
+        "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。",
+        "locales": {
+          "zh": {
+            "name": "LLM 并发上限",
+            "hint": "压缩和审校同时调用的 LLM 请求数上限。超出的排队等待。"
+          }
+        }
+      },
+      "user_list_limit": {
+        "type": "integer",
+        "name": "默认展示用户数",
+        "default": 50,
+        "minimum": 1,
+        "maximum": 200,
+        "hint": "list_users 默认一次列出多少个用户（总数始终显示，超出会提示）。",
+        "locales": {
+          "zh": {
+            "name": "默认展示用户数",
+            "hint": "list_users 默认一次列出多少个用户（总数始终显示，超出会提示）。"
+          }
+        }
+      },
+      "memory_list_limit": {
+        "type": "integer",
+        "name": "默认展示记忆条数",
+        "default": 20,
+        "minimum": 1,
+        "maximum": 100,
+        "hint": "list_user_memories / list_session_memories 默认一次列出多少条记忆（总数始终显示）。",
+        "locales": {
+          "zh": {
+            "name": "默认展示记忆条数",
+            "hint": "list_user_memories / list_session_memories 默认一次列出多少条记忆（总数始终显示）。"
+          }
+        }
+      },
+      "recent_summaries_count": {
+        "type": "integer",
+        "name": "默认最近记得条数",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 10,
+        "hint": "list_users 里每个用户默认展示几条最近记得的记忆。",
+        "locales": {
+          "zh": {
+            "name": "默认最近记得条数",
+            "hint": "list_users 里每个用户默认展示几条最近记得的记忆。"
+          }
+        }
+      },
+      "profile_enabled": {
+        "type": "switch",
+        "name": "启用画像",
+        "default": true,
+        "hint": "为实体（用户/群/机器人）生成结构化画像，由记忆聚合而成。",
+        "locales": {
+          "zh": {
+            "name": "启用画像",
+            "hint": "为实体生成结构化画像，由记忆聚合而成。"
+          }
+        }
+      },
+      "profile_inject": {
+        "type": "switch",
+        "name": "注入画像",
+        "default": true,
+        "hint": "对话时把当前用户及其提到的人的画像注入上下文。",
+        "locales": {
+          "zh": {
+            "name": "注入画像",
+            "hint": "对话时把当前用户及其提到的人的画像注入上下文。"
+          }
+        }
+      },
+      "profile_inject_max": {
+        "type": "integer",
+        "name": "画像注入上限",
+        "default": 3,
+        "minimum": 0,
+        "maximum": 6,
+        "hint": "最多注入多少个实体的画像（含当前用户）。",
+        "locales": {
+          "zh": {
+            "name": "画像注入上限",
+            "hint": "最多注入多少个实体的画像（含当前用户）。"
+          }
+        }
+      },
+      "profile_generate_model": {
+        "type": "string",
+        "name": "画像生成模型",
+        "default": "",
+        "hint": "生成画像用的 LLM 模型（留空=默认模型）。",
+        "locales": {
+          "zh": {
+            "name": "画像生成模型",
+            "hint": "生成画像用的 LLM 模型（留空=默认模型）。"
+          }
+        }
+      },
+      "profile_gen_trigger": {
+        "type": "integer",
+        "name": "画像生成触发记忆数",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 50,
+        "hint": "某实体累计多少条记忆时触发一次画像生成（首次见即生成）。",
+        "locales": {
+          "zh": {
+            "name": "画像生成触发记忆数",
+            "hint": "某实体累计多少条记忆时触发一次画像生成。"
+          }
+        }
+      }
     }
   },
   "section_trigger": {
@@ -45,13 +370,65 @@
     "collapsed": false,
     "fields": {
       "trigger_mode": {
-        "type": "string", "name": "触发模式", "options": ["rounds", "tokens", "messages", "either"],
-        "default": "rounds", "hint": "rounds 按对话轮数触发；tokens 按 Token 数触发；messages 按消息数触发；either 任一条件满足即触发。",
-        "locales": {"zh": {"name": "触发模式", "hint": "rounds 轮数/tokens Token数/messages 消息数/either 任一即触发"}}
+        "type": "string",
+        "name": "触发模式",
+        "options": [
+          "rounds",
+          "tokens",
+          "messages",
+          "either"
+        ],
+        "default": "rounds",
+        "hint": "rounds 按对话轮数触发；tokens 按 Token 数触发；messages 按消息数触发；either 任一条件满足即触发。",
+        "locales": {
+          "zh": {
+            "name": "触发模式",
+            "hint": "rounds 轮数/tokens Token数/messages 消息数/either 任一即触发"
+          }
+        }
       },
-      "round_threshold": {"type": "integer", "name": "轮数阈值", "default": 10, "minimum": 1, "maximum": 200, "hint": "累积多少轮对话后触发压缩。", "locales": {"zh": {"name": "轮数阈值", "hint": "累积多少轮对话后触发压缩。"}}},
-      "token_threshold": {"type": "integer", "name": "Token 阈值", "default": 10000, "minimum": 100, "maximum": 100000, "hint": "累积多少估算 Token 后触发压缩。", "locales": {"zh": {"name": "Token 阈值", "hint": "累积多少估算 Token 后触发压缩。"}}},
-      "message_threshold": {"type": "integer", "name": "消息数阈值", "default": 50, "minimum": 2, "maximum": 500, "hint": "累积多少条原始消息后触发压缩。", "locales": {"zh": {"name": "消息数阈值", "hint": "累积多少条原始消息后触发压缩。"}}}
+      "round_threshold": {
+        "type": "integer",
+        "name": "轮数阈值",
+        "default": 10,
+        "minimum": 1,
+        "maximum": 200,
+        "hint": "累积多少轮对话后触发压缩。",
+        "locales": {
+          "zh": {
+            "name": "轮数阈值",
+            "hint": "累积多少轮对话后触发压缩。"
+          }
+        }
+      },
+      "token_threshold": {
+        "type": "integer",
+        "name": "Token 阈值",
+        "default": 10000,
+        "minimum": 100,
+        "maximum": 100000,
+        "hint": "累积多少估算 Token 后触发压缩。",
+        "locales": {
+          "zh": {
+            "name": "Token 阈值",
+            "hint": "累积多少估算 Token 后触发压缩。"
+          }
+        }
+      },
+      "message_threshold": {
+        "type": "integer",
+        "name": "消息数阈值",
+        "default": 50,
+        "minimum": 2,
+        "maximum": 500,
+        "hint": "累积多少条原始消息后触发压缩。",
+        "locales": {
+          "zh": {
+            "name": "消息数阈值",
+            "hint": "累积多少条原始消息后触发压缩。"
+          }
+        }
+      }
     }
   },
   "section_compression": {
@@ -59,15 +436,129 @@
     "name": "压缩与分层",
     "collapsed": false,
     "fields": {
-      "compress_model": {"type": "model_select", "name": "压缩模型", "model_type": "llm", "default": "", "hint": "留空跟随框架默认快速模型（WebUI-默认快速模型）。", "locales": {"zh": {"name": "压缩模型", "hint": "留空跟随框架默认快速模型（WebUI-默认快速模型）。"}}},
-      "compress_probability": {"type": "float", "name": "压缩触发概率", "default": 0.8, "minimum": 0.0, "maximum": 1.0, "hint": "概率扰动，避免每次触发都压缩而影响互动感。1.0 为必触发。", "locales": {"zh": {"name": "压缩触发概率", "hint": "概率扰动，避免每次触发都压缩而影响互动感。1.0 为必触发。"}}},
-      "compress_timeout": {"type": "integer", "name": "压缩超时（秒）", "default": 30, "minimum": 5, "maximum": 120, "hint": "每次压缩 LLM 调用的超时秒数。超时后重试，超过最大重试次数则跳过整批。", "locales": {"zh": {"name": "压缩超时（秒）", "hint": "每次压缩 LLM 调用的超时秒数。超时后重试，超过最大重试次数则跳过整批。"}}},
-      "max_compress_retry": {"type": "integer", "name": "压缩最大重试", "default": 2, "minimum": 0, "maximum": 10, "hint": "超时后重试次数。超过后跳过整批消息，不阻塞后续消息处理。", "locales": {"zh": {"name": "压缩最大重试", "hint": "超时后重试次数。超过后跳过整批消息，不阻塞后续消息处理。"}}},
-      "batch_size": {"type": "integer", "name": "每批消息数", "default": 10, "minimum": 2, "maximum": 80, "hint": "每次压缩取多少条原始消息给模型。", "locales": {"zh": {"name": "每批消息数", "hint": "每次压缩取多少条原始消息给模型。"}}},
-      "level_group_size": {"type": "integer", "name": "高层合并数量", "default": 4, "minimum": 2, "maximum": 12, "hint": "同层摘要达到多少条时合并为更高层。", "locales": {"zh": {"name": "高层合并数量", "hint": "同层摘要达到多少条时合并为更高层。"}}},
-      "max_level": {"type": "integer", "name": "最大压缩层级", "default": 5, "minimum": 1, "maximum": 12, "hint": "达到最高层后保留为长期事实，不再自动合并。", "locales": {"zh": {"name": "最大压缩层级", "hint": "达到最高层后保留为长期事实，不再自动合并。"}}},
-      "min_chars": {"type": "integer", "name": "最小压缩字符数", "default": 80, "minimum": 20, "maximum": 2000, "hint": "内容太短时不调用压缩模型。", "locales": {"zh": {"name": "最小压缩字符数", "hint": "内容太短时不调用压缩模型。"}}},
-      "prompt": {"type": "markdown", "name": "压缩提示词", "default": "你是长期记忆整理器。把{range}中提取成可验证、简洁、无重复的记忆。\n只输出 JSON，不要 Markdown：{\"summary\":\"一句话概述\",\"content\":\"事实、偏好、决定和关系变化，分行列出\",\"importance\":0.0}\n不要臆测，不要把闲聊或临时情绪写成长期事实；保留时间、主体和限定条件。\n待整理内容：\n{content}", "hint": "必须输出 JSON，支持 {content} 和 {range} 占位符。", "locales": {"zh": {"name": "压缩提示词", "hint": "必须输出 JSON，支持 {content} 和 {range} 占位符。"}}}
+      "compress_model": {
+        "type": "model_select",
+        "name": "压缩模型",
+        "model_type": "llm",
+        "default": "",
+        "hint": "留空跟随框架默认快速模型（WebUI-默认快速模型）。",
+        "locales": {
+          "zh": {
+            "name": "压缩模型",
+            "hint": "留空跟随框架默认快速模型（WebUI-默认快速模型）。"
+          }
+        }
+      },
+      "compress_probability": {
+        "type": "float",
+        "name": "压缩触发概率",
+        "default": 0.8,
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "hint": "概率扰动，避免每次触发都压缩而影响互动感。1.0 为必触发。",
+        "locales": {
+          "zh": {
+            "name": "压缩触发概率",
+            "hint": "概率扰动，避免每次触发都压缩而影响互动感。1.0 为必触发。"
+          }
+        }
+      },
+      "compress_timeout": {
+        "type": "integer",
+        "name": "压缩超时（秒）",
+        "default": 30,
+        "minimum": 5,
+        "maximum": 120,
+        "hint": "每次压缩 LLM 调用的超时秒数。超时后重试，超过最大重试次数则跳过整批。",
+        "locales": {
+          "zh": {
+            "name": "压缩超时（秒）",
+            "hint": "每次压缩 LLM 调用的超时秒数。超时后重试，超过最大重试次数则跳过整批。"
+          }
+        }
+      },
+      "max_compress_retry": {
+        "type": "integer",
+        "name": "压缩最大重试",
+        "default": 2,
+        "minimum": 0,
+        "maximum": 10,
+        "hint": "超时后重试次数。超过后跳过整批消息，不阻塞后续消息处理。",
+        "locales": {
+          "zh": {
+            "name": "压缩最大重试",
+            "hint": "超时后重试次数。超过后跳过整批消息，不阻塞后续消息处理。"
+          }
+        }
+      },
+      "batch_size": {
+        "type": "integer",
+        "name": "每批消息数",
+        "default": 10,
+        "minimum": 2,
+        "maximum": 80,
+        "hint": "每次压缩取多少条原始消息给模型。",
+        "locales": {
+          "zh": {
+            "name": "每批消息数",
+            "hint": "每次压缩取多少条原始消息给模型。"
+          }
+        }
+      },
+      "level_group_size": {
+        "type": "integer",
+        "name": "高层合并数量",
+        "default": 4,
+        "minimum": 2,
+        "maximum": 12,
+        "hint": "同层摘要达到多少条时合并为更高层。",
+        "locales": {
+          "zh": {
+            "name": "高层合并数量",
+            "hint": "同层摘要达到多少条时合并为更高层。"
+          }
+        }
+      },
+      "max_level": {
+        "type": "integer",
+        "name": "最大压缩层级",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 12,
+        "hint": "达到最高层后保留为长期事实，不再自动合并。",
+        "locales": {
+          "zh": {
+            "name": "最大压缩层级",
+            "hint": "达到最高层后保留为长期事实，不再自动合并。"
+          }
+        }
+      },
+      "min_chars": {
+        "type": "integer",
+        "name": "最小压缩字符数",
+        "default": 80,
+        "minimum": 20,
+        "maximum": 2000,
+        "hint": "内容太短时不调用压缩模型。",
+        "locales": {
+          "zh": {
+            "name": "最小压缩字符数",
+            "hint": "内容太短时不调用压缩模型。"
+          }
+        }
+      },
+      "prompt": {
+        "type": "markdown",
+        "name": "压缩提示词",
+        "default": "你是长期记忆整理器。把{range}中提取成可验证、简洁、无重复的记忆。\n只输出 JSON，不要 Markdown：{\"items\":[{\"summary\":\"一句话概述\",\"content\":\"事实、偏好、决定和关系变化，分行列出\",\"memory_type\":\"关于实体|偏好风格|约定任务|关系网络|溯源查询|日常事件\",\"tags\":[\"标签1\",\"标签2\"],\"importance\":0.0,\"confidence\":0.0,\"reason\":\"为什么记（偏好/约定类必填）\",\"scenario\":\"什么时候该想起（偏好/约定类必填）\",\"entity_id\":\"关联到谁（用户/群/机器人标识，可空）\"}]}\nmemory_type 只能从 6 类里选：关于实体(这个人/群是谁、身份背景) / 偏好风格(喜欢什么、习惯、禁止项) / 约定任务(正在做的事、项目、约定、截止) / 关系网络(谁是谁的什么人、成员列表、角色设定) / 溯源查询(去哪查资料、哪个系统管什么) / 日常事件(其他值得记住的)。\n偏好风格和约定任务两类必须填 reason(为什么记这件事)和 scenario(什么时候该想起它)。\ntags 是 2-4 个简短中文标签，方便以后按标签翻找，不要超过 6 个。\n不要臆测，不要把闲聊或临时情绪写成长期事实；保留时间、主体和限定条件。\n待整理内容：\n{content}",
+        "hint": "必须输出 JSON，支持 {content} 和 {range} 占位符。",
+        "locales": {
+          "zh": {
+            "name": "压缩提示词",
+            "hint": "必须输出 JSON，支持 {content} 和 {range} 占位符。"
+          }
+        }
+      }
     }
   },
   "section_retrieval": {
@@ -75,14 +566,115 @@
     "name": "检索与注入",
     "collapsed": false,
     "fields": {
-      "semantic_enabled": {"type": "switch", "name": "启用语义向量", "default": true, "hint": "没有 embedding 模型时自动退化为 FTS5。", "locales": {"zh": {"name": "启用语义向量", "hint": "没有 embedding 模型时自动退化为 FTS5。"}}},
-      "embedding_model": {"type": "model_select", "name": "向量模型", "model_type": "embedding", "default": "", "hint": "留空跟随框架默认向量模型（WebUI-默认向量模型）。", "locales": {"zh": {"name": "向量模型", "hint": "留空跟随框架默认向量模型。"}}},
-      "rerank_model": {"type": "model_select", "name": "重排序模型", "model_type": "llm", "default": "", "hint": "留空跟随框架默认重排序模型（WebUI-默认重排序模型）。", "locales": {"zh": {"name": "重排序模型", "hint": "留空跟随框架默认重排序模型。"}}},
-      "search_scope": {"type": "string", "name": "默认检索范围", "options": ["linked", "session", "global"], "default": "linked", "hint": "linked 跨会话跨用户关联；session 仅当前会话；global 全部。", "locales": {"zh": {"name": "默认检索范围", "hint": "linked 跨会话跨用户关联；session 仅当前会话；global 全部。"}}},
-      "cross_user_enabled": {"type": "switch", "name": "允许跨用户关联", "default": true, "hint": "关于同一主体的不同用户证据互相补充。", "locales": {"zh": {"name": "允许跨用户关联", "hint": "关于同一主体的不同用户证据互相补充。"}}},
-      "top_k": {"type": "integer", "name": "默认结果数", "default": 5, "minimum": 1, "maximum": 12, "hint": "检索返回的记忆条数。", "locales": {"zh": {"name": "默认结果数", "hint": "检索返回的记忆条数。"}}},
-      "recency_half_life_days": {"type": "float", "name": "时间衰减半衰期（天）", "default": 45.0, "minimum": 1.0, "maximum": 3650.0, "hint": "越近的记忆略有优势，但不会覆盖高相关旧事实。", "locales": {"zh": {"name": "时间衰减半衰期（天）", "hint": "越近的记忆略有优势，但不会覆盖高相关旧事实。"}}},
-      "inject_level_max": {"type": "integer", "name": "注入最高层级", "default": 12, "minimum": 0, "maximum": 12, "hint": "可限制只注入某些压缩层。", "locales": {"zh": {"name": "注入最高层级", "hint": "可限制只注入某些压缩层。"}}}
+      "semantic_enabled": {
+        "type": "switch",
+        "name": "启用语义向量",
+        "default": true,
+        "hint": "没有 embedding 模型时自动退化为 FTS5。",
+        "locales": {
+          "zh": {
+            "name": "启用语义向量",
+            "hint": "没有 embedding 模型时自动退化为 FTS5。"
+          }
+        }
+      },
+      "embedding_model": {
+        "type": "model_select",
+        "name": "向量模型",
+        "model_type": "embedding",
+        "default": "",
+        "hint": "留空跟随框架默认向量模型（WebUI-默认向量模型）。",
+        "locales": {
+          "zh": {
+            "name": "向量模型",
+            "hint": "留空跟随框架默认向量模型。"
+          }
+        }
+      },
+      "rerank_model": {
+        "type": "model_select",
+        "name": "重排序模型",
+        "model_type": "llm",
+        "default": "",
+        "hint": "留空跟随框架默认重排序模型（WebUI-默认重排序模型）。",
+        "locales": {
+          "zh": {
+            "name": "重排序模型",
+            "hint": "留空跟随框架默认重排序模型。"
+          }
+        }
+      },
+      "search_scope": {
+        "type": "string",
+        "name": "默认检索范围",
+        "options": [
+          "linked",
+          "session",
+          "global"
+        ],
+        "default": "linked",
+        "hint": "linked 跨会话跨用户关联；session 仅当前会话；global 全部。",
+        "locales": {
+          "zh": {
+            "name": "默认检索范围",
+            "hint": "linked 跨会话跨用户关联；session 仅当前会话；global 全部。"
+          }
+        }
+      },
+      "cross_user_enabled": {
+        "type": "switch",
+        "name": "允许跨用户关联",
+        "default": true,
+        "hint": "关于同一主体的不同用户证据互相补充。",
+        "locales": {
+          "zh": {
+            "name": "允许跨用户关联",
+            "hint": "关于同一主体的不同用户证据互相补充。"
+          }
+        }
+      },
+      "top_k": {
+        "type": "integer",
+        "name": "默认结果数",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 12,
+        "hint": "检索返回的记忆条数。",
+        "locales": {
+          "zh": {
+            "name": "默认结果数",
+            "hint": "检索返回的记忆条数。"
+          }
+        }
+      },
+      "recency_half_life_days": {
+        "type": "float",
+        "name": "时间衰减半衰期（天）",
+        "default": 45.0,
+        "minimum": 1.0,
+        "maximum": 3650.0,
+        "hint": "越近的记忆略有优势，但不会覆盖高相关旧事实。",
+        "locales": {
+          "zh": {
+            "name": "时间衰减半衰期（天）",
+            "hint": "越近的记忆略有优势，但不会覆盖高相关旧事实。"
+          }
+        }
+      },
+      "inject_level_max": {
+        "type": "integer",
+        "name": "注入最高层级",
+        "default": 12,
+        "minimum": 0,
+        "maximum": 12,
+        "hint": "可限制只注入某些压缩层。",
+        "locales": {
+          "zh": {
+            "name": "注入最高层级",
+            "hint": "可限制只注入某些压缩层。"
+          }
+        }
+      }
     }
   },
   "section_reflection": {
@@ -90,11 +682,87 @@
     "name": "后台反思与纠错",
     "collapsed": false,
     "fields": {
-      "enabled": {"type": "switch", "name": "启用后台记忆审校", "default": true, "hint": "低频比较新证据与旧记忆，只有高置信度冲突才改动。", "locales": {"zh": {"name": "启用后台记忆审校", "hint": "低频比较新证据与旧记忆，只有高置信度冲突才改动。"}}},
-      "reflect_model": {"type": "model_select", "name": "审校模型", "model_type": "llm", "default": "", "hint": "留空跟随框架默认语言模型（WebUI-默认语言模型）。", "locales": {"zh": {"name": "审校模型", "hint": "留空跟随框架默认语言模型（WebUI-默认语言模型）。"}}},
-      "interval_seconds": {"type": "integer", "name": "审校间隔（秒）", "default": 1800, "minimum": 300, "maximum": 86400, "hint": "低频运行，避免后台持续消耗。", "locales": {"zh": {"name": "审校间隔（秒）", "hint": "低频运行，避免后台持续消耗。"}}},
-      "max_items": {"type": "integer", "name": "每次审校记忆数", "default": 4, "minimum": 1, "maximum": 20, "hint": "每个会话最多检查最近的高价值记忆。", "locales": {"zh": {"name": "每次审校记忆数", "hint": "每个会话最多检查最近的高价值记忆。"}}},
-      "prompt": {"type": "markdown", "name": "审校提示词", "default": "你是记忆审校器。比较旧记忆和新证据，只处理有明确矛盾的事实。\n只输出 JSON：{\"action\":\"none|correct|stale\",\"summary\":\"修正后的概述\",\"content\":\"修正后的事实\",\"confidence\":0.0,\"reason\":\"证据依据\"}\n若只是措辞不同、证据不足或可能是临时状态，输出 none。不得凭空补全。\n旧记忆：\n{memory}\n新证据：\n{evidence}", "hint": "必须输出 JSON，支持 {memory} 和 {evidence} 占位符。", "locales": {"zh": {"name": "审校提示词", "hint": "必须输出 JSON，支持 {memory} 和 {evidence} 占位符。"}}}
+      "enabled": {
+        "type": "switch",
+        "name": "启用后台记忆审校",
+        "default": true,
+        "hint": "低频比较新证据与旧记忆，只有高置信度冲突才改动。",
+        "locales": {
+          "zh": {
+            "name": "启用后台记忆审校",
+            "hint": "低频比较新证据与旧记忆，只有高置信度冲突才改动。"
+          }
+        }
+      },
+      "reflect_model": {
+        "type": "model_select",
+        "name": "审校模型",
+        "model_type": "llm",
+        "default": "",
+        "hint": "留空跟随框架默认语言模型（WebUI-默认语言模型）。",
+        "locales": {
+          "zh": {
+            "name": "审校模型",
+            "hint": "留空跟随框架默认语言模型（WebUI-默认语言模型）。"
+          }
+        }
+      },
+      "interval_seconds": {
+        "type": "integer",
+        "name": "审校间隔（秒）",
+        "default": 1800,
+        "minimum": 300,
+        "maximum": 86400,
+        "hint": "低频运行，避免后台持续消耗。",
+        "locales": {
+          "zh": {
+            "name": "审校间隔（秒）",
+            "hint": "低频运行，避免后台持续消耗。"
+          }
+        }
+      },
+      "period_days": {
+        "type": "float",
+        "name": "审计周期（天）",
+        "default": 3.0,
+        "minimum": 0.5,
+        "maximum": 90.0,
+        "hint": "记忆被审计过后 N 天内不再重复审；超期后重新进入审计池。",
+        "locales": {
+          "zh": {
+            "name": "审计周期（天）",
+            "hint": "记忆被审计过后 N 天内不再重复审；超期后重新进入审计池。"
+          }
+        }
+      },
+      "batch_size": {
+        "type": "integer",
+        "name": "每轮审计条数",
+        "default": 20,
+        "minimum": 1,
+        "maximum": 100,
+        "hint": "后台审计每轮最多处理多少条到期记忆（全局池，优先没审过的）。",
+        "locales": {
+          "zh": {
+            "name": "每轮审计条数",
+            "hint": "后台审计每轮最多处理多少条到期记忆（优先没审过的）。"
+          }
+        }
+      },
+      "dedup_similarity_threshold": {
+        "type": "float",
+        "name": "去重相似度阈值",
+        "default": 0.1,
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "hint": "FTS5 归一化相似度超出此值的记忆候选才会被 LLM 判断是否合并。越大越省 token。",
+        "locales": {
+          "zh": {
+            "name": "去重相似度阈值",
+            "hint": "FTS5 归一化相似度超出此值的候选才被 LLM 判断是否合并。"
+          }
+        }
+      }
     }
   }
 }
