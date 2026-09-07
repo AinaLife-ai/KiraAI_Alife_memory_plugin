@@ -140,10 +140,10 @@ def _infer_simple_memory_tags(text: str) -> list[str]:
 
 def _map_level_from_importance(importance: float, max_level: int = 5) -> int:
     """按重要度把记忆映射到层级（迁移用，避免一刀切全 L3）。
-    importance 0-1。KiraOS 的 importance 普遍偏中(均值~0.5)，用平缓分段映射，
-    让日常/具体事件落低位、核心资料落高位，而不是全堆中间层。
+    importance 0-1（KiraOS 的 importance/10）。KiraOS 重要度普遍偏中(均值~0.5)，
+    用平缓分段映射：日常→低层、重要→高层，>=0.8(即 KiraOS 8) 直接归最高层。
     分段（importance → level，封顶 max_level）：
-      <0.4 → L1, 0.4-0.6 → L2, 0.6-0.75 → L3, 0.75-0.9 → L4, >=0.9 → max_level"""
+      <0.4 → L1, 0.4-0.6 → L2, 0.6-0.75 → L3, 0.75-0.8 → L4, >=0.8 → max_level"""
     try:
         r = float(importance)
     except (TypeError, ValueError):
@@ -155,7 +155,7 @@ def _map_level_from_importance(importance: float, max_level: int = 5) -> int:
         lvl = 2
     elif r < 0.75:
         lvl = 3
-    elif r < 0.9:
+    elif r < 0.8:
         lvl = 4
     else:
         lvl = max_level
