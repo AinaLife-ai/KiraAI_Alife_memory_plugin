@@ -366,10 +366,11 @@ class MemoryStore:
             # 标签索引表（结构化标签，替代字符串解析）
             conn.execute("CREATE TABLE IF NOT EXISTS memories_tags(mid TEXT NOT NULL, tag TEXT NOT NULL, UNIQUE(mid, tag))")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_tags_tag ON memories_tags(tag)")
-            # 用户/实体画像表（entity_id 统一，user/group/bot 归一张表，entity_type 区分）
+            # 用户/实体画像表（entity_id 统一，user/group/self 归一张表，entity_type 区分）
             conn.execute("""CREATE TABLE IF NOT EXISTS user_profiles(
                 entity_id TEXT PRIMARY KEY,
                 entity_type TEXT NOT NULL DEFAULT 'user',
+                is_ai INTEGER DEFAULT NULL,
                 name TEXT DEFAULT '', nickname TEXT DEFAULT '',
                 description TEXT DEFAULT '',
                 platform TEXT DEFAULT '',
@@ -384,6 +385,13 @@ class MemoryStore:
                 generated_from TEXT DEFAULT '',
                 memory_type TEXT DEFAULT ''
             )""")
+            # 旧库 user_profiles 缺 is_ai 列时补列
+            try:
+                pf_cols = {r[1].lower() for r in conn.execute("PRAGMA table_info(user_profiles)").fetchall()}
+                if "is_ai" not in pf_cols:
+                    conn.execute("ALTER TABLE user_profiles ADD COLUMN is_ai INTEGER DEFAULT NULL")
+            except Exception:
+                pass
             # 关系网络表：实体间三元组（谁是谁的什么人）
             conn.execute("""CREATE TABLE IF NOT EXISTS relationships(
                 id TEXT PRIMARY KEY,
@@ -1122,10 +1130,12 @@ class MemoryStore:
             existing = conn.execute("SELECT * FROM user_profiles WHERE entity_id=?", (entity_id,)).fetchone()
             if existing:
                 conn.execute(
-                    "UPDATE user_profiles SET entity_type=?, name=?, nickname=?, description=?, platform=?, "
+                    "UPDATE user_profiles SET entity_type=?, is_ai=?, name=?, nickname=?, description=?, platform=?, "
                     "traits=?, preferences=?, relationships=?, facts=?, aliases=?, interaction_count=?, "
                     "last_interaction=?, updated_at=?, generated_from=?, memory_type=? WHERE entity_id=?",
-                    (fields.get("entity_type", existing["entity_type"]), fields.get("name", existing["name"]),
+                    (fields.get("entity_type", existing["entity_type"]),
+                     fields.get("is_ai", existing["is_ai"] if "is_ai" in existing.keys() else None),
+                     fields.get("name", existing["name"]),
                      fields.get("nickname", existing["nickname"]), fields.get("description", existing["description"]),
                      fields.get("platform", existing["platform"]),
                      json.dumps(fields.get("traits", json.loads(existing["traits"] or "[]")), ensure_ascii=False),
@@ -1139,8 +1149,8 @@ class MemoryStore:
                      fields.get("memory_type", existing["memory_type"]) or "", entity_id))
             else:
                 conn.execute(
-                    "INSERT OR REPLACE INTO user_profiles(entity_id,entity_type,name,nickname,description,platform,traits,preferences,relationships,facts,aliases,interaction_count,last_interaction,updated_at,generated_from,memory_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (entity_id, fields.get("entity_type", entity_type), fields.get("name", ""),
+                    "INSERT OR REPLACE INTO user_profiles(entity_id,entity_type,is_ai,name,nickname,description,platform,traits,preferences,relationships,facts,aliases,interaction_count,last_interaction,updated_at,generated_from,memory_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (entity_id, fields.get("entity_type", entity_type), fields.get("is_ai", None), fields.get("name", ""),
                      fields.get("nickname", ""), fields.get("description", ""), fields.get("platform", ""),
                      json.dumps(fields.get("traits", []), ensure_ascii=False),
                      json.dumps(fields.get("preferences", {}), ensure_ascii=False),
@@ -1154,18 +1164,26 @@ class MemoryStore:
         finally:
             conn.close()
 
-    async def list_profiles(self, limit: int = 100, entity_type: str | None = None) -> list[dict]:
-        """列出所有画像（默认 user；可过滤 group）。bot 自己不设类型，是 user/group 之外平行的存在。"""
-        return await asyncio.to_thread(self._list_profiles, limit, entity_type)
+    async def list_profiles(self, limit: int = 100, entity_type: str | None = None, is_ai: bool | None = None) -> list[dict]:
+        """列出所有画像（可过滤 entity_type / is_ai）。entity_type: user/group/self。"""
+        return await asyncio.to_thread(self._list_profiles, limit, entity_type, is_ai)
 
-    def _list_profiles(self, limit, entity_type):
+    def _list_profiles(self, limit, entity_type, is_ai):
         conn = self._connect()
         try:
+            sql = "SELECT * FROM user_profiles"
+            conds, args = [], []
             if entity_type:
-                rows = conn.execute("SELECT * FROM user_profiles WHERE entity_type=? ORDER BY last_interaction DESC LIMIT ?",
-                                    (entity_type, limit)).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM user_profiles ORDER BY last_interaction DESC LIMIT ?", (limit,)).fetchall()
+                conds.append("entity_type=?")
+                args.append(entity_type)
+            if is_ai is not None:
+                conds.append("is_ai=?")
+                args.append(1 if is_ai else 0)
+            if conds:
+                sql += " WHERE " + " AND ".join(conds)
+            sql += " ORDER BY last_interaction DESC LIMIT ?"
+            args.append(limit)
+            rows = conn.execute(sql, args).fetchall()
             return [self._normalize_profile(dict(r)) for r in rows]
         finally:
             conn.close()

@@ -1152,6 +1152,75 @@ class AlifeMemoryPlugin(BasePlugin):
         except Exception as exc:
             logger.warning("[alife_memory] 生成画像失败 %s: %s", entity_id, exc)
 
+    async def _ensure_self_profile(self, self_id: str) -> None:
+        """确保 bot 自己（self）有画像。bot 是插件宿主 AI，记她自己的设定/性格/身份。
+
+        entity_type='self'，独立于 user/group，因为她不是'用户'也不是'群'。
+        若记忆里暂无足够信息，先落一个骨架（后续压缩/画像生成会持续填充）。
+        """
+        if not self_id:
+            return
+        if getattr(self, "_self_profiled", False):
+            return
+        self._self_profiled = True  # 每实例只尝试一次，避免每轮探测
+        try:
+            existing = await self.store.get_profile(self_id)
+            if existing:
+                # 已有骨架但类型被误判为 user → 升级为 self
+                if existing.get("entity_type") not in ("self",):
+                    await self.store.upsert_profile(self_id, "self",
+                                                    entity_type="self",
+                                                    description=existing.get("description") or "（bot 自己——插件宿主 AI）")
+                return
+            # 尝试用关于 bot 的记忆生成画像；没有就用骨架
+            profile = None
+            try:
+                profile = await self._generate_profile(self_id, "self")
+            except Exception:
+                profile = None
+            if profile is None:
+                await self.store.upsert_profile(self_id, "self",
+                                                name="", nickname="", description="（bot 自己——插件宿主 AI）",
+                                                traits=[], preferences={}, facts=[], aliases=[],
+                                                generated_from="auto:first_seen")
+                logger.info("[alife_memory] 已创建 bot 自己(self)画像骨架: %s", self_id)
+        except Exception as exc:
+            logger.warning("[alife_memory] 创建 self 画像失败 %s: %s", self_id, exc)
+
+    @staticmethod
+    def _infer_is_ai(profile: dict) -> bool | None:
+        """从画像内容启发式判断该实体是否为 AI（有明确证据返回 True/False，否则 None）。
+
+        有证据链才判：traits/facts/description 中明确出现 AI/机器人/桌宠/虚拟等自述词。
+        无证据返回 None（未知），宁可留空也不瞎猜——避免把真人标记为 AI。
+        """
+        hay = []
+        for k in ("traits", "facts"):
+            v = profile.get(k) or []
+            for item in v:
+                if isinstance(item, str):
+                    hay.append(item)
+                elif isinstance(item, dict):
+                    hay.append(str(item.get("trait", item.get("fact", ""))))
+        hay.append(str(profile.get("description", "") or ""))
+        hay_text = " ".join(hay)
+        # 顺序关键：先查明确否认（"不是AI"/"不是机器人"/"真人"），再查确认词。
+        # 若先查"是AI"会把"不是AI"里的子串"是AI"误判为 AI。
+        human_words = ("人类", "我是真人", "真人玩家", "活人", "不是AI", "不是机器人", "人类用户", "非AI", "并非AI", "真人")
+        strong_ai = ("是AI", "是机器人", "是个AI", "同为AI", "也是AI", "AI角色", "AI桌宠", "是桌宠",
+                     "我是AI", "本人是AI", "bot", "虚拟角色", "聊天机器人", "人工智能")
+        for w in human_words:
+            if w.lower() in hay_text.lower():
+                return False
+        for w in strong_ai:
+            if w.lower() in hay_text.lower():
+                return True
+        # 弱词（"机器人"等）单独出现且有 AI 上下文才判
+        for w in ("机器人", "AI", "桌宠", "NPC", "模型"):
+            if w.lower() in hay_text.lower():
+                return True
+        return None
+
     async def _generate_profile(self, entity_id: str, entity_type: str = "user") -> dict | None:
         """从该实体的记忆聚合并由 LLM 生成结构化画像，落库。"""
         memories = await self.store.list_memories_by_entity(entity_id, 200)
@@ -1189,7 +1258,13 @@ class AlifeMemoryPlugin(BasePlugin):
             "generated_from": ",".join(m["id"] for m in cand[:40]),
             "memory_type": entity_type,
         }
-        await self.store.upsert_profile(entity_id, entity_type, **profile)
+        # AI 身份标记：LLM 明确输出 is_ai 优先，否则启发式从内容判断（有证据才标）
+        if isinstance(result.get("is_ai"), bool):
+            profile["is_ai"] = result.get("is_ai")
+        else:
+            profile["is_ai"] = self._infer_is_ai(profile)
+        upsert_fields = {k: v for k, v in profile.items() if k not in ("entity_id", "entity_type")}
+        await self.store.upsert_profile(entity_id, entity_type, **upsert_fields)
         for rel in profile.get("relationships", []):
             if isinstance(rel, dict) and rel.get("target_id") and rel.get("relation"):
                 await self.store.upsert_relationship(entity_id, str(rel["target_id"]), str(rel["relation"]),
@@ -1448,6 +1523,15 @@ class AlifeMemoryPlugin(BasePlugin):
         if not text:
             return
         messages = getattr(event, "messages", []) or []
+        # 探测 bot 自己 ID（KiraIMMessage.self_id 即 bot 自身），首次见到创建 self 画像
+        try:
+            for item in messages:
+                self_id = str(getattr(item, "self_id", "") or "")
+                if self_id:
+                    self._track(self._ensure_self_profile(self_id))
+                    break
+        except Exception:
+            pass
         user_messages = []
         for index, item in enumerate(messages):
             role = getattr(item, "role", None) or (item.get("role") if isinstance(item, dict) else "") or "user"
@@ -1854,8 +1938,14 @@ class AlifeMemoryPlugin(BasePlugin):
             _num(limit, 100, 1, 500, True))
 
     @register.api(method="GET", path="/profiles", auth=True, summary="List entity profiles")
-    async def api_profiles(self, limit: int = 100, entity_type: str | None = None):
-        return await self.store.list_profiles(_num(limit, 100, 1, 500, True), entity_type or None)
+    async def api_profiles(self, limit: int = 100, entity_type: str | None = None, is_ai: str | None = None):
+        """is_ai=1 只看 AI 用户；is_ai=0 只看真人；不传看全部。"""
+        is_ai_val = None
+        if is_ai in ("1", "true", "yes"):
+            is_ai_val = True
+        elif is_ai in ("0", "false", "no"):
+            is_ai_val = False
+        return await self.store.list_profiles(_num(limit, 100, 1, 500, True), entity_type or None, is_ai_val)
 
     @register.api(method="GET", path="/profile/{entity_id}", auth=True, summary="Get one profile")
     async def api_profile(self, entity_id: str):
@@ -1867,8 +1957,10 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @register.api(method="POST", path="/profile/{entity_id}/regenerate", auth=True, summary="Regenerate a profile")
     async def api_profile_regenerate(self, entity_id: str):
-        p = await self._generate_profile(entity_id, "user")
-        return {"ok": bool(p)}
+        existing = await self.store.get_profile(entity_id)
+        etype = (existing or {}).get("entity_type") or "user"
+        p = await self._generate_profile(entity_id, etype)
+        return {"ok": bool(p), "entity_type": etype}
 
     @register.api(method="GET", path="/memory/{memory_id}", auth=True, summary="Get memory")
     async def api_memory(self, memory_id: str):
