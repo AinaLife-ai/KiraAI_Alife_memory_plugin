@@ -1469,13 +1469,17 @@ class AlifeMemoryPlugin(BasePlugin):
     @register.api(method="GET", path="/status", auth=True, summary="Memory status")
     async def api_status(self):
         result = await self.store.stats()
+        # 画像/关系统计（批次 B）
+        profiles = await self.store.list_profiles(10000)
+        rels = await asyncio.to_thread(self.store._list_relationships, None, None)
         result.update({"enabled": self.enabled, "capture_enabled": self.capture_enabled, "auto_inject": self.auto_inject,
                        "passive_recall": self.passive_recall, "workers": len(self._workers),
                        "reflection": self.reflect_enabled, "trigger_mode": self.trigger_mode,
                        "round_threshold": self.round_threshold, "token_threshold": self.token_threshold,
                        "message_threshold": self.message_threshold,
                        "max_level": self.max_level, "auto_archive_days": self.auto_archive_days,
-                       "archive_level_min": self.archive_level_min})
+                       "archive_level_min": self.archive_level_min,
+                       "profiles": len(profiles), "relationships": len(rels) if isinstance(rels, list) else 0})
         return result
 
     @register.api(method="GET", path="/pending", auth=True, summary="Pending compression stats")
@@ -1485,8 +1489,29 @@ class AlifeMemoryPlugin(BasePlugin):
                 "message_count": pending.get("message_count", 0)}
 
     @register.api(method="GET", path="/memories", auth=True, summary="List memories")
-    async def api_memories(self, sid: str | None = None, limit: int = 100):
-        return await self.store.list_memories(sid or None, _num(limit, 100, 1, 500, True))
+    async def api_memories(self, sid: str | None = None, limit: int = 100,
+                           level: int | None = None, memory_type: str | None = None,
+                           tag: str | None = None, user_id: str | None = None):
+        return await self.store.list_memories_filtered(
+            sid or None, level, memory_type, tag, user_id,
+            _num(limit, 100, 1, 500, True))
+
+    @register.api(method="GET", path="/profiles", auth=True, summary="List entity profiles")
+    async def api_profiles(self, limit: int = 100, entity_type: str | None = None):
+        return await self.store.list_profiles(_num(limit, 100, 1, 500, True), entity_type or None)
+
+    @register.api(method="GET", path="/profile/{entity_id}", auth=True, summary="Get one profile")
+    async def api_profile(self, entity_id: str):
+        return await self.store.get_profile(entity_id) or {"error": "not found"}
+
+    @register.api(method="GET", path="/relationships", auth=True, summary="List relationship graph")
+    async def api_relationships(self, entity_id: str | None = None, target_id: str | None = None):
+        return await self.store.list_relationships(entity_id or None, target_id or None)
+
+    @register.api(method="POST", path="/profile/{entity_id}/regenerate", auth=True, summary="Regenerate a profile")
+    async def api_profile_regenerate(self, entity_id: str):
+        p = await self._generate_profile(entity_id, "user")
+        return {"ok": bool(p)}
 
     @register.api(method="GET", path="/memory/{memory_id}", auth=True, summary="Get memory")
     async def api_memory(self, memory_id: str):

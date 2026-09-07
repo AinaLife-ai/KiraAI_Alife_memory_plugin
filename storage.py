@@ -816,6 +816,47 @@ class MemoryStore:
         finally:
             conn.close()
 
+    async def list_memories_filtered(self, sid: str | None = None, level: int | None = None,
+                                     memory_type: str | None = None, tag: str | None = None,
+                                     user_id: str | None = None, limit: int = 100) -> list[dict]:
+        """按维度筛选记忆（WebUI 五维查看用）。支持 sid/level/memory_type/tag/user_id 组合。"""
+        return await asyncio.to_thread(self._list_memories_filtered, sid, level, memory_type, tag, user_id, limit)
+
+    def _list_memories_filtered(self, sid, level, memory_type, tag, user_id, limit):
+        conn = self._connect()
+        try:
+            where = ["deleted=0"]
+            params: list = []
+            if sid:
+                where.append("m.sid=?")
+                params.append(sid)
+            if level:
+                where.append("m.level=?")
+                params.append(level)
+            if memory_type:
+                where.append("m.memory_type=?")
+                params.append(memory_type)
+            if user_id:
+                where.append("(m.user_id=? OR m.entity_id=?)")
+                params.extend([user_id, user_id])
+            if tag:
+                # 通过 memories_tags 索引表筛标签
+                tag_sql = ("SELECT mid FROM memories_tags WHERE tag=?")
+                rows = conn.execute(
+                    f"SELECT m.* FROM memories m WHERE {' AND '.join(where)} AND m.id IN ({tag_sql}) "
+                    "ORDER BY m.end_ts DESC LIMIT ?",
+                    [*params, tag, limit]).fetchall()
+            else:
+                rows = conn.execute(
+                    f"SELECT m.* FROM memories m WHERE {' AND '.join(where)} ORDER BY m.end_ts DESC LIMIT ?",
+                    [*params, limit]).fetchall()
+            result = []
+            for row in rows:
+                result.append(_normalize_item(dict(row)))
+            return result
+        finally:
+            conn.close()
+
     async def get_memory(self, memory_id: str) -> dict[str, Any] | None:
         return await asyncio.to_thread(self._get_memory, memory_id)
 
