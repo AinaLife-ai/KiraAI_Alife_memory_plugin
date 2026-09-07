@@ -1100,6 +1100,51 @@ class AlifeMemoryPlugin(BasePlugin):
             lines.append("  事实：" + "；".join(str(f)[:60] for f in p["facts"][:8]))
         return "\n".join(lines)
 
+    async def _collect_profile_blocks(self, query: str, user_id: str, req, extra_entities: list[str] | None = None) -> list[str]:
+        """收集需注入的画像块：当前用户 + query 中提及的关联实体 + 首次见的新用户（上限 profile_inject_max）。"""
+        profile_blocks: list[str] = []
+        cur_entity = user_id or _event_user_id(getattr(req, "messages", [])[-1] if getattr(req, "messages", []) else None)
+        if cur_entity:
+            # 首次见 → 记录并确保画像
+            self._seen_profiles = getattr(self, "_seen_profiles", {})
+            if cur_entity not in self._seen_profiles:
+                await self._ensure_profile(cur_entity, "user")
+                self._seen_profiles[cur_entity] = True
+            pb = await self._format_profile_block(cur_entity, "画像")
+            if pb:
+                profile_blocks.append(pb)
+        # 首次见的新用户画像（被动召回时优先带上"这个人是谁"）
+        for eid in (extra_entities or [])[:getattr(self, "profile_inject_max", 3)]:
+            if not eid or eid == cur_entity:
+                continue
+            try:
+                pb = await self._format_profile_block(eid, "画像:关联")
+            except Exception:
+                pb = None
+            if pb:
+                profile_blocks.append(pb)
+                if len(profile_blocks) >= getattr(self, "profile_inject_max", 3) + 1:
+                    break
+        # 扫码提取提及的关联实体（从 query 中出现的已知实体 id/名字/昵称）
+        pmax = getattr(self, "profile_inject_max", 3)
+        if pmax and pmax > 0 and len(profile_blocks) < pmax + 1:
+            known = await self.store.list_profiles(pmax + 8)
+            seen_entities = set()
+            for kp in known:
+                eid = kp.get("entity_id", "")
+                if not eid or eid == cur_entity or eid in seen_entities:
+                    continue
+                match_keys = [eid] + [str(kp.get("name", "")) for _x in (1,)] + [str(kp.get("nickname", ""))]
+                match_keys = [k for k in match_keys if k]
+                if any(k and k != cur_entity and k in str(query) for k in match_keys):
+                    seen_entities.add(eid)
+                    pb = await self._format_profile_block(eid, "画像:关联")
+                    if pb:
+                        profile_blocks.append(pb)
+                    if len(profile_blocks) >= pmax + 1:
+                        break
+        return profile_blocks
+
     async def _inject(self, sid: str, req: LLMRequest, user_id: str = "", recall_user_ids: list[str] | None = None,
                      do_passive_update: bool = False):
         if not self.auto_inject:
@@ -1181,6 +1226,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 logger.debug("[alife_memory] 关键词召回池: %d 词 → +%d 条", len(recall_terms), len(seen_ids))
 
         # 3) 首次见到用户召回（per-session：仅当该会话还没召回过这个用户的记忆）
+        new_user_ids: list[str] = []
         if self.passive_recall and recall_user_ids:
             new_uids = [u for u in recall_user_ids if u and u != user_id]
             if new_uids:
@@ -1190,12 +1236,15 @@ class AlifeMemoryPlugin(BasePlugin):
                         r["score"] = 0.3
                         all_results.append(r)
                         seen_ids.add(r["id"])
+                new_user_ids = new_uids
                 logger.debug("[alife_memory] 被动召回: %d 个新用户 → 补 %d 条跨会话记忆", len(new_uids), len(seen_ids))
 
-        if not all_results:
-            return
+        # 不再因无记忆命中就提前 return：让画像注入也能执行（画像可能独立存在）。
+        # 末尾有 "if not lines and not profile_blocks: return" 兜底。
 
         # 排序后重排序（如有配置）
+        if not all_results:
+            all_results = []
         all_results.sort(key=lambda x: (x.get("score", 0.0), x.get("importance", 0.0)), reverse=True)
         reranked = await self._rerank(str(query), all_results[:self.retrieval_top_k * 3])
         if reranked is not all_results[:self.retrieval_top_k * 3]:
@@ -1225,45 +1274,23 @@ class AlifeMemoryPlugin(BasePlugin):
             item_budget -= 1
             token_budget -= cost
             char_budget -= char_cost
-        if not lines:
-            return
         # 画像注入（批次 B）：当前用户画像 + 提及的关联实体（上限 profile_inject_max）
+        # 独立于记忆注入——即使本轮无记忆命中，只要有当前用户/关联实体画像，也注入
         profile_blocks: list[str] = []
         if getattr(self, "profile_inject", True) and getattr(self, "profile_enabled", True):
-            # 当前实体（user_id 或按会话取第一个用户）
-            cur_entity = user_id or _event_user_id(getattr(req, "messages", [])[-1] if getattr(req, "messages", []) else None)
-            if cur_entity:
-                # 首次见 → 记录并确保画像
-                self._seen_profiles = getattr(self, "_seen_profiles", {})
-                if cur_entity not in self._seen_profiles:
-                    await self._ensure_profile(cur_entity, "user")
-                    self._seen_profiles[cur_entity] = True
-                pb = await self._format_profile_block(cur_entity, "画像")
-                if pb:
-                    profile_blocks.append(pb)
-            # 扫码提取提及的关联实体（从 query 中出现的已知实体 id/名字/昵称）
-            pmax = getattr(self, "profile_inject_max", 3)
-            if pmax and pmax > 0:
-                known = await self.store.list_profiles(pmax + 8)
-                seen_entities = set()
-                for kp in known:
-                    eid = kp.get("entity_id", "")
-                    if not eid or eid == cur_entity or eid in seen_entities:
-                        continue
-                    # 匹配实体 id 或其名字/昵称是否出现在 query 中
-                    match_keys = [eid] + [str(kp.get("name", "")) for _k in (1,)] + [str(kp.get("nickname", ""))]
-                    match_keys = [k for k in match_keys if k]
-                    if any(k and k != cur_entity and k in str(query) for k in match_keys):
-                        seen_entities.add(eid)
-                        pb = await self._format_profile_block(eid, "画像:关联")
-                        if pb:
-                            profile_blocks.append(pb)
-                        if len(profile_blocks) >= pmax + 1:
-                            break
-        block = ("你曾经的一些记忆：\n" + "\n".join(lines) +
-                 '\n（完整的记忆细节可通过 search_long_term_memory 工具检索）')
+            profile_blocks = await self._collect_profile_blocks(query, user_id, req, extra_entities=new_user_ids)
+
+        if not lines and not profile_blocks:
+            return
+
+        block_parts = []
+        if lines:
+            block_parts.append("你曾经的一些记忆：\n" + "\n".join(lines) +
+                               '\n（完整的记忆细节可通过 search_long_term_memory 工具检索）')
         if profile_blocks:
-            block += "\n\n" + "\n\n".join(profile_blocks) + "\n（以上是相关人物/实体的画像，帮助你记住这些人的身份和关系）"
+            block_parts.append("\n\n".join(profile_blocks) +
+                               "\n（以上是相关人物/实体的画像，帮助你记住这些人的身份和关系）")
+        block = "\n\n".join(block_parts)
         system_msg = OpenAIMessage(role="system", content=block)
         req.messages.insert(0, system_msg)
         logger.debug("[alife_memory] 注入完成: %d 条记忆 + %d 画像块, 约 %d tokens", len(lines), len(profile_blocks), self.max_injected_tokens - token_budget)
@@ -1552,7 +1579,32 @@ class AlifeMemoryPlugin(BasePlugin):
         for u in users:
             ts = time.strftime('%Y-%m-%d', time.localtime(u["last_ts"])) if u["last_ts"] else "未知"
             max_lv = u.get("max_level") or 1
-            out.append(f"\n- {u['user_id']} | {u['cnt']} 条记忆 | 最高层 L{max_lv} | 最近 {ts}")
+            # 并入画像（简洁）：名字（昵称）[QQ号] · 描述 · 关键特质/偏好（各截断，避免 token 爆炸）
+            profile = None
+            try:
+                profile = await self.store.get_profile(u['user_id'])
+            except Exception:
+                profile = None
+            head = f"\n- {u['user_id']} | {u['cnt']} 条记忆 | 最高层 L{max_lv} | 最近 {ts}"
+            if profile:
+                name = str(profile.get("name") or "")
+                nick = str(profile.get("nickname") or "")
+                desc = str(profile.get("description") or "")
+                label = (name + (f"（{nick}）" if nick and nick != name else "") + f"[{u['user_id']}]") if name else u['user_id']
+                # 画像概述一行
+                extra = ""
+                if desc:
+                    extra += desc[:50]
+                # 特质（前3） + 偏好（前3条），简洁
+                traits = [str(t) for t in (profile.get("traits") or []) if str(t)][:5]
+                prefs = profile.get("preferences") or {}
+                pref_items = [f"{k}→{v}" for k, v in list(prefs.items())[:3]] if isinstance(prefs, dict) else []
+                if traits:
+                    extra += (" · " + "、".join(traits)) if extra else "特质：" + "、".join(traits)
+                if pref_items:
+                    extra += (" · " + "；".join(pref_items)) if extra else "偏好：" + "；".join(pref_items)
+                head = f"\n- {label} | {u['cnt']} 条记忆" + (f" | {extra[:120]}" if extra else "")
+            out.append(head)
             # 最高权重×层级的那条
             if u.get("top_summary"):
                 out.append(f"  ★ 高权重: L{u.get('top_level',1)} 重要{u.get('top_importance',0.0):.2f} → {u['top_summary'][:90]}")
@@ -1567,6 +1619,32 @@ class AlifeMemoryPlugin(BasePlugin):
             out.append(f"\n… 还有 {total - len(users)} 个用户未显示（可增大 limit 查看）")
         return "\n".join(out)
 
+    async def _format_full_profile(self, entity_id: str) -> str | None:
+        """完整画像格式化（查单用户用）：描述/特质/偏好/关系/事实/别名，全量给 bot 深入了解。"""
+        p = await self.store.get_profile(entity_id)
+        if not p:
+            return None
+        name = str(p.get("name") or "") or entity_id
+        nick = str(p.get("nickname") or "")
+        parts = [f"{name}" + (f"（{nick}）" if nick and nick != name else "")]
+        if p.get("description"):
+            parts.append(f"概述：{p['description']}")
+        if p.get("traits"):
+            parts.append("特质：" + "；".join(str(t) for t in p["traits"]))
+        if p.get("preferences") and isinstance(p["preferences"], dict):
+            parts.append("偏好：" + "；".join(f"{k}→{v}" for k, v in p["preferences"].items()))
+        if p.get("relationships"):
+            rels = [str(r.get("target_id", "")) + "→" + str(r.get("relation", "")) for r in p["relationships"] if isinstance(r, dict)]
+            if rels:
+                parts.append("关系：" + "；".join(rels))
+        if p.get("facts"):
+            parts.append("事实：" + "；".join(str(f) for f in p["facts"]))
+        if p.get("aliases"):
+            aliases = [str(a) for a in p["aliases"] if str(a)]
+            if aliases:
+                parts.append("别名：" + "、".join(aliases[:6]))
+        return "\n".join(parts)
+
     @register.tool(
         name="list_user_memories",
         description="精确列出某个用户（指定 user_id）的全部记忆，跨会话。按重要性×层级优先，兼顾最近。当你要回忆某个具体用户的相关事情时使用，比笼统检索更准。",
@@ -1574,17 +1652,37 @@ class AlifeMemoryPlugin(BasePlugin):
     async def list_user_memories(self, event: KiraMessageBatchEvent, user_id: str, limit: int | None = None) -> str:
         total = await self.store.count_memories_by_user(user_id)
         if total == 0:
+            # 无记忆也可能有画像 → 给完整画像（即使没记忆也告诉 bot 这人是谁）
+            profile_text = await self._format_full_profile(user_id)
+            if profile_text:
+                return f"用户 {user_id} 目前没有记忆，但他的画像：\n{profile_text}"
             return f"没有找到用户 {user_id} 的记忆。"
         shown = _num(limit, self.memory_list_limit, 1, 200, True) if limit is not None else self.memory_list_limit
         memories = await self.store.list_memories_by_user(user_id, shown)
-        out = [f"用户 {user_id} 共有 {total} 条记忆（显示前 {len(memories)} 条，按重要性×层级排序）："]
+        out = []
+        # 完整画像（查单用户 → 给 bot 深入了解的机会）
+        profile_text = await self._format_full_profile(user_id)
+        if profile_text:
+            out.append(f"这是{user_id}的画像：\n{profile_text}")
+        out.append(f"\n他{user_id if total==0 else ''}共有 {total} 条记忆（显示前 {len(memories)} 条）：")
         for m in memories:
             t = time.strftime('%Y-%m-%d', time.localtime(m["end_ts"]))
             conf = m.get("confidence", 0.65)
-            out.append(f"\n- L{m['level']} | 重要{m.get('importance', 0.5):.2f} | 置信{conf*100:.0f}% | {t} | {m['summary']}")
+            mtype = m.get("memory_type") or "日常事件"
+            out.append(f"\n- L{m['level']} [{mtype}] | 重要{m.get('importance', 0.5):.2f} | 置信{conf*100:.0f}% | {t} | {m['summary']}")
         if total > len(memories):
             out.append(f"\n… 还有 {total - len(memories)} 条未显示（可增大 limit 查看）")
         return "\n".join(out)
+
+    @register.tool(
+        name="get_user_profile",
+        description="查某个用户/实体的完整画像（性格、偏好、关系、关键事实、别名），了解这个人是谁。当你想深入了解某人或回忆他的资料时使用，比翻记忆更集中。",
+        params={"type": "object", "properties": {"user_id": {"type": "string", "description": "要查询的用户/实体标识，可通过 list_users 获取"}}, "required": ["user_id"]})
+    async def get_user_profile(self, event: KiraMessageBatchEvent, user_id: str) -> str:
+        profile_text = await self._format_full_profile(user_id)
+        if not profile_text:
+            return f"还没有关于 {user_id} 的画像（可能记忆还不够，仍在积累中）。"
+        return f"这是{user_id}的画像：\n{profile_text}"
 
     @register.tool(
         name="list_session_memories",

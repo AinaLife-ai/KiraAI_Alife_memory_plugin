@@ -1248,11 +1248,15 @@ class MemoryStore:
     def _list_users(self, limit):
         conn = self._connect()
         try:
+            now = time.time()
             rows = conn.execute(
-                "SELECT user_id, COUNT(*) AS cnt, MAX(end_ts) AS last_ts, MAX(level) AS max_level "
+                "SELECT user_id, COUNT(*) AS cnt, MAX(end_ts) AS last_ts, MAX(level) AS max_level, "
+                "MAX(importance) AS max_importance "
                 "FROM memories WHERE deleted=0 AND user_id != '' AND status='active' "
-                "GROUP BY user_id ORDER BY cnt DESC, last_ts DESC LIMIT ?",
-                (limit,)
+                "GROUP BY user_id "
+                "ORDER BY (MAX(importance)*0.5 + (1.0/(1.0+MAX(0.0,(?-MAX(end_ts))/86400.0)))*0.3 "
+                "         + (COUNT(*)*1.0/(COUNT(*)+10.0))*0.2) DESC LIMIT ?",
+                (now, limit)
             ).fetchall()
             result = []
             for row in rows:
