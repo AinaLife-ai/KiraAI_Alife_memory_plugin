@@ -102,6 +102,42 @@ def _norm_mt(mt: str) -> str:
     return en.get(mt.lower(), "日常事件")
 
 
+# Simple Memory 迁移用的启发式类型/标签推断（core.txt 是纯文本逐行，无元数据，只能从内容判断）
+_SIMPLE_ENT_KW = ("是", "职业", "工作", "公司", "学校", "专业", "性格", "名字", "身份", "背景", "博士", "硕士", "教师", "医生", "学生")
+_SIMPLE_PREF_KW = ("喜欢", "讨厌", "爱", "爱吃", "习惯", "不习惯", "愿意", "不愿意", "偏好", "爱好", "忌口", "喜欢看", "爱看", "口味", "睡觉", "熬夜", "作息", "喜欢喝", "喜欢穿", "喜欢用", "上班", "下班")
+_SIMPLE_TASK_KW = ("正在", "打算", "计划", "项目", "截止", "明天", "后天", "要做", "任务", "记得", "约定", "安排", "下周", "月底", "完成")
+_SIMPLE_REL_KW = ("朋友", "主人", "妹妹", "姐姐", "哥哥", "女友", "男友", "恋人", "家人", "同事", "搭档", "家人", "抚养", "关系", "情侣", "兄弟", "爸爸", "妈妈")
+
+
+def _infer_simple_memory_type(text: str) -> str:
+    """从纯文本启发式推断 memory_type（Simple Memory 无元数据）。
+    优先级：实体 > 约定 > 偏好 > 关系 > 日常。"""
+    t = (text or "").lower()
+    # 身份/职业背景 → 关于实体（但避免把"是"误判所有含是的句子）
+    if any(k in t for k in ("职业", "公司", "学校", "专业", "性格", "身份", "背景", "博士", "硕士", "教师", "医生", "学生")):
+        return "关于实体"
+    if any(k in t for k in _SIMPLE_TASK_KW):
+        return "约定任务"
+    if any(k in t for k in _SIMPLE_PREF_KW):
+        return "偏好风格"
+    if any(k in t for k in _SIMPLE_REL_KW):
+        return "关系网络"
+    return "日常事件"
+
+
+def _infer_simple_memory_tags(text: str) -> list[str]:
+    """从纯文本启发式打少量标签（Simple Memory 无 tags）。"""
+    tags = []
+    t = (text or "")
+    if any(k in t for k in _SIMPLE_PREF_KW):
+        tags.append("偏好")
+    if any(k in t for k in ("项目", "计划", "截止", "任务", "约定", "安排")):
+        tags.append("约事")
+    if any(k in t for k in ("朋友", "主人", "家人", "女友", "男友", "恋人", "妹妹", "姐姐", "哥哥", "同事", "抚养", "情侣", "兄弟", "爸爸", "妈妈")):
+        tags.append("关系")
+    return tags
+
+
 def _norm_clamp(v, lo: float, hi: float, default: float) -> float:
     try:
         f = float(v)
@@ -469,15 +505,18 @@ class AlifeMemoryPlugin(BasePlugin):
             data_root = Path(get_data_path())
 
             if plugin_id == "kira_plugin_simple_memory":
-                # Simple Memory: data/memory/core.txt，单文件逐行
+                # Simple Memory: data/memory/core.txt，单文件逐行（纯文本，无元数据/标签/时间）
                 core_txt = data_root / "memory" / "core.txt"
                 if core_txt.exists():
                     logger.info("[alife_memory] 发现 Simple Memory 数据文件: %s，正在迁移……", core_txt)
                     raw_text = await asyncio.to_thread(lambda: core_txt.read_text(encoding="utf-8", errors="replace"))
                     lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
                     if lines:
-                        now = time.time()
-                        # 迁移只导入文本 + 元数据，不计算向量（避免卡顿/白忙/依赖向量模型）
+                        # 用文件修改时间近似这批记忆的时间（core.txt 无逐条时间戳）
+                        try:
+                            file_mtime = await asyncio.to_thread(lambda: core_txt.stat().st_mtime)
+                        except Exception:
+                            file_mtime = time.time()
                         rows = []
                         for line in lines:
                             if len(line) > 120:
@@ -485,11 +524,14 @@ class AlifeMemoryPlugin(BasePlugin):
                             content_stripped = line
                             rows.append({
                                 "sid": "system", "level": 3, "summary": content_stripped[:100],
-                                "content": content_stripped, "start_ts": now, "end_ts": now,
+                                "content": content_stripped, "start_ts": file_mtime, "end_ts": file_mtime,
                                 "source_ids": [], "importance": 0.5, "embedding": None,
-                                "user_id": "", "source_fingerprint": hashlib.sha256(("simple_memory_import|" + content_stripped).encode()).hexdigest()[:32],
-                                "source_refs": [{"sid": "simple_memory_import", "user_id": "", "ts": now,
-                                                 "action": "从Simple Memory自动迁移，原始文件保留未清理"}],
+                                "user_id": "", "memory_type": _infer_simple_memory_type(content_stripped),
+                                "tags": _infer_simple_memory_tags(content_stripped),
+                                "entity_id": "",
+                                "source_fingerprint": hashlib.sha256(("simple_memory_import|" + content_stripped).encode()).hexdigest()[:32],
+                                "source_refs": [{"sid": "simple_memory_import", "user_id": "", "ts": file_mtime,
+                                                 "action": "从Simple Memory自动迁移（core.txt 纯文本，无 标签/时间 元数据，时间为文件修改时间）"}],
                             })
                         count = await self.store.add_memories_batch(rows)
                         if count:
