@@ -257,6 +257,12 @@ class AlifeMemoryPlugin(BasePlugin):
         # archive_level_min 默认 = max_level（最高层保护，其余层级可归档）
         # 必须在 max_level 已赋值后才设置
         self.archive_level_min = _num(basic.get("archive_level_min", self.max_level), 1, 1, 12, True)
+        # 用户画像（批次 B）：是否启用画像生成/注入
+        self.profile_enabled = bool(basic.get("profile_enabled", True))
+        self.profile_inject = bool(basic.get("profile_inject", True))
+        self.profile_inject_max = _num(basic.get("profile_inject_max", 3), 3, 0, 6, True)
+        self.profile_generate_model = str(basic.get("profile_generate_model", "") or "").strip()
+        self.profile_gen_trigger = _num(basic.get("profile_gen_trigger", 5), 5, 1, 50, True)  # 某实体累计多少条记忆触发一次画像生成
 
     @staticmethod
     def _default_compress_prompt():
@@ -874,6 +880,82 @@ class AlifeMemoryPlugin(BasePlugin):
                         scenario=ci.get("scenario", memory.get("scenario", "")),
                         entity_id=ci.get("entity_id", memory.get("entity_id", "")))
 
+    # ---- 画像（批次 B）----
+    async def _ensure_profile(self, entity_id: str, entity_type: str = "user") -> None:
+        """确保某实体有画像。若不存在，用其记忆聚合并由 LLM 生成画像。"""
+        if not getattr(self, "profile_enabled", True) or not entity_id:
+            return
+        profile = await self.store.get_profile(entity_id)
+        if profile:
+            return
+        try:
+            await self._generate_profile(entity_id, entity_type)
+        except Exception as exc:
+            logger.warning("[alife_memory] 生成画像失败 %s: %s", entity_id, exc)
+
+    async def _generate_profile(self, entity_id: str, entity_type: str = "user") -> dict | None:
+        """从该实体的记忆聚合并由 LLM 生成结构化画像，落库。"""
+        memories = await self.store.list_memories_by_entity(entity_id, 200)
+        if not memories:
+            return None
+        cand = [m for m in memories if m.get("status") == "active"][:60]
+        if not cand:
+            return None
+        snippet = "\n".join(
+            f"- [{m.get('memory_type','日常事件')}] {m['summary']} | 来源:{m.get('sid','')} 时间:{time.strftime('%Y-%m-%d', time.localtime(m['end_ts']))}"
+            for m in cand)
+        prompt = (
+            f"你是用户画像提炼师。根据下面的记忆片段，提炼出实体「{entity_id}」（类型:{entity_type}）的结构化画像。\n"
+            "只输出 JSON，不要 Markdown：{\"name\":\"\",\"nickname\":\"\",\"description\":\"一句话画像概述\","
+            "\"traits\":[\"特质，如：关系_莎娜: 莎娜的主人\"],\"preferences\":{\"偏好键\":\"值\"},"
+            "\"relationships\":[{\"target_id\":\"对象\",\"relation\":\"关系\",\"confidence\":0.9}],"
+            "\"facts\":[\"关键事实\"],\"aliases\":[\"别名\"]}\n"
+            "traits 是稳定特质/角色；preferences 是喜好/习惯/禁止项；relationships 是与其他实体（人或AI）的关系；facts 是关键事实。\n"
+            "只基于给定记忆提炼，不要臆测。每条画像信息应能在记忆里找到依据。\n记忆片段：\n{snippet}"
+        ).replace("{snippet}", snippet)
+        result = await self._llm_json(prompt, self.profile_generate_model or "")
+        if not isinstance(result, dict):
+            return None
+        profile = {
+            "entity_id": entity_id, "entity_type": entity_type,
+            "name": str(result.get("name", "") or ""),
+            "nickname": str(result.get("nickname", "") or ""),
+            "description": str(result.get("description", "") or ""),
+            "traits": result.get("traits") if isinstance(result.get("traits"), list) else [],
+            "preferences": result.get("preferences") if isinstance(result.get("preferences"), dict) else {},
+            "relationships": result.get("relationships") if isinstance(result.get("relationships"), list) else [],
+            "facts": result.get("facts") if isinstance(result.get("facts"), list) else [],
+            "aliases": result.get("aliases") if isinstance(result.get("aliases"), list) else [],
+            "platform": str(result.get("platform", "") or ""),
+            "generated_from": ",".join(m["id"] for m in cand[:40]),
+            "memory_type": entity_type,
+        }
+        await self.store.upsert_profile(entity_id, entity_type, **profile)
+        for rel in profile.get("relationships", []):
+            if isinstance(rel, dict) and rel.get("target_id") and rel.get("relation"):
+                await self.store.upsert_relationship(entity_id, str(rel["target_id"]), str(rel["relation"]),
+                                                     source_mid=profile.get("generated_from", ""),
+                                                     confidence=float(rel.get("confidence", 0.7)))
+        logger.info("[alife_memory] 已生成画像 %s: %d traits / %d relations", entity_id,
+                    len(profile.get("traits", [])), len(profile.get("relationships", [])))
+        return profile
+
+    async def _format_profile_block(self, entity_id: str, scoped: str = "画像") -> str | None:
+        """格式化某实体画像为注入块文本。"""
+        p = await self.store.get_profile(entity_id)
+        if not p or not (p.get("description") or p.get("traits") or p.get("preferences") or p.get("facts")):
+            return None
+        lines = [f"[{scoped}:{entity_id}] {p.get('description', '')}".strip()]
+        if p.get("traits"):
+            lines.append("  特质：" + "；".join(str(t) for t in p["traits"][:8]))
+        if p.get("preferences"):
+            prefs = p["preferences"]
+            if isinstance(prefs, dict):
+                lines.append("  偏好：" + "；".join(f"{k}→{v}" for k, v in list(prefs.items())[:10]))
+        if p.get("facts"):
+            lines.append("  事实：" + "；".join(str(f)[:60] for f in p["facts"][:8]))
+        return "\n".join(lines)
+
     async def _inject(self, sid: str, req: LLMRequest, user_id: str = "", recall_user_ids: list[str] | None = None,
                      do_passive_update: bool = False):
         if not self.auto_inject:
@@ -1001,11 +1083,46 @@ class AlifeMemoryPlugin(BasePlugin):
             char_budget -= char_cost
         if not lines:
             return
+        # 画像注入（批次 B）：当前用户画像 + 提及的关联实体（上限 profile_inject_max）
+        profile_blocks: list[str] = []
+        if getattr(self, "profile_inject", True) and getattr(self, "profile_enabled", True):
+            # 当前实体（user_id 或按会话取第一个用户）
+            cur_entity = user_id or _event_user_id(getattr(req, "messages", [])[-1] if getattr(req, "messages", []) else None)
+            if cur_entity:
+                # 首次见 → 记录并确保画像
+                self._seen_profiles = getattr(self, "_seen_profiles", {})
+                if cur_entity not in self._seen_profiles:
+                    await self._ensure_profile(cur_entity, "user")
+                    self._seen_profiles[cur_entity] = True
+                pb = await self._format_profile_block(cur_entity, "画像")
+                if pb:
+                    profile_blocks.append(pb)
+            # 扫码提取提及的关联实体（从 query 中出现的已知实体 id/名字/昵称）
+            pmax = getattr(self, "profile_inject_max", 3)
+            if pmax and pmax > 0:
+                known = await self.store.list_profiles(pmax + 8)
+                seen_entities = set()
+                for kp in known:
+                    eid = kp.get("entity_id", "")
+                    if not eid or eid == cur_entity or eid in seen_entities:
+                        continue
+                    # 匹配实体 id 或其名字/昵称是否出现在 query 中
+                    match_keys = [eid] + [str(kp.get("name", "")) for _k in (1,)] + [str(kp.get("nickname", ""))]
+                    match_keys = [k for k in match_keys if k]
+                    if any(k and k != cur_entity and k in str(query) for k in match_keys):
+                        seen_entities.add(eid)
+                        pb = await self._format_profile_block(eid, "画像:关联")
+                        if pb:
+                            profile_blocks.append(pb)
+                        if len(profile_blocks) >= pmax + 1:
+                            break
         block = ("你曾经的一些记忆：\n" + "\n".join(lines) +
                  '\n（完整的记忆细节可通过 search_long_term_memory 工具检索）')
+        if profile_blocks:
+            block += "\n\n" + "\n\n".join(profile_blocks) + "\n（以上是相关人物/实体的画像，帮助你记住这些人的身份和关系）"
         system_msg = OpenAIMessage(role="system", content=block)
         req.messages.insert(0, system_msg)
-        logger.debug("[alife_memory] 注入完成: %d 条, 约 %d tokens", len(lines), self.max_injected_tokens - token_budget)
+        logger.debug("[alife_memory] 注入完成: %d 条记忆 + %d 画像块, 约 %d tokens", len(lines), len(profile_blocks), self.max_injected_tokens - token_budget)
 
 
     async def _inject_context_marker(self, req: LLMRequest, sid: str):

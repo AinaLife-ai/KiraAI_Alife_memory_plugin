@@ -364,6 +364,37 @@ class MemoryStore:
             # 标签索引表（结构化标签，替代字符串解析）
             conn.execute("CREATE TABLE IF NOT EXISTS memories_tags(mid TEXT NOT NULL, tag TEXT NOT NULL, UNIQUE(mid, tag))")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_tags_tag ON memories_tags(tag)")
+            # 用户/实体画像表（entity_id 统一，user/group/bot 归一张表，entity_type 区分）
+            conn.execute("""CREATE TABLE IF NOT EXISTS user_profiles(
+                entity_id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL DEFAULT 'user',
+                name TEXT DEFAULT '', nickname TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                platform TEXT DEFAULT '',
+                traits TEXT DEFAULT '[]',
+                preferences TEXT DEFAULT '{}',
+                relationships TEXT DEFAULT '[]',
+                facts TEXT DEFAULT '[]',
+                aliases TEXT DEFAULT '[]',
+                interaction_count INTEGER DEFAULT 0,
+                last_interaction REAL DEFAULT 0,
+                updated_at REAL DEFAULT 0,
+                generated_from TEXT DEFAULT '',
+                memory_type TEXT DEFAULT ''
+            )""")
+            # 关系网络表：实体间三元组（谁是谁的什么人）
+            conn.execute("""CREATE TABLE IF NOT EXISTS relationships(
+                id TEXT PRIMARY KEY,
+                entity_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                direction TEXT NOT NULL DEFAULT 'direct',
+                source_mid TEXT,
+                confidence REAL DEFAULT 0.7,
+                created_at REAL, updated_at REAL
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_relationships_entity ON relationships(entity_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_relationships_target ON relationships(target_id)")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_source_fingerprint ON memories(source_fingerprint) WHERE source_fingerprint <> ''")
             # FTS 中文检索迁移：统一重建为 unicode61（jieba 分词后空格连接入库，能正确检索中文）
             try:
@@ -993,6 +1024,165 @@ class MemoryStore:
         finally:
             conn.close()
 
+    # ---- 用户/实体画像 ----
+
+    async def get_profile(self, entity_id: str) -> dict | None:
+        """读取单个实体画像。"""
+        return await asyncio.to_thread(self._get_profile, entity_id)
+
+    def _get_profile(self, entity_id: str):
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT * FROM user_profiles WHERE entity_id=?", (entity_id,)).fetchone()
+            if not row:
+                return None
+            return self._normalize_profile(dict(row))
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _normalize_profile(p: dict) -> dict:
+        for k in ("traits", "relationships", "facts", "aliases"):
+            try:
+                p[k] = json.loads(p.get(k) or "[]")
+            except (TypeError, json.JSONDecodeError):
+                p[k] = []
+        try:
+            p["preferences"] = json.loads(p.get("preferences") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            p["preferences"] = {}
+        return p
+
+    async def upsert_profile(self, entity_id: str, entity_type: str = "user", **fields) -> bool:
+        """写入/更新实体画像（upsert by entity_id）。"""
+        return await asyncio.to_thread(self._upsert_profile, entity_id, entity_type, fields)
+
+    def _upsert_profile(self, entity_id, entity_type, fields):
+        conn = self._connect()
+        try:
+            now = time.time()
+            existing = conn.execute("SELECT * FROM user_profiles WHERE entity_id=?", (entity_id,)).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE user_profiles SET entity_type=?, name=?, nickname=?, description=?, platform=?, "
+                    "traits=?, preferences=?, relationships=?, facts=?, aliases=?, interaction_count=?, "
+                    "last_interaction=?, updated_at=?, generated_from=?, memory_type=? WHERE entity_id=?",
+                    (fields.get("entity_type", existing["entity_type"]), fields.get("name", existing["name"]),
+                     fields.get("nickname", existing["nickname"]), fields.get("description", existing["description"]),
+                     fields.get("platform", existing["platform"]),
+                     json.dumps(fields.get("traits", json.loads(existing["traits"] or "[]")), ensure_ascii=False),
+                     json.dumps(fields.get("preferences", json.loads(existing["preferences"] or "{}")), ensure_ascii=False),
+                     json.dumps(fields.get("relationships", json.loads(existing["relationships"] or "[]")), ensure_ascii=False),
+                     json.dumps(fields.get("facts", json.loads(existing["facts"] or "[]")), ensure_ascii=False),
+                     json.dumps(fields.get("aliases", json.loads(existing["aliases"] or "[]")), ensure_ascii=False),
+                     int(fields.get("interaction_count", existing["interaction_count"])),
+                     float(fields.get("last_interaction", existing["last_interaction"])),
+                     now, fields.get("generated_from", existing["generated_from"]),
+                     fields.get("memory_type", existing["memory_type"]) or "", entity_id))
+            else:
+                conn.execute(
+                    "INSERT OR REPLACE INTO user_profiles(entity_id,entity_type,name,nickname,description,platform,traits,preferences,relationships,facts,aliases,interaction_count,last_interaction,updated_at,generated_from,memory_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (entity_id, fields.get("entity_type", entity_type), fields.get("name", ""),
+                     fields.get("nickname", ""), fields.get("description", ""), fields.get("platform", ""),
+                     json.dumps(fields.get("traits", []), ensure_ascii=False),
+                     json.dumps(fields.get("preferences", {}), ensure_ascii=False),
+                     json.dumps(fields.get("relationships", []), ensure_ascii=False),
+                     json.dumps(fields.get("facts", []), ensure_ascii=False),
+                     json.dumps(fields.get("aliases", []), ensure_ascii=False),
+                     int(fields.get("interaction_count", 0)), float(fields.get("last_interaction", now)),
+                     now, fields.get("generated_from", ""), fields.get("memory_type", "")))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    async def list_profiles(self, limit: int = 100, entity_type: str | None = None) -> list[dict]:
+        """列出所有画像（默认 user；可过滤 group/bot）。"""
+        return await asyncio.to_thread(self._list_profiles, limit, entity_type)
+
+    def _list_profiles(self, limit, entity_type):
+        conn = self._connect()
+        try:
+            if entity_type:
+                rows = conn.execute("SELECT * FROM user_profiles WHERE entity_type=? ORDER BY last_interaction DESC LIMIT ?",
+                                    (entity_type, limit)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM user_profiles ORDER BY last_interaction DESC LIMIT ?", (limit,)).fetchall()
+            return [self._normalize_profile(dict(r)) for r in rows]
+        finally:
+            conn.close()
+
+    async def search_profiles(self, keyword: str, limit: int = 20) -> list[dict]:
+        """按实体 id/name/nickname 模糊搜画像。"""
+        return await asyncio.to_thread(self._search_profiles, keyword, limit)
+
+    def _search_profiles(self, keyword, limit):
+        conn = self._connect()
+        try:
+            like = f"%{keyword}%"
+            rows = conn.execute(
+                "SELECT * FROM user_profiles WHERE entity_id LIKE ? OR name LIKE ? OR nickname LIKE ? LIMIT ?",
+                (like, like, like, limit)).fetchall()
+            return [self._normalize_profile(dict(r)) for r in rows]
+        finally:
+            conn.close()
+
+    # ---- 关系网络 ----
+
+    async def upsert_relationship(self, entity_id: str, target_id: str, relation: str,
+                                  direction: str = "direct", source_mid: str = "",
+                                  confidence: float = 0.7) -> str:
+        """写入/更新一条关系（去重：同 entity+target+relation）。返回 relation id。"""
+        return await asyncio.to_thread(self._upsert_relationship, entity_id, target_id, relation,
+                                       direction, source_mid, confidence)
+
+    def _upsert_relationship(self, entity_id, target_id, relation, direction, source_mid, confidence):
+        conn = self._connect()
+        try:
+            now = time.time()
+            existing = conn.execute(
+                "SELECT id, source_mid, confidence FROM relationships WHERE entity_id=? AND target_id=? AND relation=?",
+                (entity_id, target_id, relation)).fetchone()
+            if existing:
+                rid = existing["id"]
+                # 合并来源 + 取更高置信度
+                merged_src = (existing["source_mid"] or "")
+                if source_mid and source_mid not in merged_src:
+                    merged_src = (merged_src + "," + source_mid).strip(",")
+                merged_conf = max(float(existing["confidence"]), float(confidence))
+                conn.execute(
+                    "UPDATE relationships SET source_mid=?, confidence=?, updated_at=? WHERE id=?",
+                    (merged_src, merged_conf, now, rid))
+            else:
+                rid = f"rel-{int(now)}-{uuid.uuid4().hex[:8]}"
+                conn.execute(
+                    "INSERT OR REPLACE INTO relationships(id,entity_id,target_id,relation,direction,source_mid,confidence,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (rid, entity_id, target_id, relation, direction or "direct", source_mid,
+                     max(0.0, min(1.0, confidence)), now, now))
+            conn.commit()
+            return rid
+        finally:
+            conn.close()
+
+    async def list_relationships(self, entity_id: str | None = None, target_id: str | None = None) -> list[dict]:
+        """列出关系网络。可按主体或对象过滤。"""
+        return await asyncio.to_thread(self._list_relationships, entity_id, target_id)
+
+    def _list_relationships(self, entity_id, target_id):
+        conn = self._connect()
+        try:
+            if entity_id and target_id:
+                rows = conn.execute("SELECT * FROM relationships WHERE entity_id=? AND target_id=? ORDER BY confidence DESC", (entity_id, target_id)).fetchall()
+            elif entity_id:
+                rows = conn.execute("SELECT * FROM relationships WHERE entity_id=? ORDER BY confidence DESC", (entity_id,)).fetchall()
+            elif target_id:
+                rows = conn.execute("SELECT * FROM relationships WHERE target_id=? ORDER BY confidence DESC", (target_id,)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM relationships ORDER BY confidence DESC LIMIT 500").fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
     async def list_users(self, limit: int = 50) -> list[dict]:
         """列出所有被记住的用户及其记忆概况。"""
         return await asyncio.to_thread(self._list_users, limit)
@@ -1078,6 +1268,25 @@ class MemoryStore:
                 "ORDER BY (importance * 0.6 + level * 0.4) DESC, end_ts DESC LIMIT ?",
                 (user_id, limit)
             ).fetchall()
+            result = []
+            for row in rows:
+                result.append(_normalize_item(dict(row)))
+            return result
+        finally:
+            conn.close()
+
+    async def list_memories_by_entity(self, entity_id: str, limit: int = 200) -> list[dict]:
+        """按实体检索记忆：entity_id 列 或 user_id 列 命中（画像聚合用）。跨会话跨用户。"""
+        return await asyncio.to_thread(self._list_memories_by_entity, entity_id, limit)
+
+    def _list_memories_by_entity(self, entity_id, limit):
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM memories WHERE deleted=0 AND status='active' "
+                "AND (entity_id=? OR user_id=?) "
+                "ORDER BY (importance * 0.6 + level * 0.4) DESC, end_ts DESC LIMIT ?",
+                (entity_id, entity_id, limit)).fetchall()
             result = []
             for row in rows:
                 result.append(_normalize_item(dict(row)))
