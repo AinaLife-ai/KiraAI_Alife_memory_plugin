@@ -647,6 +647,20 @@
           }
         }
       },
+      "search_min_score": {
+        "type": "float",
+        "name": "检索最低相关分（工具）",
+        "default": 0.1,
+        "minimum": 0.0,
+        "maximum": 0.9,
+        "hint": "bot 主动搜记忆工具的相关分门槛，低于此分的记忆不返回。默认 0.1 尽量多召回；追求精准可调高。",
+        "locales": {
+          "zh": {
+            "name": "检索最低相关分（工具）",
+            "hint": "bot 主动搜记忆工具的相关分门槛，低于此分的记忆不返回。默认 0.1 尽量多召回；追求精准可调高。"
+          }
+        }
+      },
       "recency_half_life_days": {
         "type": "float",
         "name": "时间衰减半衰期（天）",

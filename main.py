@@ -111,17 +111,18 @@ _SIMPLE_REL_KW = ("朋友", "主人", "妹妹", "姐姐", "哥哥", "女友", "�
 
 def _infer_simple_memory_type(text: str) -> str:
     """从纯文本启发式推断 memory_type（Simple Memory 无元数据）。
-    优先级：实体 > 约定 > 偏好 > 关系 > 日常。"""
+    优先级：身份/职业(最明确) > 关系 > 约定 > 偏好 > 日常。"""
     t = (text or "").lower()
-    # 身份/职业背景 → 关于实体（但避免把"是"误判所有含是的句子）
+    # 身份/职业背景最明确 → 关于实体
     if any(k in t for k in ("职业", "公司", "学校", "专业", "性格", "身份", "背景", "博士", "硕士", "教师", "医生", "学生")):
         return "关于实体"
+    # 明确关系表述（谁是谁的什么人）
+    if any(k in t for k in _SIMPLE_REL_KW):
+        return "关系网络"
     if any(k in t for k in _SIMPLE_TASK_KW):
         return "约定任务"
     if any(k in t for k in _SIMPLE_PREF_KW):
         return "偏好风格"
-    if any(k in t for k in _SIMPLE_REL_KW):
-        return "关系网络"
     return "日常事件"
 
 
@@ -136,6 +137,50 @@ def _infer_simple_memory_tags(text: str) -> list[str]:
     if any(k in t for k in ("朋友", "主人", "家人", "女友", "男友", "恋人", "妹妹", "姐姐", "哥哥", "同事", "抚养", "情侣", "兄弟", "爸爸", "妈妈")):
         tags.append("关系")
     return tags
+
+
+def _infer_simple_importance(text: str) -> float:
+    """从纯文本启发式估算记忆重要性（Simple Memory 无元数据，只能按内容估值）。
+    返回 0-1。身份/关系/明确偏好 → 更重要；无特征 → 中等。"""
+    t = (text or "")
+    # 关系类（谁是谁的什么人，表述明确）→ 优先，较高
+    if any(k in t for k in _SIMPLE_REL_KW):
+        return 0.7
+    # 身份/职业背景（最值得长期记住的人物资料）→ 高
+    if any(k in t for k in _SIMPLE_ENT_KW):
+        return 0.8
+    # 明确偏好/习惯 → 中高
+    if any(k in t for k in _SIMPLE_PREF_KW):
+        return 0.65
+    # 约定/任务/计划 → 中等
+    if any(k in t for k in _SIMPLE_TASK_KW):
+        return 0.6
+    # 无特征 → 默认中等
+    return 0.5
+
+
+def _map_level_from_importance(importance: float, max_level: int = 5) -> int:
+    """按重要度把记忆映射到层级（迁移用，避免一刀切全 L3）。
+    importance 0-1（KiraOS 的 importance/10）。KiraOS 重要度普遍偏中(均值~0.5)，
+    用平缓分段映射：日常→低层、重要→高层，>=0.8(即 KiraOS 8) 直接归最高层。
+    分段（importance → level，封顶 max_level）：
+      <0.4 → L1, 0.4-0.6 → L2, 0.6-0.75 → L3, 0.75-0.8 → L4, >=0.8 → max_level"""
+    try:
+        r = float(importance)
+    except (TypeError, ValueError):
+        r = 0.5
+    r = max(0.0, min(1.0, r))
+    if r < 0.4:
+        lvl = 1
+    elif r < 0.6:
+        lvl = 2
+    elif r < 0.75:
+        lvl = 3
+    elif r < 0.8:
+        lvl = 4
+    else:
+        lvl = max_level
+    return max(1, min(max_level, lvl))
 
 
 def _norm_clamp(v, lo: float, hi: float, default: float) -> float:
@@ -280,6 +325,8 @@ class AlifeMemoryPlugin(BasePlugin):
         self.search_scope = str(retrieval.get("search_scope", "linked") or "linked").lower()
         if self.search_scope not in ("session", "linked", "global"):
             self.search_scope = "linked"
+        # bot 主动搜记忆工具的最低相关分门槛：默认 0.1 尽量多召回（用户偏好宁可多不可漏）
+        self.search_min_score = _num(retrieval.get("search_min_score", 0.1), 0.1, 0.0, 0.9)
         self.cross_user_enabled = bool(retrieval.get("cross_user_enabled", True))
         self.inject_level_max = _num(retrieval.get("inject_level_max", 12), 12, 0, 12, True)
 
@@ -504,10 +551,13 @@ class AlifeMemoryPlugin(BasePlugin):
                             if len(line) > 120:
                                 continue
                             content_stripped = line
+                            # 启发式估值重要性（Simple Memory 无元数据）→ 映射层级
+                            imp = _infer_simple_importance(content_stripped)
                             rows.append({
-                                "sid": "system", "level": 3, "summary": content_stripped[:100],
+                                "sid": "system", "level": _map_level_from_importance(imp, self.max_level),
+                                "summary": content_stripped[:100],
                                 "content": content_stripped, "start_ts": file_mtime, "end_ts": file_mtime,
-                                "source_ids": [], "importance": 0.5, "embedding": None,
+                                "source_ids": [], "importance": imp, "embedding": None,
                                 "user_id": "", "memory_type": _infer_simple_memory_type(content_stripped),
                                 "tags": _infer_simple_memory_tags(content_stripped),
                                 "entity_id": "",
@@ -536,7 +586,8 @@ class AlifeMemoryPlugin(BasePlugin):
                             now = time.time()
                             for (content, summary, importance, source_sid, ts_val, ktags, ktype) in valid:
                                 rows.append({
-                                    "sid": source_sid, "level": 3, "summary": summary,
+                                    "sid": source_sid, "level": _map_level_from_importance(importance, self.max_level),
+                                    "summary": summary,
                                     "content": content, "start_ts": ts_val, "end_ts": ts_val,
                                     "source_ids": [], "importance": importance,
                                     "embedding": None, "user_id": "",
@@ -549,9 +600,75 @@ class AlifeMemoryPlugin(BasePlugin):
                             if count:
                                 migrated = True
                                 logger.info("[alife_memory] 已从 KiraOS 记忆迁移 %d 条记忆（原始文件未删除）", count)
+                            # 迁移 KiraOS 实体画像 + 关系（profile.json）→ user_profiles + relationships
+                            try:
+                                pn = await self._migrate_kiraos_profiles(data_root)
+                                if pn:
+                                    migrated = True
+                            except Exception as exc:
+                                logger.warning("[alife_memory] 迁移 KiraOS 画像失败: %s", exc)
         except Exception as exc:
             logger.warning("[alife_memory] 从 %s 迁移失败: %s", plugin_id, exc)
         return migrated
+
+    async def _migrate_kiraos_profiles(self, data_root: Path, max_profiles: int = 200) -> int:
+        """迁移 KiraOS 实体画像（data/memory/entities/{type}_{id}/profile.json）到 user_profiles +
+        relationships 表。KiraOS entity_type = user/group/channel，映射到我们的 user/group。
+        返回迁移的画像数。"""
+        entities_dir = data_root / "memory" / "entities"
+        if not await asyncio.to_thread(lambda: entities_dir.exists()):
+            return 0
+        profile_files = await asyncio.to_thread(lambda: list(entities_dir.glob("*/profile.json")))
+        if not profile_files:
+            return 0
+        n = 0
+        for pf in profile_files[:max_profiles]:
+            try:
+                raw = await asyncio.to_thread(lambda f=pf: f.read_text(encoding="utf-8", errors="replace"))
+                import json as _json
+                data = _json.loads(raw)
+                if not isinstance(data, dict):
+                    continue
+                # entity 目录名格式 {type}_{quoted_id}，从 profile 里的 entity_id 取更可靠
+                entity_id = str(data.get("entity_id", "")).strip()
+                if not entity_id:
+                    # 从目录名解析
+                    seg = pf.parent.name
+                    if "_" in seg:
+                        entity_id = seg.split("_", 1)[1]
+                if not entity_id:
+                    continue
+                kira_type = str(data.get("entity_type", "user")).lower()
+                # KiraOS channel(频道/群) → 我们的 group；user → user；group → group
+                our_type = "user" if kira_type == "user" else "group"
+                profile = {
+                    "name": str(data.get("name", "") or ""),
+                    "nickname": str(data.get("nickname", "") or ""),
+                    "description": str(data.get("description", "") or ""),
+                    "platform": str(data.get("platform", "") or ""),
+                    "traits": data.get("traits") if isinstance(data.get("traits"), list) else [],
+                    "preferences": data.get("preferences") if isinstance(data.get("preferences"), dict) else {},
+                    "facts": data.get("facts") if isinstance(data.get("facts"), list) else [],
+                    "aliases": data.get("aliases") if isinstance(data.get("aliases"), list) else [],
+                    "interaction_count": int(data.get("interaction_count", 0) or 0),
+                    "last_interaction": float(data.get("last_interaction", 0.0) or 0.0),
+                    "generated_from": "KiraOS profile.json 迁移",
+                }
+                await self.store.upsert_profile(entity_id, our_type, **profile)
+                # 关系图（dict: {target_id: relation}）→ relationships 三元组
+                rel_map = data.get("relationships") if isinstance(data.get("relationships"), dict) else {}
+                for target_id, relation in list(rel_map.items())[:40]:
+                    if target_id and relation:
+                        await self.store.upsert_relationship(
+                            entity_id, str(target_id), str(relation),
+                            source_mid="kiraos_profile:" + pf.name, confidence=0.8)
+                n += 1
+            except Exception as exc:
+                logger.warning("[alife_memory] 迁移 KiraOS 画像 %s 失败: %s", pf, exc)
+                continue
+        if n:
+            logger.info("[alife_memory] 已从 KiraOS 迁移 %d 个画像 + 关系", n)
+        return n
 
     async def terminate(self):
         self._closed = True
@@ -1037,6 +1154,75 @@ class AlifeMemoryPlugin(BasePlugin):
         except Exception as exc:
             logger.warning("[alife_memory] 生成画像失败 %s: %s", entity_id, exc)
 
+    async def _ensure_self_profile(self, self_id: str) -> None:
+        """确保 bot 自己（self）有画像。bot 是插件宿主 AI，记她自己的设定/性格/身份。
+
+        entity_type='self'，独立于 user/group，因为她不是'用户'也不是'群'。
+        若记忆里暂无足够信息，先落一个骨架（后续压缩/画像生成会持续填充）。
+        """
+        if not self_id:
+            return
+        if getattr(self, "_self_profiled", False):
+            return
+        self._self_profiled = True  # 每实例只尝试一次，避免每轮探测
+        try:
+            existing = await self.store.get_profile(self_id)
+            if existing:
+                # 已有骨架但类型被误判为 user → 升级为 self
+                if existing.get("entity_type") not in ("self",):
+                    await self.store.upsert_profile(self_id, "self",
+                                                    entity_type="self",
+                                                    description=existing.get("description") or "（bot 自己——插件宿主 AI）")
+                return
+            # 尝试用关于 bot 的记忆生成画像；没有就用骨架
+            profile = None
+            try:
+                profile = await self._generate_profile(self_id, "self")
+            except Exception:
+                profile = None
+            if profile is None:
+                await self.store.upsert_profile(self_id, "self",
+                                                name="", nickname="", description="（bot 自己——插件宿主 AI）",
+                                                traits=[], preferences={}, facts=[], aliases=[],
+                                                generated_from="auto:first_seen")
+                logger.info("[alife_memory] 已创建 bot 自己(self)画像骨架: %s", self_id)
+        except Exception as exc:
+            logger.warning("[alife_memory] 创建 self 画像失败 %s: %s", self_id, exc)
+
+    @staticmethod
+    def _infer_is_ai(profile: dict) -> bool | None:
+        """从画像内容启发式判断该实体是否为 AI（有明确证据返回 True/False，否则 None）。
+
+        有证据链才判：traits/facts/description 中明确出现 AI/机器人/桌宠/虚拟等自述词。
+        无证据返回 None（未知），宁可留空也不瞎猜——避免把真人标记为 AI。
+        """
+        hay = []
+        for k in ("traits", "facts"):
+            v = profile.get(k) or []
+            for item in v:
+                if isinstance(item, str):
+                    hay.append(item)
+                elif isinstance(item, dict):
+                    hay.append(str(item.get("trait", item.get("fact", ""))))
+        hay.append(str(profile.get("description", "") or ""))
+        hay_text = " ".join(hay)
+        # 顺序关键：先查明确否认（"不是AI"/"不是机器人"/"真人"），再查确认词。
+        # 若先查"是AI"会把"不是AI"里的子串"是AI"误判为 AI。
+        human_words = ("人类", "我是真人", "真人玩家", "活人", "不是AI", "不是机器人", "人类用户", "非AI", "并非AI", "真人")
+        strong_ai = ("是AI", "是机器人", "是个AI", "同为AI", "也是AI", "AI角色", "AI桌宠", "是桌宠",
+                     "我是AI", "本人是AI", "bot", "虚拟角色", "聊天机器人", "人工智能")
+        for w in human_words:
+            if w.lower() in hay_text.lower():
+                return False
+        for w in strong_ai:
+            if w.lower() in hay_text.lower():
+                return True
+        # 弱词（"机器人"等）单独出现且有 AI 上下文才判
+        for w in ("机器人", "AI", "桌宠", "NPC", "模型"):
+            if w.lower() in hay_text.lower():
+                return True
+        return None
+
     async def _generate_profile(self, entity_id: str, entity_type: str = "user") -> dict | None:
         """从该实体的记忆聚合并由 LLM 生成结构化画像，落库。"""
         memories = await self.store.list_memories_by_entity(entity_id, 200)
@@ -1074,7 +1260,13 @@ class AlifeMemoryPlugin(BasePlugin):
             "generated_from": ",".join(m["id"] for m in cand[:40]),
             "memory_type": entity_type,
         }
-        await self.store.upsert_profile(entity_id, entity_type, **profile)
+        # AI 身份标记：LLM 明确输出 is_ai 优先，否则启发式从内容判断（有证据才标）
+        if isinstance(result.get("is_ai"), bool):
+            profile["is_ai"] = result.get("is_ai")
+        else:
+            profile["is_ai"] = self._infer_is_ai(profile)
+        upsert_fields = {k: v for k, v in profile.items() if k not in ("entity_id", "entity_type")}
+        await self.store.upsert_profile(entity_id, entity_type, **upsert_fields)
         for rel in profile.get("relationships", []):
             if isinstance(rel, dict) and rel.get("target_id") and rel.get("relation"):
                 await self.store.upsert_relationship(entity_id, str(rel["target_id"]), str(rel["relation"]),
@@ -1333,6 +1525,15 @@ class AlifeMemoryPlugin(BasePlugin):
         if not text:
             return
         messages = getattr(event, "messages", []) or []
+        # 探测 bot 自己 ID（KiraIMMessage.self_id 即 bot 自身），首次见到创建 self 画像
+        try:
+            for item in messages:
+                self_id = str(getattr(item, "self_id", "") or "")
+                if self_id:
+                    self._track(self._ensure_self_profile(self_id))
+                    break
+        except Exception:
+            pass
         user_messages = []
         for index, item in enumerate(messages):
             role = getattr(item, "role", None) or (item.get("role") if isinstance(item, dict) else "") or "user"
@@ -1458,7 +1659,7 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @register.tool(
         name="search_long_term_memory",
-        description="检索长期记忆。涉及过去事实、偏好、约定或时间线时调用。返回结果包含记忆 ID、概要、内容和关联信息。结果最相关在前。",
+        description="检索长期记忆。涉及过去事实、偏好、约定、关系或时间线时调用。返回包含记忆条目和人物/群画像（若相关）。结果最相关在前。",
         params={"type": "object", "properties": {"query": {"type": "string", "description": "检索问题，越精确越好"}, "top_k": {"type": "integer", "description": "结果数，最多 12 条", "default": 5}, "scope": {"type": "string", "description": "检索范围：session 当前会话、linked 所有来源交叉关联、global 全部记忆", "default": ""}}, "required": ["query"]})
     async def search_long_term_memory(self, event: KiraMessageBatchEvent, query: str, top_k: int = 5, scope: str = "") -> str:
         sid = getattr(event, "sid", "")
@@ -1467,14 +1668,43 @@ class AlifeMemoryPlugin(BasePlugin):
             scope = self.search_scope
         user_id = _event_user_id((getattr(event, "messages", []) or [None])[-1])
         results = await self.store.search(sid, query, _num(top_k, 5, 1, 12, True), list(range(self.max_level + 1)), await self._embed(query), self.half_life, scope, user_id, self.embedding_model)
-        if not results:
+        # 按可配置相关分门槛过滤（默认 0.1 尽量召回；getattr 兜底兼容旧配置/测试旁路）
+        results = [r for r in results if float(r.get("score", 0)) >= getattr(self, "search_min_score", 0.1)]
+        out: list[str] = []
+        if results:
+            out.append(f"共找到 {len(results)} 条相关记忆：")
+            for i, x in enumerate(results, 1):
+                out.append(f"\n--- {i}. ID: {x['id']} ---")
+                out.append(f"概要: {x['summary']}")
+                out.append(f"内容: {x['content']}")
+                out.append(f"相关度: {x['score']:.2f} | 来源会话: {x.get('sid', 'unknown')} | 用户: {x.get('user_id', '') or 'unknown'} | 时间: {time.strftime('%Y-%m-%d %H:%M', time.localtime(x['end_ts']))}")
+        # 画像命中：query 里提到的实体或画像内容相关（人是谁/性格/偏好）也能搜到
+        try:
+            profiles = await self.store.search_profiles(query, limit=max(3, _num(top_k, 5, 1, 6, True)), match_content=True)
+            # 记忆结果里已出现的实体不再重复列画像；没记忆命中时画像独立成段
+            if profiles:
+                mem_entities = {str(x.get("user_id", "")) for x in results if x.get("user_id")}
+                rel_profiles = [p for p in profiles if p.get("entity_id") not in mem_entities][:3]
+                if rel_profiles:
+                    out.append("\n相关画像：")
+                    for i, p in enumerate(rel_profiles, 1):
+                        ptype = {"user": "用户", "group": "群", "self": "bot自己"}.get(p.get("entity_type", ""), p.get("entity_type", ""))
+                        ai_tag = "（AI）" if p.get("is_ai") in (1, True) else ""
+                        lines = [f"\n--- 画像{i}. {p.get('name') or p.get('entity_id')}{ai_tag} [{ptype}] ---",
+                                 f"ID: {p.get('entity_id')}"]
+                        if p.get("description"):
+                            lines.append(f"概述: {p['description']}")
+                        if p.get("traits"):
+                            lines.append(f"特质: " + "；".join(str(t) for t in p["traits"][:6]))
+                        if p.get("preferences") and isinstance(p["preferences"], dict):
+                            lines.append(f"偏好: " + "；".join(f"{k}→{v}" for k, v in list(p["preferences"].items())[:5]))
+                        if p.get("facts"):
+                            lines.append(f"事实: " + "；".join(str(f)[:60] for f in p["facts"][:5]))
+                        out.extend(lines)
+        except Exception:
+            logger.debug("[alife_memory] 画像检索叠加失败，忽略", exc_info=True)
+        if not out:
             return "没有找到相关长期记忆"
-        out = [f"共找到 {len(results)} 条相关记忆："]
-        for i, x in enumerate(results, 1):
-            out.append(f"\n--- {i}. ID: {x['id']} ---")
-            out.append(f"概要: {x['summary']}")
-            out.append(f"内容: {x['content']}")
-            out.append(f"相关度: {x['score']:.2f} | 来源会话: {x.get('sid', 'unknown')} | 用户: {x.get('user_id', '') or 'unknown'} | 时间: {time.strftime('%Y-%m-%d %H:%M', time.localtime(x['end_ts']))}")
         return "\n".join(out)
 
     @register.tool(
@@ -1739,8 +1969,14 @@ class AlifeMemoryPlugin(BasePlugin):
             _num(limit, 100, 1, 500, True))
 
     @register.api(method="GET", path="/profiles", auth=True, summary="List entity profiles")
-    async def api_profiles(self, limit: int = 100, entity_type: str | None = None):
-        return await self.store.list_profiles(_num(limit, 100, 1, 500, True), entity_type or None)
+    async def api_profiles(self, limit: int = 100, entity_type: str | None = None, is_ai: str | None = None):
+        """is_ai=1 只看 AI 用户；is_ai=0 只看真人；不传看全部。"""
+        is_ai_val = None
+        if is_ai in ("1", "true", "yes"):
+            is_ai_val = True
+        elif is_ai in ("0", "false", "no"):
+            is_ai_val = False
+        return await self.store.list_profiles(_num(limit, 100, 1, 500, True), entity_type or None, is_ai_val)
 
     @register.api(method="GET", path="/profile/{entity_id}", auth=True, summary="Get one profile")
     async def api_profile(self, entity_id: str):
@@ -1752,8 +1988,10 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @register.api(method="POST", path="/profile/{entity_id}/regenerate", auth=True, summary="Regenerate a profile")
     async def api_profile_regenerate(self, entity_id: str):
-        p = await self._generate_profile(entity_id, "user")
-        return {"ok": bool(p)}
+        existing = await self.store.get_profile(entity_id)
+        etype = (existing or {}).get("entity_type") or "user"
+        p = await self._generate_profile(entity_id, etype)
+        return {"ok": bool(p), "entity_type": etype}
 
     @register.api(method="GET", path="/memory/{memory_id}", auth=True, summary="Get memory")
     async def api_memory(self, memory_id: str):
@@ -1771,7 +2009,13 @@ class AlifeMemoryPlugin(BasePlugin):
             scope = self.search_scope
         user_id = str(body.get("user_id", ""))
         result = await self.store.search(sid, query, _num(body.get("top_k", self.retrieval_top_k), self.retrieval_top_k, 1, 20, True), None, await self._embed(query), self.half_life, scope, user_id, self.embedding_model)
-        return {"query": query, "scope": scope, "results": result}
+        # 叠加画像命中（按画像内容匹配，如"温婉的金发少女"能搜到 self 画像）
+        profiles = []
+        try:
+            profiles = await self.store.search_profiles(query, limit=5, match_content=True)
+        except Exception:
+            profiles = []
+        return {"query": query, "scope": scope, "results": result, "profiles": profiles}
 
     @register.api(method="POST", path="/memory/{memory_id}/correct", auth=True, summary="Correct memory")
     async def api_correct(self, memory_id: str, request: Request):
