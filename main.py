@@ -138,6 +138,30 @@ def _infer_simple_memory_tags(text: str) -> list[str]:
     return tags
 
 
+def _map_level_from_importance(importance: float, max_level: int = 5) -> int:
+    """按重要度把记忆映射到层级（迁移用，避免一刀切全 L3）。
+    importance 0-1。KiraOS 的 importance 普遍偏中(均值~0.5)，用平缓分段映射，
+    让日常/具体事件落低位、核心资料落高位，而不是全堆中间层。
+    分段（importance → level，封顶 max_level）：
+      <0.4 → L1, 0.4-0.6 → L2, 0.6-0.75 → L3, 0.75-0.9 → L4, >=0.9 → max_level"""
+    try:
+        r = float(importance)
+    except (TypeError, ValueError):
+        r = 0.5
+    r = max(0.0, min(1.0, r))
+    if r < 0.4:
+        lvl = 1
+    elif r < 0.6:
+        lvl = 2
+    elif r < 0.75:
+        lvl = 3
+    elif r < 0.9:
+        lvl = 4
+    else:
+        lvl = max_level
+    return max(1, min(max_level, lvl))
+
+
 def _norm_clamp(v, lo: float, hi: float, default: float) -> float:
     try:
         f = float(v)
@@ -505,7 +529,8 @@ class AlifeMemoryPlugin(BasePlugin):
                                 continue
                             content_stripped = line
                             rows.append({
-                                "sid": "system", "level": 3, "summary": content_stripped[:100],
+                                "sid": "system", "level": _map_level_from_importance(0.5, self.max_level),
+                                "summary": content_stripped[:100],
                                 "content": content_stripped, "start_ts": file_mtime, "end_ts": file_mtime,
                                 "source_ids": [], "importance": 0.5, "embedding": None,
                                 "user_id": "", "memory_type": _infer_simple_memory_type(content_stripped),
@@ -536,7 +561,8 @@ class AlifeMemoryPlugin(BasePlugin):
                             now = time.time()
                             for (content, summary, importance, source_sid, ts_val, ktags, ktype) in valid:
                                 rows.append({
-                                    "sid": source_sid, "level": 3, "summary": summary,
+                                    "sid": source_sid, "level": _map_level_from_importance(importance, self.max_level),
+                                    "summary": summary,
                                     "content": content, "start_ts": ts_val, "end_ts": ts_val,
                                     "source_ids": [], "importance": importance,
                                     "embedding": None, "user_id": "",
