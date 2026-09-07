@@ -141,8 +141,13 @@ async function runSearch(){
   const q=$('#searchQuery').value.trim();
   if(!q)return toast('请输入检索内容');
   const r=await api('/search',{method:'POST',body:JSON.stringify({query:q,sid:$('#searchSid').value,scope:$('#searchScope').value,top_k:10})});
-  const list=r.results||[];
-  $('#searchResults').innerHTML=list.length?list.map(x=>`<div class="memory-item"><h3><span>${esc(x.summary)}</span><span class="tag">${(x.score*100).toFixed(0)}%</span></h3><div class="content">${esc(x.content)}</div><div class="meta">${esc(x.id)} · 来源 ${esc(x.sid)} · 用户 ${esc(x.user_id||'—')}</div></div>`).join(''):'<div class="empty">无结果</div>';
+  const list=r.results||[],plist=r.profiles||[];
+  let html='';
+  if(plist.length){
+    html+=plist.map(p=>`<div class="memory-item"><h3><span>画像·${esc(p.name||p.entity_id)}</span><span class="tag" style="background:#f7ecff">${etLabel(p.entity_type)}</span>${p.is_ai===1||p.is_ai===true?`<span class="tag" style="background:#ffe9f3;color:#c2356b">AI</span>`:''}</h3>${p.description?`<div class="content">${esc(p.description)}</div>`:''}${(p.traits||[]).length||Object.keys(p.preferences||{}).length?`<div class="meta">${(p.traits||[]).slice(0,4).map(esc).join(' · ')}${Object.keys(p.preferences||{}).length?` · 偏好${Object.keys(p.preferences).length}项`:''}</div>`:''}<div class="meta">${esc(p.entity_id)} · 画像</div></div>`).join('');
+  }
+  html+=list.length?list.map(x=>`<div class="memory-item"><h3><span>${esc(x.summary)}</span><span class="tag">${(x.score*100).toFixed(0)}%</span></h3><div class="content">${esc(x.content)}</div><div class="meta">${esc(x.id)} · 来源 ${esc(x.sid)} · 用户 ${esc(x.user_id||'—')}</div></div>`).join(''):'';
+  $('#searchResults').innerHTML=html||'<div class="empty">无结果</div>';
 }
 
 // ---- 任务 ----

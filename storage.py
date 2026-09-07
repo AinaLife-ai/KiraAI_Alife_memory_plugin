@@ -1188,17 +1188,36 @@ class MemoryStore:
         finally:
             conn.close()
 
-    async def search_profiles(self, keyword: str, limit: int = 20) -> list[dict]:
-        """按实体 id/name/nickname 模糊搜画像。"""
-        return await asyncio.to_thread(self._search_profiles, keyword, limit)
+    async def search_profiles(self, keyword: str, limit: int = 20, match_content: bool = False) -> list[dict]:
+        """按实体 id/name/nickname 模糊搜画像；match_content=True 时同时搜
+        description/traits/preferences/facts 内容（自然语言检索画像内容）。"""
+        return await asyncio.to_thread(self._search_profiles, keyword, limit, match_content)
 
-    def _search_profiles(self, keyword, limit):
+    def _search_profiles(self, keyword, limit, match_content):
         conn = self._connect()
         try:
-            like = f"%{keyword}%"
-            rows = conn.execute(
-                "SELECT * FROM user_profiles WHERE entity_id LIKE ? OR name LIKE ? OR nickname LIKE ? LIMIT ?",
-                (like, like, like, limit)).fetchall()
+            if match_content:
+                # 分词后的 token 任一命中即算（整句 LIKE 太严，搜不到"温婉的金发"这类描述）。
+                # 过滤单字中文 token——"不/的/词"这类单字 LIKE 会命中一切描述，属于噪音。
+                tokens = [t for t in segment_for_fts(keyword).split()
+                          if len(t) > 1 and not (len(t) == 1 and '\u4e00' <= t <= '\u9fff')]
+                if not tokens:
+                    # 全单字（如"名字"已分词但全为单字）→ 用原始查询整体 LIKE 一次做宽松匹配
+                    tokens = [f"%{keyword}%"]
+                conds, args = [], []
+                for tok in tokens[:8]:
+                    like = f"%{tok}%"
+                    conds.append("(entity_id LIKE ? OR name LIKE ? OR nickname LIKE ? "
+                                 "OR description LIKE ? OR traits LIKE ? OR preferences LIKE ? OR facts LIKE ?)")
+                    args.extend([like] * 7)
+                sql = "SELECT * FROM user_profiles WHERE " + " OR ".join(conds) + " LIMIT ?"
+                args.append(limit)
+                rows = conn.execute(sql, args).fetchall()
+            else:
+                like = f"%{keyword}%"
+                rows = conn.execute(
+                    "SELECT * FROM user_profiles WHERE entity_id LIKE ? OR name LIKE ? OR nickname LIKE ? LIMIT ?",
+                    (like, like, like, limit)).fetchall()
             return [self._normalize_profile(dict(r)) for r in rows]
         finally:
             conn.close()

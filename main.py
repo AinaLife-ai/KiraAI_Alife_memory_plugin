@@ -1657,7 +1657,7 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @register.tool(
         name="search_long_term_memory",
-        description="检索长期记忆。涉及过去事实、偏好、约定或时间线时调用。返回结果包含记忆 ID、概要、内容和关联信息。结果最相关在前。",
+        description="检索长期记忆。涉及过去事实、偏好、约定、关系或时间线时调用。返回包含记忆条目和人物/群画像（若相关）。结果最相关在前。",
         params={"type": "object", "properties": {"query": {"type": "string", "description": "检索问题，越精确越好"}, "top_k": {"type": "integer", "description": "结果数，最多 12 条", "default": 5}, "scope": {"type": "string", "description": "检索范围：session 当前会话、linked 所有来源交叉关联、global 全部记忆", "default": ""}}, "required": ["query"]})
     async def search_long_term_memory(self, event: KiraMessageBatchEvent, query: str, top_k: int = 5, scope: str = "") -> str:
         sid = getattr(event, "sid", "")
@@ -1666,14 +1666,44 @@ class AlifeMemoryPlugin(BasePlugin):
             scope = self.search_scope
         user_id = _event_user_id((getattr(event, "messages", []) or [None])[-1])
         results = await self.store.search(sid, query, _num(top_k, 5, 1, 12, True), list(range(self.max_level + 1)), await self._embed(query), self.half_life, scope, user_id, self.embedding_model)
-        if not results:
+        # 低分兜底记忆视为无关（全表 fallback 的 score≈0.1-0.25，是"没搜到"的信号）
+        # 工具是 bot 的精确查询——宁可说没有，也不拿无关记忆糊弄
+        results = [r for r in results if float(r.get("score", 0)) >= 0.30]
+        out: list[str] = []
+        if results:
+            out.append(f"共找到 {len(results)} 条相关记忆：")
+            for i, x in enumerate(results, 1):
+                out.append(f"\n--- {i}. ID: {x['id']} ---")
+                out.append(f"概要: {x['summary']}")
+                out.append(f"内容: {x['content']}")
+                out.append(f"相关度: {x['score']:.2f} | 来源会话: {x.get('sid', 'unknown')} | 用户: {x.get('user_id', '') or 'unknown'} | 时间: {time.strftime('%Y-%m-%d %H:%M', time.localtime(x['end_ts']))}")
+        # 画像命中：query 里提到的实体或画像内容相关（人是谁/性格/偏好）也能搜到
+        try:
+            profiles = await self.store.search_profiles(query, limit=max(3, _num(top_k, 5, 1, 6, True)), match_content=True)
+            # 记忆结果里已出现的实体不再重复列画像；没记忆命中时画像独立成段
+            if profiles:
+                mem_entities = {str(x.get("user_id", "")) for x in results if x.get("user_id")}
+                rel_profiles = [p for p in profiles if p.get("entity_id") not in mem_entities][:3]
+                if rel_profiles:
+                    out.append("\n相关画像：")
+                    for i, p in enumerate(rel_profiles, 1):
+                        ptype = {"user": "用户", "group": "群", "self": "bot自己"}.get(p.get("entity_type", ""), p.get("entity_type", ""))
+                        ai_tag = "（AI）" if p.get("is_ai") in (1, True) else ""
+                        lines = [f"\n--- 画像{i}. {p.get('name') or p.get('entity_id')}{ai_tag} [{ptype}] ---",
+                                 f"ID: {p.get('entity_id')}"]
+                        if p.get("description"):
+                            lines.append(f"概述: {p['description']}")
+                        if p.get("traits"):
+                            lines.append(f"特质: " + "；".join(str(t) for t in p["traits"][:6]))
+                        if p.get("preferences") and isinstance(p["preferences"], dict):
+                            lines.append(f"偏好: " + "；".join(f"{k}→{v}" for k, v in list(p["preferences"].items())[:5]))
+                        if p.get("facts"):
+                            lines.append(f"事实: " + "；".join(str(f)[:60] for f in p["facts"][:5]))
+                        out.extend(lines)
+        except Exception:
+            logger.debug("[alife_memory] 画像检索叠加失败，忽略", exc_info=True)
+        if not out:
             return "没有找到相关长期记忆"
-        out = [f"共找到 {len(results)} 条相关记忆："]
-        for i, x in enumerate(results, 1):
-            out.append(f"\n--- {i}. ID: {x['id']} ---")
-            out.append(f"概要: {x['summary']}")
-            out.append(f"内容: {x['content']}")
-            out.append(f"相关度: {x['score']:.2f} | 来源会话: {x.get('sid', 'unknown')} | 用户: {x.get('user_id', '') or 'unknown'} | 时间: {time.strftime('%Y-%m-%d %H:%M', time.localtime(x['end_ts']))}")
         return "\n".join(out)
 
     @register.tool(
@@ -1978,7 +2008,13 @@ class AlifeMemoryPlugin(BasePlugin):
             scope = self.search_scope
         user_id = str(body.get("user_id", ""))
         result = await self.store.search(sid, query, _num(body.get("top_k", self.retrieval_top_k), self.retrieval_top_k, 1, 20, True), None, await self._embed(query), self.half_life, scope, user_id, self.embedding_model)
-        return {"query": query, "scope": scope, "results": result}
+        # 叠加画像命中（按画像内容匹配，如"温婉的金发少女"能搜到 self 画像）
+        profiles = []
+        try:
+            profiles = await self.store.search_profiles(query, limit=5, match_content=True)
+        except Exception:
+            profiles = []
+        return {"query": query, "scope": scope, "results": result, "profiles": profiles}
 
     @register.api(method="POST", path="/memory/{memory_id}/correct", auth=True, summary="Correct memory")
     async def api_correct(self, memory_id: str, request: Request):
