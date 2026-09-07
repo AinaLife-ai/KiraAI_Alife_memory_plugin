@@ -188,8 +188,14 @@ const configFields=[
   ['section_reflection.enabled','启用后台审校','switch',true],
   ['section_reflection.reflect_model','审校模型','model_select',''],
   ['section_reflection.interval_seconds','审校间隔(秒)','number',1800],
-  ['section_reflection.max_items','每次审校记忆数','number',4],
-  ['section_reflection.prompt','审校提示词','textarea',''],
+  ['section_reflection.period_days','审计周期(天)','number',3],
+  ['section_reflection.batch_size','每轮审计条数','number',20],
+  ['section_reflection.dedup_similarity_threshold','去重相似度阈值','number',0.1],
+  ['section_basic.profile_enabled','启用画像','switch',true],
+  ['section_basic.profile_inject','注入画像','switch',true],
+  ['section_basic.profile_inject_max','画像注入上限','number',3],
+  ['section_basic.profile_generate_model','画像生成模型','model_select',''],
+  ['section_basic.profile_gen_trigger','画像生成触发记忆数','number',5],
 ];
 
 function getVal(path,def){
