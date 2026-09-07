@@ -109,8 +109,8 @@ def cosine(a: list[float] | None, b: list[float] | None) -> float:
 
 
 def _normalize_item(item: dict) -> dict:
-    """解析并清理从 memories 表返回的行：反序列化 source_ids/source_refs，
-    去掉 embedding 大数组（对 LLM/前端无意义，避免浪费），保留 embed_model 标记。"""
+    """解析并清理从 memories 表返回的行：反序列化 source_ids/source_refs/tags，
+    去掉 embedding 大数组（对 LLM/前端无意义，避免浪费），保留 embed_model/结构化字段。"""
     try:
         item["source_ids"] = json.loads(item.get("source_ids") or "[]")
     except (TypeError, json.JSONDecodeError):
@@ -119,8 +119,142 @@ def _normalize_item(item: dict) -> dict:
         item["source_refs"] = json.loads(item.get("source_refs") or "[]")
     except (TypeError, json.JSONDecodeError):
         item["source_refs"] = []
+    try:
+        item["tags"] = json.loads(item.get("tags") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        item["tags"] = []
     item.pop("embedding", None)
     return item
+
+
+def _write_tags(conn, mid: str, tags: list[str] | None) -> None:
+    """把标签写入 memories_tags 索引表（结构化检索用）。"""
+    if not tags:
+        return
+    for tag in tags:
+        tag = str(tag).strip()
+        if tag:
+            conn.execute("INSERT OR IGNORE INTO memories_tags(mid,tag) VALUES(?,?)", (mid, tag))
+
+
+def _table_has_column(conn, table: str, column: str) -> bool:
+    """检查表是否有某列。"""
+    try:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        return column in cols
+    except Exception:
+        return False
+
+
+import re as _PREFIX_RE
+_PREFIX_RE_PATTERN = _PREFIX_RE.compile(r'^\[(标签:|关于我的|我喜欢的|正在发生的|去哪查|日常的|关于实体|偏好风格|约定任务|关系网络|溯源查询|日常事件|原因:|何时想起:)')
+def _re_match_prefix(s: str) -> bool:
+    """判断字符串是否以已知前缀开头（用于迁移判断）。"""
+    return bool(_PREFIX_RE_PATTERN.match(s or ""))
+
+
+def _parse_legacy_prefix(summary: str, content: str) -> tuple[str, list[str], str, str]:
+    """反解析历史字符串前缀 [关于我的]/[我喜欢的]/[标签:...]/[原因:...]/[何时想起:...]。
+    返回 (clean_summary, clean_content, memory_type, reason, scenario)。
+    只移除已知前缀，解析不出则原样保留（幂等、不丢数据）。"""
+    import re as _re
+    memory_type = ""
+    reason = ""
+    scenario = ""
+    leg_map = {"关于我的": "关于实体", "我喜欢的": "偏好风格", "正在发生的": "约定任务",
+               "去哪查": "溯源查询", "日常的": "日常事件"}
+    # 抽取类型前缀
+    m = _re.match(r'^\[(关于我的|我喜欢的|正在发生的|去哪查|日常的|关于实体|偏好风格|约定任务|关系网络|溯源查询|日常事件)\]', summary)
+    if m:
+        memory_type = leg_map.get(m.group(1), m.group(1))
+        summary = summary[m.end():].strip()
+        content = _re.sub(r'^\[(关于我的|我喜欢的|正在发生的|去哪查|日常的|关于实体|偏好风格|约定任务|关系网络|溯源查询|日常事件)\]\s*', '', content)
+    # 抽取标签前缀（summary 和 content 开头都可能带，都尝试）
+    tags = []
+    tm = _re.match(r'^\[标签:([^\]]+)\]\s*', summary)
+    if tm:
+        tags = [t.strip() for t in tm.group(1).split(",") if t.strip()]
+        summary = summary[tm.end():].strip()
+        content = _re.sub(r'^\[标签:[^\]]+\]\s*', '', content)
+    else:
+        tm2 = _re.match(r'^\[标签:([^\]]+)\]\s*', content)
+        if tm2:
+            tags = [t.strip() for t in tm2.group(1).split(",") if t.strip()]
+            content = content[tm2.end():].strip()
+    # 抽取原因
+    rm = _re.search(r'\[原因:([^\]]*)\]', content)
+    if rm:
+        reason = rm.group(1)
+        content = content.replace(rm.group(0), "").strip()
+    # 抽取何时想起
+    sm = _re.search(r'\[何时想起:([^\]]*)\]', content)
+    if sm:
+        scenario = sm.group(1)
+        content = content.replace(sm.group(0), "").strip()
+    return summary, content, memory_type, tags, reason, scenario
+
+
+def _migrate_legacy_prefixes(conn) -> int:
+    """把历史 [关于我的]/[标签:...] 等前缀记忆反解析成结构化字段。幂等。返回处理条数。"""
+    if not _table_has_column(conn, "memories", "memory_type"):
+        return 0
+    rows = conn.execute("SELECT id,sid,level,summary,content,memory_type,tags,reason,scenario FROM memories").fetchall()
+    n = 0
+    for r in rows:
+        need = False
+        clean_sum = r["summary"]; clean_con = r["content"]; mtype = r["memory_type"]; tags = r["tags"]; reason = r["reason"]; scenario = r["scenario"]
+        # 只处理仍带旧前缀的
+        if clean_sum.startswith("[") and "[标签:" in clean_sum or _re_match_prefix(clean_sum) or _re_match_prefix(clean_con):
+            clean_sum, clean_con, new_type, new_tags, new_reason, new_scenario = _parse_legacy_prefix(clean_sum, clean_con)
+            if new_type:
+                mtype = _norm_memory_type(new_type); need = True
+            if new_tags:
+                try:
+                    tags = json.loads(tags or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    tags = []
+                tags = list(dict.fromkeys(tags + new_tags))
+                need = True
+            if new_reason:
+                reason = new_reason; need = True
+            if new_scenario:
+                scenario = new_scenario; need = True
+            if clean_sum != r["summary"] or clean_con != r["content"]:
+                need = True
+            if not need:
+                continue
+            conn.execute("UPDATE memories SET summary=?, content=?, memory_type=?, tags=?, reason=?, scenario=? WHERE id=?",
+                         (clean_sum, clean_con, mtype, json.dumps(tags, ensure_ascii=False), reason, scenario, r["id"]))
+            if new_tags:
+                _write_tags(conn, r["id"], new_tags)
+            # 重建 FTS
+            conn.execute("DELETE FROM memories_fts WHERE memory_id=?", (r["id"],))
+            conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
+                         (segment_for_fts(clean_sum), segment_for_fts(clean_con), r["sid"], r["level"], r["id"]))
+            n += 1
+    return n
+
+
+def _norm_memory_type(mt: str) -> str:
+    """规范化记忆类型到标准 6 类。非法值回退为「日常事件」。兼容旧 5 类中文标签和英文枚举。"""
+    valid = {"关于实体", "偏好风格", "约定任务", "关系网络", "溯源查询", "日常事件"}
+    mt = (mt or "").strip()
+    if mt in valid:
+        return mt
+    # 兼容旧 5 类标签
+    legacy = {"关于我的": "关于实体", "我喜欢的": "偏好风格", "正在发生的": "约定任务",
+              "去哪查": "溯源查询", "日常的": "日常事件"}
+    if mt in legacy:
+        return legacy[mt]
+    # 兼容英文枚举（后端模型可能输出）
+    en = {"entity": "关于实体", "preference": "偏好风格", "task": "约定任务",
+          "relation": "关系网络", "source": "溯源查询", "daily": "日常事件", "fact": "日常事件"}
+    return en.get(mt, "日常事件")
+
+
+def uid_or_empty(user_id: str) -> str:
+    """实体关联字段：优先记忆显式声明的 entity_id，缺省时退化到 user_id。"""
+    return str(user_id or "")
 
 
 class MemoryStore:
@@ -218,10 +352,18 @@ class MemoryStore:
                 "dedupe_key": "ALTER TABLE memories ADD COLUMN dedupe_key TEXT NOT NULL DEFAULT ''",
                 "source_refs": "ALTER TABLE memories ADD COLUMN source_refs TEXT NOT NULL DEFAULT '[]'",
                 "embed_model": "ALTER TABLE memories ADD COLUMN embed_model TEXT DEFAULT ''",
+                "memory_type": "ALTER TABLE memories ADD COLUMN memory_type TEXT NOT NULL DEFAULT 'fact'",
+                "tags": "ALTER TABLE memories ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'",
+                "reason": "ALTER TABLE memories ADD COLUMN reason TEXT NOT NULL DEFAULT ''",
+                "scenario": "ALTER TABLE memories ADD COLUMN scenario TEXT NOT NULL DEFAULT ''",
+                "entity_id": "ALTER TABLE memories ADD COLUMN entity_id TEXT NOT NULL DEFAULT ''",
             }
             for name, statement in migrations.items():
                 if name not in columns:
                     conn.execute(statement)
+            # 标签索引表（结构化标签，替代字符串解析）
+            conn.execute("CREATE TABLE IF NOT EXISTS memories_tags(mid TEXT NOT NULL, tag TEXT NOT NULL, UNIQUE(mid, tag))")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_tags_tag ON memories_tags(tag)")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_source_fingerprint ON memories(source_fingerprint) WHERE source_fingerprint <> ''")
             # FTS 中文检索迁移：统一重建为 unicode61（jieba 分词后空格连接入库，能正确检索中文）
             try:
@@ -247,6 +389,14 @@ class MemoryStore:
                             "INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
                             (seg_sum, seg_con, r["sid"], r["level"], r["id"])
                         )
+            except Exception:
+                pass
+            # 反解析历史 [关于我的]/[标签:...] 前缀 → 结构化字段（幂等迁移）
+            try:
+                mig_n = _migrate_legacy_prefixes(conn)
+                if mig_n:
+                    logger = __import__("logging").getLogger("alife_memory_storage")
+                    logger.info("[alife_memory_storage] 反解析历史标签前缀: %d 条记忆 → 结构化字段", mig_n)
             except Exception:
                 pass
             conn.commit()
@@ -369,15 +519,19 @@ class MemoryStore:
                          supersedes: str | None = None, correction_note: str = "",
                          user_id: str = "", source_fingerprint: str = "",
                          source_refs: list[dict[str, Any]] | None = None,
-                         embed_model: str = "") -> str:
+                         embed_model: str = "", memory_type: str = "日常事件",
+                         tags: list[str] | None = None, reason: str = "",
+                         scenario: str = "", entity_id: str = "") -> str:
         return await asyncio.to_thread(self._add_memory, sid, level, summary, content,
                                        start_ts, end_ts, source_ids, importance, embedding,
                                        memory_id, confidence, supersedes, correction_note, user_id,
-                                       source_fingerprint, source_refs, embed_model)
+                                       source_fingerprint, source_refs, embed_model,
+                                       memory_type, tags, reason, scenario, entity_id)
 
     def _add_memory(self, sid, level, summary, content, start_ts, end_ts, source_ids,
                     importance, embedding, memory_id, confidence, supersedes, correction_note, user_id,
-                    source_fingerprint, source_refs, embed_model=""):
+                    source_fingerprint, source_refs, embed_model="",
+                    memory_type="日常事件", tags=None, reason="", scenario="", entity_id=""):
         mid = memory_id or f"L{level}-{int(start_ts)}-{int(end_ts)}-{uuid.uuid4().hex[:8]}"
         fact_key = normalized_fact_key(summary, content)
         now = time.time()
@@ -421,12 +575,17 @@ class MemoryStore:
                 conn.commit()
                 return str(duplicate['id'])
             refs = source_refs or [{'sid': sid, 'user_id': str(user_id or ''), 'start_ts': start_ts, 'end_ts': end_ts}]
+            _mt = _norm_memory_type(memory_type)
+            _tags = [t for t in (tags or []) if str(t).strip()]
             conn.execute(
-                "INSERT OR REPLACE INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs,embed_model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs,embed_model,memory_type,tags,reason,scenario,entity_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (mid, sid, str(user_id or ""), level, summary.strip(), content, start_ts, end_ts, max(0.0, min(1.0, importance)),
                  json.dumps(source_ids, ensure_ascii=False), json.dumps(embedding) if embedding else None, now, now,
                  "active", max(0.0, min(1.0, confidence)), supersedes, correction_note or "", source_fingerprint or "", fact_key,
-                 json.dumps(refs, ensure_ascii=False), embed_model or ""))
+                 json.dumps(refs, ensure_ascii=False), embed_model or "", _mt,
+                 json.dumps(_tags, ensure_ascii=False), reason or "", scenario or "",
+                 str(entity_id or uid_or_empty(user_id))))
+            _write_tags(conn, mid, _tags)
             conn.execute("DELETE FROM memories_fts WHERE memory_id=?", (mid,))
             conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
                          (segment_for_fts(summary), segment_for_fts(content), sid, level, mid))
@@ -454,6 +613,8 @@ class MemoryStore:
                 source_ids = it.get("source_ids", []); source_refs = it.get("source_refs", [])
                 user_id = it.get("user_id", ""); confidence = it.get("confidence", 0.65)
                 source_fingerprint = it.get("source_fingerprint", ""); memory_id = it.get("memory_id")
+                memory_type = it.get("memory_type", "日常事件"); tags = it.get("tags") or []
+                reason = it.get("reason", ""); scenario = it.get("scenario", ""); entity_id = it.get("entity_id", "")
                 fact_key = normalized_fact_key(summary, content)
                 now = time.time()
                 # 去重：同指纹已存在 → 跳过（迁移幂等）
@@ -467,13 +628,18 @@ class MemoryStore:
                     continue
                 mid = memory_id or f"L{level}-{int(start_ts)}-{int(end_ts)}-{uuid.uuid4().hex[:8]}"
                 refs = source_refs or [{"sid": sid, "user_id": str(user_id or ""), "start_ts": start_ts, "end_ts": end_ts}]
+                _mt = _norm_memory_type(memory_type)
+                _tags = [t for t in (tags or []) if str(t).strip()]
                 conn.execute(
-                    "INSERT OR REPLACE INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs,embed_model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT OR REPLACE INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs,embed_model,memory_type,tags,reason,scenario,entity_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (mid, sid, str(user_id or ""), level, summary.strip(), content, start_ts, end_ts,
                      max(0.0, min(1.0, importance)), json.dumps(source_ids, ensure_ascii=False),
                      json.dumps(embedding) if embedding else None, now, now, "active",
                      max(0.0, min(1.0, confidence)), None, "", source_fingerprint or "", fact_key,
-                     json.dumps(refs, ensure_ascii=False), embed_model or ""))
+                     json.dumps(refs, ensure_ascii=False), embed_model or "", _mt,
+                     json.dumps(_tags, ensure_ascii=False), reason or "", scenario or "",
+                     str(entity_id or uid_or_empty(user_id))))
+                _write_tags(conn, mid, _tags)
                 conn.execute("DELETE FROM memories_fts WHERE memory_id=?", (mid,))
                 conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
                              (segment_for_fts(summary), segment_for_fts(content), sid, level, mid))
@@ -632,10 +798,15 @@ class MemoryStore:
 
     async def correct_memory(self, memory_id: str, summary: str, content: str,
                              note: str, confidence: float = 0.95,
-                             embedding: list[float] | None = None) -> str | None:
-        return await asyncio.to_thread(self._correct_memory, memory_id, summary, content, note, confidence, embedding)
+                             embedding: list[float] | None = None,
+                             memory_type: str = "", tags: list[str] | None = None,
+                             reason: str = "", scenario: str = "",
+                             entity_id: str = "") -> str | None:
+        return await asyncio.to_thread(self._correct_memory, memory_id, summary, content, note, confidence, embedding,
+                                       memory_type, tags, reason, scenario, entity_id)
 
-    def _correct_memory(self, memory_id, summary, content, note, confidence, embedding):
+    def _correct_memory(self, memory_id, summary, content, note, confidence, embedding,
+                        memory_type="", tags=None, reason="", scenario="", entity_id=""):
         conn = self._connect()
         try:
             old = conn.execute("SELECT * FROM memories WHERE id=? AND deleted=0", (memory_id,)).fetchone()
@@ -645,13 +816,18 @@ class MemoryStore:
             now = time.time()
             conn.execute("UPDATE memories SET status='superseded', updated_at=?, correction_note=? WHERE id=?",
                          (now, note, memory_id))
+            _mt = _norm_memory_type(memory_type or old['memory_type'] if 'memory_type' in old.keys() and old['memory_type'] else memory_type or "日常事件")
+            _tags = [t for t in (tags or (json.loads(old['tags']) if 'tags' in old.keys() and old['tags'] else [])) if str(t).strip()]
             conn.execute(
-                "INSERT INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs,embed_model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO memories(id,sid,user_id,level,summary,content,start_ts,end_ts,importance,source_ids,embedding,created_at,updated_at,status,confidence,supersedes,correction_note,source_fingerprint,dedupe_key,source_refs,embed_model,memory_type,tags,reason,scenario,entity_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (new_id, old['sid'], old['user_id'], old['level'], summary.strip(), content, old['start_ts'], old['end_ts'],
                  old['importance'], old['source_ids'], json.dumps(embedding) if embedding else old['embedding'],
                  now, now, 'active', max(0.0, min(1.0, confidence)), memory_id, note or '', '',
                  normalized_fact_key(summary, content), old['source_refs'],
-                 str(old['embed_model']) if 'embed_model' in old.keys() else ''))
+                 str(old['embed_model']) if 'embed_model' in old.keys() else '',
+                 _mt, json.dumps(_tags, ensure_ascii=False), reason or '', scenario or '',
+                 str(entity_id or (old['entity_id'] if 'entity_id' in old.keys() else ''))))
+            _write_tags(conn, new_id, _tags)
             conn.execute("DELETE FROM memories_fts WHERE memory_id IN (?,?)", (memory_id, new_id))
             conn.execute("INSERT INTO memories_fts(summary,content,sid,level,memory_id) VALUES(?,?,?,?,?)",
                          (segment_for_fts(summary), segment_for_fts(content), old['sid'], old['level'], new_id))

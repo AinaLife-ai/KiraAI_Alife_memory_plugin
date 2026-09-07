@@ -85,6 +85,79 @@ def _json_object(text: str) -> dict[str, Any] | None:
             return None
 
 
+_MEMORY_TYPES = ("关于实体", "偏好风格", "约定任务", "关系网络", "溯源查询", "日常事件")
+_LEGACY_MT = {"关于我的": "关于实体", "我喜欢的": "偏好风格", "正在发生的": "约定任务",
+              "去哪查": "溯源查询", "日常的": "日常事件"}
+
+
+def _norm_mt(mt: str) -> str:
+    """规范化 memory_type 到 6 类。非法值回退「日常事件」。"""
+    mt = (mt or "").strip()
+    if mt in _MEMORY_TYPES:
+        return mt
+    if mt in _LEGACY_MT:
+        return _LEGACY_MT[mt]
+    en = {"entity": "关于实体", "preference": "偏好风格", "task": "约定任务",
+          "relation": "关系网络", "source": "溯源查询", "daily": "日常事件", "fact": "日常事件"}
+    return en.get(mt.lower(), "日常事件")
+
+
+def _norm_clamp(v, lo: float, hi: float, default: float) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, f))
+
+
+def _cos_structured_json(text: str, schema: str = "items") -> list[dict[str, Any]]:
+    """解析 LLM 输出的结构化记忆/审计 JSON，做 schema 校验 + 缺失字段兜底。
+    schema='items' 期望 {"items":[{summary,content,memory_type,tags,...,confidence,importance,...}]}。
+    支持顶层直接是数组，或 {"items":[...]}。解析失败返回 []（调用方降级）。"""
+    raw = _json_object(text) if isinstance(text, str) else text
+    if not isinstance(raw, dict):
+        return []
+    items = raw.get("items")
+    if items is None and schema == "items":
+        # 兼容旧的单条输出 {summary,content,...} 包装成 items
+        items = [raw] if raw.get("summary") else []
+    if not isinstance(items, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        item = dict(it)
+        # 摘要/内容兜底
+        item["summary"] = str(item.get("summary", "") or "").strip()
+        item["content"] = str(item.get("content", "") or "").strip()
+        # memory_type 规范化
+        item["memory_type"] = _norm_mt(str(item.get("memory_type", "") or ""))
+        # tags 数组化
+        raw_tags = item.get("tags", [])
+        if isinstance(raw_tags, str):
+            raw_tags = [t.strip() for t in raw_tags.replace("，", ",").split(",") if t.strip()]
+        if isinstance(raw_tags, list):
+            raw_tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+        else:
+            raw_tags = []
+        item["tags"] = raw_tags[:8]
+        # importance/confidence 钳制（缺省也补默认值，保证后续 _num/落库有值）
+        item["importance"] = _norm_clamp(item.get("importance"), 0.0, 1.0, 0.55)
+        item["confidence"] = _norm_clamp(item.get("confidence"), 0.0, 1.0, 0.65)
+        item["reason"] = str(item.get("reason", "") or "").strip()
+        item["scenario"] = str(item.get("scenario", "") or "").strip()
+        item["entity_id"] = str(item.get("entity_id", "") or "").strip()
+        # 偏好/约定类缺 reason/scenario 时补默认说明（不让空字段进库）
+        if item["memory_type"] in ("偏好风格", "约定任务"):
+            if not item["reason"]:
+                item["reason"] = "用户明确表达/正在进行的约定"
+            if not item["scenario"]:
+                item["scenario"] = "聊到该话题或相关情境时"
+        out.append(item)
+    return out
+
+
 class AlifeMemoryPlugin(BasePlugin):
     def __init__(self, ctx, cfg: dict):
         super().__init__(ctx, cfg)
@@ -188,13 +261,17 @@ class AlifeMemoryPlugin(BasePlugin):
     @staticmethod
     def _default_compress_prompt():
         return ("你是长期记忆整理器。把{range}中提取成可验证、简洁、无重复的记忆。\n"
-                "只输出 JSON，不要 Markdown：{\"summary\":\"一句话概述\",\"content\":\"事实、偏好、决定和关系变化，分行列出\",\"importance\":0.0}\n"
+                "只输出 JSON，不要 Markdown：{\"items\":[{\"summary\":\"一句话概述\",\"content\":\"事实、偏好、决定和关系变化，分行列出\",\"memory_type\":\"关于实体|偏好风格|约定任务|关系网络|溯源查询|日常事件\",\"tags\":[\"标签1\",\"标签2\"],\"importance\":0.0,\"confidence\":0.0,\"reason\":\"为什么记（偏好/约定类必填）\",\"scenario\":\"什么时候该想起（偏好/约定类必填）\",\"entity_id\":\"关联到谁（用户/群/机器人标识，可空）\"}]}\n"
+                "memory_type 只能从 6 类里选：关于实体(这个人/群是谁、身份背景) / 偏好风格(喜欢什么、习惯、禁止项) / 约定任务(正在做的事、项目、约定、截止) / 关系网络(谁是谁的什么人、成员列表、角色设定) / 溯源查询(去哪查资料、哪个系统管什么) / 日常事件(其他值得记住的)。\n"
+                "偏好风格和约定任务两类必须填 reason(为什么记这件事)和 scenario(什么时候该想起它)。\n"
+                "tags 是 2-4 个简短中文标签，方便以后按标签翻找，不要超过 6 个。\n"
                 "不要臆测，不要把闲聊或临时情绪写成长期事实；保留时间、主体和限定条件。\n待整理内容：\n{content}")
 
     @staticmethod
     def _default_reflect_prompt():
         return ("你是记忆审校器。比较旧记忆和新证据，只处理有明确矛盾的事实。\n"
-                "只输出 JSON：{\"action\":\"none|correct|stale\",\"summary\":\"修正后的概述\",\"content\":\"修正后的事实\",\"confidence\":0.0,\"reason\":\"证据依据\"}\n"
+                "只输出 JSON：{\"action\":\"none|correct|stale\",\"items\":[{\"memory_id\":\"\",\"summary\":\"修正后的概述\",\"content\":\"修正后的事实\",\"memory_type\":\"关于实体|偏好风格|约定任务|关系网络|溯源查询|日常事件\",\"tags\":[\"标签\"],\"confidence\":0.0,\"reason\":\"证据依据\",\"scenario\":\"何时想起\",\"entity_id\":\"\"}]}\n"
+                "action=correct 时 items 里给出修正后的完整结构化字段（含 memory_type/tags/reason/scenario）；action=stale 时 items 可只给 memory_id。\n"
                 "若只是措辞不同、证据不足或可能是临时状态，输出 none。不得凭空补全。\n旧记忆：\n{memory}\n新证据：\n{evidence}")
 
     def _sync_default_prompts(self, compression: dict, reflection: dict):
@@ -204,12 +281,17 @@ class AlifeMemoryPlugin(BasePlugin):
         default_refl = self._default_reflect_prompt()
         comp_val = str(compression.get("prompt", "") or "").strip()
         refl_val = str(reflection.get("prompt", "") or "").strip()
+        # 旧的非结构化默认词（用户从未自定义、仍是内置默认时也升级到新结构化词）
+        old_comp_defaults = [
+            '你是长期记忆整理器。把{range}中提取成可验证、简洁、无重复的记忆。\n只输出 JSON，不要 Markdown：{"summary":"一句话概述","content":"事实、偏好、决定和关系变化，分行列出","importance":0.0}\n不要臆测，不要把闲聊或临时情绪写成长期事实；保留时间、主体和限定条件。\n待整理内容：\n{content}']
+        old_refl_defaults = [
+            '你是记忆审校器。比较旧记忆和新证据，只处理有明确矛盾的事实。\n只输出 JSON：{"action":"none|correct|stale","summary":"修正后的概述","content":"修正后的事实","confidence":0.0,"reason":"证据依据"}\n若只是措辞不同、证据不足或可能是临时状态，输出 none。不得凭空补全。\n旧记忆：\n{memory}\n新证据：\n{evidence}']
         changed = False
-        # 空 或 等于旧默认（即从未真正自定义）→ 用最新默认
-        if not comp_val:
+        # 空 或 等于旧默认词（即从未真正自定义）→ 用最新结构化默认词
+        if not comp_val or any(comp_val == o.strip() for o in old_comp_defaults if o.strip()):
             compression["prompt"] = default_comp
             changed = True
-        if not refl_val:
+        if not refl_val or any(refl_val == o.strip() for o in old_refl_defaults if o.strip()):
             reflection["prompt"] = default_refl
             changed = True
         if changed:
@@ -625,27 +707,42 @@ class AlifeMemoryPlugin(BasePlugin):
                     logger.info("[alife_memory] 压缩超时/失败，重试 %d/%d: %d 条", new_attempts, self.max_compress_retry, len(batch_ids))
                     pending = await self.store.pending_messages(sid, self.compression_batch)
                     continue
-                summary = str((result or {}).get("summary", "")).strip()
-                detail = str((result or {}).get("content", "")).strip()
-                if not summary or not detail:
+                # 结构化解析：支持 {"items":[...]}，每条带 memory_type/tags/reason/scenario/entity_id
+                items = _cos_structured_json(result)
+                if not items:
                     await self.store.update_task(task_id, "failed", "模型未返回有效结构化记忆")
                     batch_ids = [x["id"] for x in batch]
                     await self.store.increment_attempts(batch_ids)
                     pending = await self.store.pending_messages(sid, self.compression_batch)
                     continue
-                importance = _num((result or {}).get("importance", 0.55), 0.55, 0.0, 1.0)
-                vector = await self._embed(summary + "\n" + detail)
                 fingerprint = hashlib.sha256((sid + "|" + "|".join(x["id"] for x in batch)).encode()).hexdigest()
                 refs = [{"sid": sid, "user_id": str(x.get("user_id", "")), "message_id": x["id"], "turn_no": x.get("turn_no", 0), "ts": x["ts"]} for x in batch]
-                archive_id = await self.store.add_memory(
-                    sid, 1, summary, detail, batch[0]["ts"], batch[-1]["ts"],
-                    [x["id"] for x in batch], importance, vector,
-                    user_id=str(batch[0].get("user_id", "")) if len({x.get("user_id", "") for x in batch}) == 1 else "",
-                    source_fingerprint=fingerprint, source_refs=refs,
-                    embed_model=self.embedding_model)
-                await self.store.mark_compressed([x["id"] for x in batch], archive_id)
-                await self.store.update_task(task_id, "completed", archive_id)
-                logger.debug("[alife_memory] 压缩成功: %d 条 → %s", len(batch), archive_id)
+                archived: list[str] = []
+                for item in items:
+                    if not item.get("summary") or not item.get("content"):
+                        continue
+                    vector = await self._embed(item["summary"] + "\n" + item["content"])
+                    one_refs = refs + [{"sid": item["entity_id"] or "", "user_id": str(item.get("entity_id", "") or ""), "note": "关联实体", "ts": batch[-1]["ts"]}] if item.get("entity_id") else refs
+                    aid = await self.store.add_memory(
+                        sid, 1, item["summary"], item["content"], batch[0]["ts"], batch[-1]["ts"],
+                        [x["id"] for x in batch], _num(item.get("importance", 0.55), 0.55, 0.0, 1.0), vector,
+                        user_id=str(batch[0].get("user_id", "")) if len({x.get("user_id", "") for x in batch}) == 1 else "",
+                        source_fingerprint=(fingerprint + "|" + item["summary"][:40]), source_refs=one_refs,
+                        embed_model=self.embedding_model,
+                        memory_type=item.get("memory_type", "日常事件"),
+                        tags=item.get("tags") or [],
+                        reason=item.get("reason", ""), scenario=item.get("scenario", ""),
+                        entity_id=item.get("entity_id", ""))
+                    archived.append(aid)
+                if not archived:
+                    await self.store.update_task(task_id, "failed", "结构化输出无有效记忆")
+                    batch_ids = [x["id"] for x in batch]
+                    await self.store.increment_attempts(batch_ids)
+                    pending = await self.store.pending_messages(sid, self.compression_batch)
+                    continue
+                await self.store.mark_compressed([x["id"] for x in batch], archived[0])
+                await self.store.update_task(task_id, "completed", archived[0])
+                logger.debug("[alife_memory] 压缩成功: %d 条 → %s", len(batch), archived[0])
             except Exception as exc:
                 await self.store.update_task(task_id, "failed", str(exc)[:500])
                 logger.exception("[alife_memory] compression failed")
@@ -666,10 +763,11 @@ class AlifeMemoryPlugin(BasePlugin):
             result = await self._llm_json(self.compress_prompt.replace("{content}", content), self.compress_model or "fast")
             if not result:
                 continue
-            summary = str(result.get("summary", "")).strip()
-            detail = str(result.get("content", "")).strip()
-            if not summary or not detail:
+            items = _cos_structured_json(result)
+            if not items or not items[0].get("summary"):
                 continue
+            merge_item = items[0]
+            summary = merge_item["summary"]; detail = merge_item["content"]
             vector = await self._embed(summary + "\n" + detail)
             users = sorted({str(x.get("user_id", "")) for x in group if x.get("user_id")})
             refs = []
@@ -686,9 +784,13 @@ class AlifeMemoryPlugin(BasePlugin):
                     refs.append({"sid": item.get("sid", sid), "user_id": item.get("user_id", ""), "start_ts": item["start_ts"], "end_ts": item["end_ts"]})
             new_id = await self.store.add_memory(
                 sid, level + 1, summary, detail, group[0]["start_ts"], group[-1]["end_ts"],
-                [x["id"] for x in group], _num(result.get("importance", 0.65), 0.65, 0.0, 1.0), vector,
+                [x["id"] for x in group], _num(merge_item.get("importance", 0.65), 0.65, 0.0, 1.0), vector,
                 user_id=users[0] if len(users) == 1 else "", source_refs=refs,
-                embed_model=self.embedding_model)
+                embed_model=self.embedding_model,
+                memory_type=merge_item.get("memory_type", "日常事件"),
+                tags=merge_item.get("tags") or [],
+                reason=merge_item.get("reason", ""), scenario=merge_item.get("scenario", ""),
+                entity_id=merge_item.get("entity_id", ""))
             for old in group:
                 await self.store.mark_stale(old["id"], f"merged into {new_id}")
 
@@ -740,20 +842,37 @@ class AlifeMemoryPlugin(BasePlugin):
         for memory in memories:
             prompt = self.reflect_prompt.replace("{memory}", memory["summary"] + "\n" + memory["content"]).replace("{evidence}", evidence)
             result = await self._llm_json(prompt, self.reflect_model)
-            if not result or str(result.get("action", "none")) == "none":
+            if not result:
                 continue
-            confidence = _num(result.get("confidence", 0), 0, 0, 1)
-            if confidence < 0.86:
+            action = str(result.get("action", "none")).lower()
+            # 结构化审计：items 里给出修正条目（含 memory_type/tags/reason/scenario 修正）
+            corr_items = _cos_structured_json(result)
+            if action == "none" and not corr_items:
                 continue
-            note = str(result.get("reason", "后台审校发现新证据"))[:500]
-            if result.get("action") == "stale":
-                await self.store.mark_stale(memory["id"], note)
-            elif result.get("action") == "correct":
-                summary = str(result.get("summary", "")).strip()
-                content = str(result.get("content", "")).strip()
+            if action == "none":
+                action = "correct"
+            # 置信度：整体或单条
+            base_confidence = _num(result.get("confidence", 0), 0, 0, 1)
+            if action == "stale":
+                await self.store.mark_stale(memory["id"], "后台审校发现旧/过期")
+                continue
+            if action == "correct" and corr_items:
+                ci = corr_items[0]
+                confidence = _num(ci.get("confidence", base_confidence), 0, 0, 1)
+                if confidence < 0.86:
+                    continue
+                note = str(ci.get("reason") or result.get("reason") or "后台审校发现新证据")[:500]
+                summary = str(ci.get("summary", "")).strip()
+                content = str(ci.get("content", "")).strip()
                 if summary and content:
                     vector = await self._embed(summary + "\n" + content)
-                    await self.store.correct_memory(memory["id"], summary, content, note, confidence, vector)
+                    await self.store.correct_memory(
+                        memory["id"], summary, content, note, confidence, vector,
+                        memory_type=ci.get("memory_type", memory.get("memory_type", "")),
+                        tags=ci.get("tags") or memory.get("tags") or [],
+                        reason=ci.get("reason", memory.get("reason", "")),
+                        scenario=ci.get("scenario", memory.get("scenario", "")),
+                        entity_id=ci.get("entity_id", memory.get("entity_id", "")))
 
     async def _inject(self, sid: str, req: LLMRequest, user_id: str = "", recall_user_ids: list[str] | None = None,
                      do_passive_update: bool = False):
@@ -1006,18 +1125,22 @@ class AlifeMemoryPlugin(BasePlugin):
             "when_it_matters": {"type": "string", "description": "（偏好和项目类必填）什么时候该想起这条？什么场景下适用？", "default": ""}},
             "required": ["content"]})
     async def remember_fact(self, event: KiraMessageBatchEvent, content: str, summary: str = "",
-                            memory_type: str = "日常的", tags: str = "",
+                            memory_type: str = "日常事件", tags: str = "",
                             importance: float = 0.5, reason: str = "", when_it_matters: str = "") -> str:
         sid = getattr(event, "sid", "")
         if not sid or not content.strip():
             return "还不知道是在哪个会话说的，先聊起来再记吧"
-        # 校验类型
-        valid_types = {"关于我的", "我喜欢的", "正在发生的", "去哪查", "日常的"}
+        # 校验类型（新 6 类 + 兼容旧 5 类）
+        valid_types = {"关于实体", "偏好风格", "约定任务", "关系网络", "溯源查询", "日常事件"}
+        legacy_types = {"关于我的": "关于实体", "我喜欢的": "偏好风格", "正在发生的": "约定任务",
+                        "去哪查": "溯源查询", "日常的": "日常事件"}
         memory_type = memory_type.strip()
+        if memory_type in legacy_types:
+            memory_type = legacy_types[memory_type]
         if memory_type not in valid_types:
-            memory_type = "日常的"
-        # 偏好和项目类强制要求原因和适用场景
-        if memory_type in ("我喜欢的", "正在发生的"):
+            memory_type = "日常事件"
+        # 偏好和约定类强制要求原因和适用场景
+        if memory_type in ("偏好风格", "约定任务"):
             if not reason.strip() or not when_it_matters.strip():
                 return f"关于「{memory_type}」类的事情，最好也告诉我为什么是这样、什么时候该想起它，这样以后用起来才不迷糊。"
         summary = summary.strip() or content.strip().splitlines()[0][:100]
@@ -1029,31 +1152,21 @@ class AlifeMemoryPlugin(BasePlugin):
         processed_reason = self._convert_relative_dates(reason) if reason else ""
         processed_when = self._convert_relative_dates(when_it_matters) if when_it_matters else ""
 
-        # 组装摘要
-        type_tag = f"[{memory_type}]"
-        extra = ""
-        if reason:
-            extra += f" [原因:{processed_reason[:200]}]"
-        if when_it_matters:
-            extra += f" [何时想起:{processed_when[:200]}]"
-        content_with_meta = f"{type_tag} {processed_content.strip()}{extra}"
-        summary_with_meta = f"{type_tag} {summary}"
+        # 标签解析（逗号分隔字符串 → 数组）
+        tag_list = [t.strip() for t in tags.replace("，", ",").split(",") if t.strip()] if tags else []
 
-        # 标签追加到内容
-        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-        if tag_list:
-            tag_text = f"[标签:{','.join(tag_list)}] "
-            content_with_meta = tag_text + content_with_meta
-            summary_with_meta = tag_text + summary_with_meta
-
-        vector = await self._embed(summary_with_meta + "\n" + content_with_meta)
+        # 结构化落库：不塞字符串前缀，直接存字段
+        vector = await self._embed(summary + "\n" + processed_content)
         mid = await self.store.add_memory(
-            sid, self.max_level, summary_with_meta, content_with_meta,
+            sid, self.max_level, summary, processed_content,
             now, now, [], importance, vector, user_id=user_id,
+            memory_type=memory_type, tags=tag_list,
+            reason=processed_reason, scenario=processed_when,
+            entity_id=user_id,
             source_refs=[{"sid": sid, "user_id": user_id, "ts": now,
                           "action": "主动记录", "type": memory_type}],
             embed_model=self.embedding_model)
-        return f"已经记下了：{summary_with_meta[:80]}……（ID: {mid}，来源会话和保存时间已自动记录）"
+        return f"已经记下了：{summary[:80]}……（ID: {mid}，来源会话和保存时间已自动记录）"
 
     @register.tool(
         name="search_long_term_memory",
@@ -1137,12 +1250,11 @@ class AlifeMemoryPlugin(BasePlugin):
                 if s and s not in seen_sids:
                     seen_sids.add(s)
                     source_info += f"\n  来源会话: {s} | 用户: {ref.get('user_id', '') or 'unknown'} | 时间: {time.strftime('%Y-%m-%d %H:%M', time.localtime(ref.get('ts', 0)))}"
-        tags = ""
-        if memory["summary"].startswith("[标签:"):
-            tags = memory["summary"].split("]")[0].strip("[]")
+        tags = memory.get("tags") or []
+        mt = memory.get("memory_type") or "日常事件"
         parts = [
             f"记忆 ID: {memory['id']}",
-            f"层级: L{memory['level']}",
+            f"层级: L{memory['level']} | 类型: {mt}",
             f"状态: {memory.get('status', 'active')}",
             f"置信度: {memory.get('confidence', 0.65)*100:.0f}%",
             f"时间范围: {t_start} → {t_end}",
@@ -1150,7 +1262,13 @@ class AlifeMemoryPlugin(BasePlugin):
             f"详细内容: {memory['content']}",
         ]
         if tags:
-            parts.insert(0, f"标签: {tags}")
+            parts.insert(0, f"标签: {'、'.join(tags)}")
+        if memory.get("reason"):
+            parts.append(f"为什么记: {memory['reason']}")
+        if memory.get("scenario"):
+            parts.append(f"何时想起: {memory['scenario']}")
+        if memory.get("entity_id"):
+            parts.append(f"关联实体: {memory['entity_id']}")
         if source_info:
             parts.append(f"来源引用:{source_info}")
         if memory.get("correction_note"):
