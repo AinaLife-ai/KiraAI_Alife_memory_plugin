@@ -1133,6 +1133,10 @@ class AlifeMemoryPlugin(BasePlugin):
             **self.identity_report,
             "synthetic_remaining": await self.store.call("synthetic_identity"),
         }
+        status["boot"] = {
+            "enabled": self.settings.boot_enabled,
+            "replay_seconds": self.settings.boot_replay_seconds,
+        }
         status["sessions"] = await self.store.call("sessions")
         names = await self.store.call("entities", ids=status["sessions"], limit=1000)
         status["session_names"] = {n["id"]: n["name"] for n in names if n["name"]}

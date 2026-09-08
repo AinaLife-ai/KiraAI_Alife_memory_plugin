@@ -42,6 +42,8 @@ const fields = {
   proactive_interval: "主动感知间隔（秒）",
   proactive_sessions: "主动感知会话（每行一个）",
   compress_instruction: "压缩补充要求",
+  boot_enabled: "打开面板时播放载入动画",
+  boot_replay_seconds: "载入动画重播冷却（秒）",
 };
 let ctx = null,
   tab = "home",
@@ -286,6 +288,14 @@ async function poll() {
     asset = next.assets;
     const changed = !status || next.revision !== status.revision;
     status = next;
+    if (next.boot) {
+      bootConfig = {
+        enabled: next.boot.enabled !== false,
+        replay_seconds: Number(next.boot.replay_seconds) || 0,
+      };
+      localStorage.setItem("alife-boot", JSON.stringify(bootConfig));
+      if (!bootConfig.enabled && bootPlaying) endBoot();
+    }
     renderMigration(next.migration);
     $$('[data-job="reindex"]').forEach((e) => {
       e.disabled = !next.semantic_enabled;
@@ -866,6 +876,94 @@ $("#motion").onclick = () => {
   applyMotion();
 };
 applyMotion();
+const BOOT_QUOTES = [
+  "和谁的记忆，我都不想忘记",
+  "每段记忆，都有来处",
+  "和你的记忆，我不想再忘记",
+  "想念，念想",
+  "记得，是最长情的陪伴",
+  "把时间，收进可以回去的地方",
+  "走过的路，都在这里",
+  "你忘掉的，我替你记着",
+  "往事有光，来日有信",
+  "每一次相遇，都值得被留存",
+  "我们把日子，过成了故事",
+  "记忆不是负担，是归处",
+];
+let bootConfig = { enabled: true, replay_seconds: 90 };
+try {
+  Object.assign(bootConfig, JSON.parse(localStorage.getItem("alife-boot") || "{}"));
+} catch {}
+let bootPlaying = false,
+  bootTimer = null,
+  bootHiddenAt = 0;
+const BOOT_HTML =
+  '<div class="boot-stage">' +
+  '<div class="boot-ring"></div><div class="boot-orb"></div>' +
+  '<div class="boot-orb"></div><div class="boot-orb"></div>' +
+  '<div class="boot-frame"><img src="brand.png" alt="" /></div></div>' +
+  '<div class="boot-tagline">ALIFE MEMORY / Z EDITION</div>' +
+  '<div class="boot-quote" id="bootQuote"></div>' +
+  '<div class="boot-underline"></div>' +
+  '<div class="boot-hint">点击任意处跳过</div>';
+function bootQuote() {
+  const text = BOOT_QUOTES[Math.floor(Math.random() * BOOT_QUOTES.length)];
+  $("#bootQuote").replaceChildren(
+    ...[...text].map((ch, index) => {
+      const span = document.createElement("span");
+      span.textContent = ch;
+      span.style.setProperty("--i", index);
+      return span;
+    }),
+  );
+}
+function playBoot() {
+  const boot = $("#boot");
+  if (!boot || bootPlaying || !bootConfig.enabled) return;
+  bootPlaying = true;
+  boot.innerHTML = BOOT_HTML;
+  boot.hidden = false;
+  boot.classList.remove("skip");
+  bootQuote();
+  clearTimeout(bootTimer);
+  bootTimer = setTimeout(endBoot, 3900);
+}
+function endBoot() {
+  const boot = $("#boot");
+  if (!boot || !bootPlaying) return;
+  boot.classList.add("skip");
+  clearTimeout(bootTimer);
+  bootTimer = setTimeout(() => {
+    boot.hidden = true;
+    boot.classList.remove("skip");
+    bootPlaying = false;
+  }, 320);
+}
+$("#boot").onclick = endBoot;
+document.addEventListener("keydown", (event) => {
+  if (bootPlaying && ["Escape", "Enter", " "].includes(event.key)) endBoot();
+});
+function bootReplay() {
+  if (!bootHiddenAt) return;
+  const gap = (Date.now() - bootHiddenAt) / 1000;
+  bootHiddenAt = 0;
+  const cooldown = Number(bootConfig.replay_seconds);
+  if (cooldown > 0 && gap >= cooldown) playBoot();
+}
+new IntersectionObserver(
+  (entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) bootReplay();
+      else if (!bootHiddenAt) bootHiddenAt = Date.now();
+    }
+  },
+  { threshold: 0 },
+).observe(document.documentElement);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") bootReplay();
+  else if (!bootHiddenAt) bootHiddenAt = Date.now();
+});
+playBoot();
 $("#new").onclick = newMemory;
 $("#closeEditor").onclick = () => {
   $("#editor").close();
