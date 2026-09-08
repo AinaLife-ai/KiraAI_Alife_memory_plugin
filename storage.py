@@ -1432,11 +1432,22 @@ class Store:
                 (kind, sid),
             ).fetchone()[0]
 
-    def claim(self):
+    def claim(self, kind="", exclude=()):
+        """Claim the oldest queued job; dedupe has its own worker lane."""
+        clauses, args = ["state='queued'"], []
+        if kind:
+            clauses.append("kind=?")
+            args.append(kind)
+        if exclude:
+            clauses.append("kind NOT IN (SELECT value FROM json_each(?))")
+            args.append(dump(list(exclude)))
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT * FROM jobs WHERE state='queued' ORDER BY created LIMIT 1"
+                "SELECT * FROM jobs WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created LIMIT 1",
+                args,
             ).fetchone()
             if row:
                 db.execute(

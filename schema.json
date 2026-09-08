@@ -258,8 +258,8 @@
       "dedupe_threshold": {
         "type": "float",
         "name": "永久记忆相似度阈值",
-        "default": 0.3,
-        "description": "相似度阈值：越高越保守。0.3 只把疑似重复的永久记忆交给模型判断，最终是否合并由模型决定。",
+        "default": 0.25,
+        "description": "相似度阈值：越高越保守。0.25 只把疑似重复的永久记忆交给模型判断，最终是否合并由模型决定。",
         "minimum": 0.1,
         "maximum": 0.95
       }

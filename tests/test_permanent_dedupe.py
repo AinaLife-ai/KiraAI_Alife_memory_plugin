@@ -33,6 +33,16 @@ def seed(store):
     ]
 
 
+def test_dedupe_runs_on_its_own_job_lane(tmp_path):
+    store = s.Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.enqueue("dedupe", SID)
+    store.enqueue("compress", SID)
+    assert store.claim(exclude=("dedupe",))["kind"] == "compress"
+    assert store.claim(kind="dedupe")["kind"] == "dedupe"
+    assert store.claim() is None
+
+
 def test_similarity_and_clustering():
     assert r.similarity(TEXTS[0], TEXTS[1]) > 0.3
     assert r.similarity(TEXTS[0], "今天天气不错适合出门散步") == 0.0

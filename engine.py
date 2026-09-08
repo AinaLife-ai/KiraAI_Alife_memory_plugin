@@ -92,6 +92,9 @@ class Engine:
 
     async def start(self):
         self.tasks = [asyncio.create_task(self.worker(i)) for i in range(4)]
+        # Permanent-memory dedupe runs on its own lane so it never occupies the
+        # configured background concurrency.
+        self.tasks.append(asyncio.create_task(self.dedupe_worker()))
         self.tasks.append(asyncio.create_task(self.scheduler()))
 
     async def stop(self):
@@ -124,12 +127,18 @@ class Engine:
                 + cfg.compress_instruction
                 if purpose == "compress"
                 else (
-                    "只输出一个action：keep 或 merge。"
-                    "若多条永久记忆确属同一件事的重复或前后更正，action=merge，"
-                    "content为合并后的完整记忆：保留时间、否定、条件和所有关键细节，不得丢信息；"
-                    "source_ids为参与合并的记录ID（至少两条，逐字复制records[].id）。"
-                    "若它们只是话题相近、互为补充但并非同一件事，或你无法确定，action=keep。"
-                    "禁止编造ID。"
+                    "records 按时间从新到旧排列，records[0] 是最新的那条。"
+                    "只输出一个 action：keep 或 merge。"
+                    "只有同时满足三条才 merge：①指向同一个对象（同一个人、同一个群、"
+                    "同一份名单或同一个约定）；②说的是该对象的同一件事或同一属性；"
+                    "③互为重复，或后者是对前者的更正/补充。"
+                    "任意一条不满足就 keep，例如主体不同（阿远 vs 小夏）、只是话题相近、"
+                    "说的是两件不同的事。"
+                    "互相矛盾时按更正处理：content 只保留时间较晚的说法，reason 说明是更正，"
+                    "不要保留已被推翻的旧结论。"
+                    "content 必须自包含：写清对象、时间与结论；原样保留人名、群名、数字、"
+                    "QQ号与日期；不得丢掉任何一条独有的关键信息；不得写“同上”或引用其他记录ID。"
+                    "source_ids 至少两条，逐字复制 records[].id；禁止编造ID。"
                     if purpose == "dedupe"
                     else "审计输出只含actions，禁止输出summary/facts。target_id和source_ids均来自facts[].id，不是evidence[].id或facts[].sources。keep/correct的source_ids只能是[target_id]；merge至少两个同会话、同主体、同分类事实ID，每个事实只能参与一次操作。无需操作时actions=[]。依据证据审计，保留否定、时间和不确定性；不同事件不得因相似而合并。关系警告需核对原文，correct时提供修正后的relations；无法证实连线时设为空数组。无须改关系时设null。"
                 )
@@ -326,6 +335,7 @@ class Engine:
         for group in permanent_clusters(rows, cfg.dedupe_threshold):
             ids = {item["id"] for item in group}
             payload = {
+                "latest": group[0]["id"],
                 "records": [
                     {
                         "id": item["id"],
@@ -334,7 +344,7 @@ class Engine:
                         "end": item["end"],
                     }
                     for item in group
-                ]
+                ],
             }
             output = await self.structured(RecordMerge, "dedupe", payload, cfg)
             if output["action"] != "merge":
@@ -365,7 +375,7 @@ class Engine:
             if not cfg.enabled or index >= cfg.worker_count:
                 await asyncio.sleep(0.5)
                 continue
-            job = await self.store.call("claim")
+            job = await self.store.call("claim", exclude=("dedupe",))
             if not job:
                 self.wake.clear()
                 try:
@@ -443,6 +453,35 @@ class Engine:
                     ),
                     time.monotonic() - started,
                 )
+
+    async def dedupe_worker(self):
+        """Dedicated lane for permanent-memory consolidation."""
+        while not self.stopping:
+            cfg = self.settings()
+            if not cfg.enabled or not cfg.permanent_dedupe:
+                await asyncio.sleep(1)
+                continue
+            job = await self.store.call("claim", kind="dedupe")
+            if not job:
+                await asyncio.sleep(1)
+                continue
+            started = time.monotonic()
+            try:
+                await self.consolidate(job["sid"])
+                await self.store.call("finish", job["id"], "completed")
+                logger.info(
+                    "[记忆·Z] 永久记忆合并完成，耗时 %.1f 秒",
+                    time.monotonic() - started,
+                )
+            except asyncio.CancelledError:
+                await self.store.call(
+                    "finish", job["id"], "queued", "paused during reload"
+                )
+                raise
+            except Exception as exc:
+                detail = failure_detail(exc)
+                await self.store.call("finish", job["id"], "failed", detail)
+                logger.warning("[记忆·Z] 永久记忆合并失败：%s", detail)
 
     async def scheduler(self):
         last_compress = 0.0

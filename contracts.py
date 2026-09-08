@@ -144,7 +144,7 @@ class Settings(Strict):
     boot_replay_seconds: int = Field(default=90, ge=0, le=86400)
     session_affinity: bool = False
     permanent_dedupe: bool = True
-    dedupe_threshold: float = Field(default=0.3, ge=0.1, le=0.95)
+    dedupe_threshold: float = Field(default=0.25, ge=0.1, le=0.95)
 
     @model_validator(mode="after")
     def valid_batch(self):
