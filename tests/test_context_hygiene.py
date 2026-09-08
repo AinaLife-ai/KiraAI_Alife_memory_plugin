@@ -167,10 +167,6 @@ def test_totals_and_top_users_respect_scope(tmp_path):
     assert session["sessions"] == 1 and session["groups"] == 1
     whole = store.totals(SID, ["qq:1"], "global")
     assert whole["records"] == 5 and whole["users"] == 3 and whole["sessions"] == 2
-    top = store.top_users(SID, ["qq:1"], "global", limit=10)
-    assert top["total"] == 3 and top["items"][0]["user_id"] == "qq:1"
-    capped = store.top_users(SID, ["qq:1"], "global", limit=1)
-    assert len(capped["items"]) == 1 and capped["total"] == 3
 
 
 def test_session_affinity_reorders_without_narrowing(tmp_path):

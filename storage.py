@@ -717,25 +717,6 @@ class Store:
             "permanent": row["permanent"],
         }
 
-    def top_users(self, sid="", users=(), scope="session", limit=10):
-        clause, args = self._scope_clause("records", scope, sid, users)
-        with self.connect() as db:
-            rows = [
-                dict(r)
-                for r in db.execute(
-                    "SELECT value AS user_id, count(DISTINCT records.id) AS records "
-                    f"FROM records, json_each(records.users) WHERE records.deleted=0 AND {clause} "
-                    "GROUP BY value ORDER BY records DESC, value LIMIT ?",
-                    [*args, limit],
-                )
-            ]
-            total = db.execute(
-                "SELECT count(DISTINCT value) FROM records, json_each(records.users) "
-                f"WHERE records.deleted=0 AND {clause}",
-                args,
-            ).fetchone()[0]
-        return {"items": rows, "total": total}
-
     def needs_tool_cleanup(self):
         with self.connect() as db:
             return not db.execute(
@@ -1283,19 +1264,6 @@ class Store:
             for row in rows:
                 result.setdefault(row["target"], []).append(dict(row))
             return result
-
-    def known_users(self, sid, global_scope=False):
-        with self.connect() as db:
-            where = "records.deleted=0" + ("" if global_scope else " AND records.sid=?")
-            return [
-                dict(r)
-                for r in db.execute(
-                    "SELECT value AS user_id,count(DISTINCT records.id) AS records FROM records,json_each(records.users) WHERE "
-                    + where
-                    + " GROUP BY value ORDER BY value",
-                    () if global_scope else (sid,),
-                )
-            ]
 
     def classify(self, row, output):
         with self.connect() as db:

@@ -1086,7 +1086,7 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @register.tool(
         name="MemoryOverview",
-        description="感知总体记忆、用户画像、关系、偏好、约定；返回统计总量与最常往来的用户；subject 为实体 ID，支持翻页。",
+        description="感知总体记忆、用户画像、关系、偏好、约定；返回统计总量（记录/事实/人数/会话/永久记忆）；subject 为实体 ID，支持翻页。",
         params={
             "type": "object",
             "properties": {
@@ -1112,28 +1112,15 @@ class AlifeMemoryPlugin(BasePlugin):
             include_shared=True,
         )
         context = await self.store.call("context", event.sid, user_ids(event))
-        scope = self.settings.recall_scope
-        totals = await self.store.call("totals", event.sid, user_ids(event), scope)
-        top = await self.store.call(
-            "top_users", event.sid, user_ids(event), scope, 10
+        totals = await self.store.call(
+            "totals", event.sid, user_ids(event), self.settings.recall_scope
         )
-        names = {
-            n["id"]: n["name"]
-            for n in await self.store.call(
-                "entities", ids=[item["user_id"] for item in top["items"]], limit=50
-            )
-            if n["name"]
-        }
-        for item in top["items"]:
-            item["name"] = names.get(item["user_id"], "")
         return self.recall_result(
             event,
             {
                 "ok": True,
                 "active_archives": len(context),
                 "totals": totals,
-                "known_users": top["items"],
-                "known_users_total": top["total"],
                 "subjects": sorted({r["subject"] for r in rows}),
                 "facts": safe_facts(rows),
                 "next_offset": offset + len(rows),
