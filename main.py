@@ -37,7 +37,16 @@ from . import identity
 from .engine import Engine, compression_plan
 from .storage import Conflict, Store
 from .migration import SOURCES
-from .retrieval import safe_facts, archive_view, RecallWindow, asks_for_more
+from .retrieval import (
+    TOOL_RESULT_PREFIX,
+    archive_view,
+    asks_for_more,
+    looks_like_memory_payload,
+    safe_facts,
+    tool_call_summary,
+    tool_preview,
+    RecallWindow,
+)
 from .setting_help import HELP
 
 PLUGIN_ID = "alife_memory_z"
@@ -97,6 +106,7 @@ class AlifeMemoryPlugin(BasePlugin):
         self.name_refresh_lock = asyncio.Lock()
         self.recall_window = RecallWindow()
         self._recall_outputs = {}
+        self._own_outputs = set()
 
     def conflicts(self):
         pm = getattr(self.ctx, "plugin_mgr", None)
@@ -204,6 +214,18 @@ class AlifeMemoryPlugin(BasePlugin):
             # A failed migration must never block loading; sources stay read-only.
             logger.exception("[记忆·Z] 迁移未完成；插件继续加载，原文件保留")
             self.migration_blocked = False
+        try:
+            if await self.store.call("needs_tool_cleanup"):
+                report = await self.store.call("cleanup_tool_records")
+                logger.info(
+                    "[记忆·Z] 历史工具记录清理：扫描 %s · 移除 %s · 重写 %s · 约省 %s 字符",
+                    report["scanned"],
+                    report["removed"],
+                    report["rewritten"],
+                    report["freed_chars"],
+                )
+        except Exception:
+            logger.exception("[记忆·Z] 历史工具记录清理未完成，可稍后在后台任务页重试")
         await self.engine.start()
         logger.info(
             "[记忆·Z] 记忆系统就绪 · 访问范围 %s · 向量检索%s",
@@ -310,7 +332,31 @@ class AlifeMemoryPlugin(BasePlugin):
         )
         return tuple(adapters.keys())
 
-    async def refresh_name(self, entity_id, adapter_hint="", reason="adapter lookup"):
+    async def _bind_name_identity(self, entity_id, target, group, adapter, number):
+        await self.store.call(
+            "canonicalize_identity",
+            self.adapter_names(),
+            {
+                entity_id: (
+                    target,
+                    target if group else f"{adapter}:dm:{number}",
+                    "session" if group else "user",
+                )
+            },
+        )
+
+    async def refresh_name(
+        self, entity_id, adapter_hint="", reason="adapter lookup", skip_named=False
+    ):
+        entity, _wrote = await self.refresh_name_detail(
+            entity_id, adapter_hint, reason, skip_named
+        )
+        return entity
+
+    async def refresh_name_detail(
+        self, entity_id, adapter_hint="", reason="adapter lookup", skip_named=False
+    ):
+        """Return ``(entity, wrote)``; ``wrote`` is True only when a name was stored."""
         # Prefer the session's adapter, then the id prefix, then every adapter.
         # A bare number kept from migration can still be looked up and bound.
         shape = identity.legacy_shape(entity_id) or identity.pending_shape(entity_id)
@@ -326,8 +372,12 @@ class AlifeMemoryPlugin(BasePlugin):
         if manager is None:
             raise ValueError("adapter does not support name lookup")
         synthetic = identity.synthetic(entity_id)
-        if not synthetic and not await self.store.call("entities", ids=[entity_id]):
-            raise ValueError("unknown entity")
+        if not synthetic:
+            rows = await self.store.call("entities", ids=[entity_id])
+            if not rows:
+                raise ValueError("unknown entity")
+            if skip_named and rows[0]["name"]:
+                return rows[0], False
         candidates = [adapter_hint, adapter, *self.adapter_names()]
         async with self.name_refresh_lock:
             for name in dict.fromkeys(n for n in candidates if n):
@@ -353,6 +403,15 @@ class AlifeMemoryPlugin(BasePlugin):
                     if synthetic
                     else entity_id
                 )
+                if skip_named:
+                    existing = await self.store.call("entities", ids=[target])
+                    if existing and existing[0]["name"]:
+                        # Never overwrite a filled name; only bind the placeholder.
+                        if synthetic:
+                            await self._bind_name_identity(
+                                entity_id, target, group, name, number
+                            )
+                        return existing[0], False
                 await self.store.call(
                     "observe_name",
                     target,
@@ -362,20 +421,12 @@ class AlifeMemoryPlugin(BasePlugin):
                     reason=reason,
                 )
                 if synthetic:
-                    await self.store.call(
-                        "canonicalize_identity",
-                        self.adapter_names(),
-                        {
-                            entity_id: (
-                                target,
-                                target if group else f"{name}:dm:{number}",
-                                "session" if group else "user",
-                            )
-                        },
+                    await self._bind_name_identity(
+                        entity_id, target, group, name, number
                     )
                 rows = await self.store.call("entities", ids=[target])
                 if rows:
-                    return rows[0]
+                    return rows[0], True
         raise ValueError("adapter does not support name lookup")
 
     @register.tool(
@@ -436,7 +487,7 @@ class AlifeMemoryPlugin(BasePlugin):
             await self.store.call(
                 "observe_name", **edit.model_dump(), source="bot", context=event.sid
             )
-            return dump({"ok": True})
+            return self.recall_result(event, {"ok": True})
         except ValueError:
             return dump({"ok": False, "error": "invalid_or_conflicting_name"})
 
@@ -460,13 +511,14 @@ class AlifeMemoryPlugin(BasePlugin):
                 and not await self.store.call("entities", ids=[entity_id])
             ):
                 raise ValueError("not accessible")
-            return dump(
+            return self.recall_result(
+                event,
                 {
                     "ok": True,
                     "entity": await self.refresh_name(
                         entity_id, event.session.adapter_name
                     ),
-                }
+                },
             )
         except (ValueError, TimeoutError):
             return dump({"ok": False, "error": "name_lookup_unavailable"})
@@ -512,6 +564,11 @@ class AlifeMemoryPlugin(BasePlugin):
         if continuation:
             query = previous["query"]
         rows = await self.store.call("context", sid, users, scope=cfg.recall_scope)
+        prefer = (
+            {"prefer_sid": sid, "prefer_users": tuple(users)}
+            if cfg.session_affinity
+            else {}
+        )
         facts = await self.store.call(
             "facts",
             sid,
@@ -519,6 +576,7 @@ class AlifeMemoryPlugin(BasePlugin):
             users=users,
             include_shared=True,
             exclude_ids=previous["facts"] if continuation else (),
+            **prefer,
         )
         related = []
         if cfg.recall_scope != "session" and query.strip():
@@ -531,6 +589,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 limit=cfg.top_k * 2,
                 exclude_sid="" if continuation else sid,
                 exclude_ids=previous["ids"] if continuation else (),
+                **prefer,
             )
             local_ids = {r["id"] for r in rows}
             related = [
@@ -550,6 +609,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 lexical=query,
                 limit=cfg.top_k,
                 exclude_ids=previous["facts"] if continuation else (),
+                **prefer,
             )
             facts = list({f["id"]: f for f in [*extra, *facts]}.values())
         while len(dump(related)) > cfg.context_chars // 4 and related:
@@ -561,6 +621,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 *users,
                 *(u for r in related for u in r["users"]),
                 *(r["sid"] for r in related),
+                *(f["sid"] for f in facts),
             },
             limit=30,
         )
@@ -572,6 +633,17 @@ class AlifeMemoryPlugin(BasePlugin):
             }
             for n in names
         ]
+        if cfg.session_affinity:
+            # Provenance lets the model prefer this session without hiding others.
+            session_names = {n["id"]: n["name"] for n in names}
+            for item in related:
+                item["source_session"] = item["sid"]
+                item["same_session"] = item["sid"] == sid
+                item["session_name"] = session_names.get(item["sid"], "")
+            for fact in facts:
+                fact["source_session"] = fact["sid"]
+                fact["same_session"] = fact["sid"] == sid
+                fact["session_name"] = session_names.get(fact["sid"], "")
         # Memory data is a request-only user block; host history stays byte-stable.
         # Keep complete records and give explicit IDs for anything outside the budget.
         budget = cfg.context_chars - len(dump(related)) - len(dump(names)) - 1000
@@ -694,9 +766,16 @@ class AlifeMemoryPlugin(BasePlugin):
             for m in event.messages
         ]
         await self.store.call("capture", sid, base + ":input", incoming)
-        content = response.text_response
+        text = response.text_response or ""
+        content = text
+        summary = text.strip()
         if response.tool_calls:
-            content += "\n" + dump({"tool_calls": response.tool_calls})
+            content += ("\n" if content else "") + dump(
+                {"tool_calls": response.tool_calls}
+            )
+            summary = (
+                (summary + "\n" if summary else "") + tool_call_summary(response.tool_calls)
+            )
         await self.store.call(
             "capture",
             sid,
@@ -705,6 +784,8 @@ class AlifeMemoryPlugin(BasePlugin):
                 {
                     "role": "assistant",
                     "content": content,
+                    # The raw tool_calls JSON stays in content, never in the summary.
+                    "summary": summary or "（无文字回复）",
                     "time": time.time(),
                     "users": users,
                 }
@@ -717,14 +798,14 @@ class AlifeMemoryPlugin(BasePlugin):
 
     def recall_result(self, event, value):
         text = dump(value)
-        key = (
-            event.sid,
-            str(event.event_id),
-            hashlib.sha256(text.encode()).hexdigest(),
-        )
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        key = (event.sid, str(event.event_id), digest)
         self._recall_outputs[key] = None
         while len(self._recall_outputs) > 128:
             self._recall_outputs.pop(next(iter(self._recall_outputs)))
+        self._own_outputs.add(digest)
+        while len(self._own_outputs) > 256:
+            self._own_outputs.pop()
         return text
 
     @on.tool_result(priority=Priority.LOW)
@@ -733,15 +814,18 @@ class AlifeMemoryPlugin(BasePlugin):
             return
         content = await result.assemble_result()
         text = content if isinstance(content, str) else dump(content)
-        recalled = (
-            event.sid,
-            str(event.event_id),
-            hashlib.sha256(text.encode()).hexdigest(),
-        )
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        recalled = (event.sid, str(event.event_id), digest)
         if recalled in self._recall_outputs:
             del self._recall_outputs[recalled]
             return
-        key = str(event.event_id) + ":tool:" + hashlib.sha256(text.encode()).hexdigest()
+        # The same payload may arrive under a different event id after a reload.
+        if digest in self._own_outputs:
+            self._own_outputs.discard(digest)
+            return
+        if looks_like_memory_payload(text):
+            return
+        key = str(event.event_id) + ":tool:" + digest
         await self.store.call(
             "capture",
             event.sid,
@@ -749,7 +833,9 @@ class AlifeMemoryPlugin(BasePlugin):
             [
                 {
                     "role": "assistant",
-                    "content": "工具感知结果：\n" + text,
+                    "content": TOOL_RESULT_PREFIX + "\n" + text,
+                    # Keep the full payload in content; inject only a short preview.
+                    "summary": TOOL_RESULT_PREFIX + tool_preview(text),
                     "time": time.time(),
                     "users": user_ids(event),
                 }
@@ -971,7 +1057,7 @@ class AlifeMemoryPlugin(BasePlugin):
             "memorize", value.sid, value.content, value.users, now, now
         )
         await self.engine.enqueue("classify", record_id)
-        return dump({"ok": True, "id": record_id})
+        return self.recall_result(event, {"ok": True, "id": record_id})
 
     @register.tool(
         name="Forget",
@@ -994,13 +1080,13 @@ class AlifeMemoryPlugin(BasePlugin):
                 {"active": False},
                 "agent forgot permanent memory",
             )
-            return dump({"ok": True, "archive_preserved": True})
+            return self.recall_result(event, {"ok": True, "archive_preserved": True})
         except ValueError:
             return dump({"ok": False, "error": "not_accessible_or_not_permanent"})
 
     @register.tool(
         name="MemoryOverview",
-        description="感知总体记忆、用户画像、关系、偏好、约定；subject 为实体 ID，支持翻页。",
+        description="感知总体记忆、用户画像、关系、偏好、约定；返回统计总量（记录/事实/人数/会话/永久记忆）；subject 为实体 ID，支持翻页。",
         params={
             "type": "object",
             "properties": {
@@ -1026,15 +1112,15 @@ class AlifeMemoryPlugin(BasePlugin):
             include_shared=True,
         )
         context = await self.store.call("context", event.sid, user_ids(event))
-        known = await self.store.call(
-            "known_users", event.sid, self.settings.recall_scope == "global"
+        totals = await self.store.call(
+            "totals", event.sid, user_ids(event), self.settings.recall_scope
         )
         return self.recall_result(
             event,
             {
                 "ok": True,
                 "active_archives": len(context),
-                "known_users": known,
+                "totals": totals,
                 "subjects": sorted({r["subject"] for r in rows}),
                 "facts": safe_facts(rows),
                 "next_offset": offset + len(rows),
@@ -1067,7 +1153,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 reason=reason,
             )
             await self.store.call("edit", **edit.model_dump())
-            return dump({"ok": True})
+            return self.recall_result(event, {"ok": True})
         except ValueError:
             return dump({"ok": False, "error": "invalid_or_conflicting_edit"})
 
@@ -1103,6 +1189,10 @@ class AlifeMemoryPlugin(BasePlugin):
         status["identity"] = {
             **self.identity_report,
             "synthetic_remaining": await self.store.call("synthetic_identity"),
+        }
+        status["boot"] = {
+            "enabled": self.settings.boot_enabled,
+            "replay_seconds": self.settings.boot_replay_seconds,
         }
         status["sessions"] = await self.store.call("sessions")
         names = await self.store.call("entities", ids=status["sessions"], limit=1000)
@@ -1312,18 +1402,25 @@ class AlifeMemoryPlugin(BasePlugin):
                 422, "当前适配器无法查询该ID的名称，请手工校正或等待新消息"
             ) from None
 
+    @register.api(method="GET", path="/names/pending", auth=True)
+    async def api_name_pending(self):
+        ids = await self.store.call("refreshable_names", 200)
+        return {"ids": ids, "total": len(ids)}
+
     @register.api(method="POST", path="/names/refresh-batch", auth=True)
     async def api_name_refresh_batch(self, request: Request):
         value = await self.body(request, NameBatch)
         ids = value.ids or await self.store.call("refreshable_names", 200)
-        updated, failed = [], []
+        updated, skipped, failed = [], [], []
         for entity_id in ids[:200]:
             try:
-                entity = await self.refresh_name(
-                    entity_id, reason=value.reason
+                entity, wrote = await self.refresh_name_detail(
+                    entity_id, reason=value.reason, skip_named=True
                 )
-                if entity.get("name"):
+                if wrote:
                     updated.append(entity_id)
+                elif entity.get("name"):
+                    skipped.append(entity_id)
                 else:
                     failed.append(entity_id)
             except Exception:
@@ -1333,9 +1430,15 @@ class AlifeMemoryPlugin(BasePlugin):
             "ok": True,
             "reason": value.reason,
             "updated": updated,
+            "skipped": skipped,
             "failed": failed,
             "remaining": len(await self.store.call("refreshable_names", 200)),
         }
+
+    @register.api(method="POST", path="/maintenance/tools", auth=True)
+    async def api_cleanup_tools(self):
+        report = await self.store.call("cleanup_tool_records")
+        return {"ok": True, **report}
 
     @register.api(method="POST", path="/migrate", auth=True)
     async def api_migrate(self):

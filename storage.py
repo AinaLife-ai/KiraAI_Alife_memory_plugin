@@ -295,7 +295,8 @@ class Store:
                         msg["role"],
                         msg["time"],
                         msg["time"],
-                        msg["content"],
+                        # The summary is what reaches the model; content keeps the full text.
+                        msg.get("summary") or msg["content"],
                         msg["content"],
                         dump(msg["users"]),
                         pos,
@@ -661,6 +662,148 @@ class Store:
                     break
         return result
 
+    @staticmethod
+    def _scope_clause(alias, scope, sid, users):
+        """Visibility predicate shared by totals and top-user ranking."""
+        if scope == "global":
+            return "1=1", []
+        if scope == "linked":
+            return (
+                f"({alias}.sid=? OR {alias}.visibility='global' OR EXISTS "
+                f"(SELECT 1 FROM json_each({alias}.users) WHERE value IN "
+                "(SELECT value FROM json_each(?))))",
+                [sid, dump(list(users))],
+            )
+        return (
+            f"({alias}.sid=? OR {alias}.visibility='global' OR "
+            f"({alias}.visibility='user' AND EXISTS "
+            f"(SELECT 1 FROM json_each({alias}.users) WHERE value IN "
+            "(SELECT value FROM json_each(?)))))",
+            [sid, dump(list(users))],
+        )
+
+    def totals(self, sid="", users=(), scope="session"):
+        clause, args = self._scope_clause("records", scope, sid, users)
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT count(*) AS records, coalesce(sum(permanent),0) AS permanent, "
+                f"count(DISTINCT sid) AS sessions FROM records WHERE deleted=0 AND {clause}",
+                args,
+            ).fetchone()
+            people = db.execute(
+                "SELECT count(DISTINCT value) FROM records, json_each(records.users) "
+                f"WHERE records.deleted=0 AND {clause}",
+                args,
+            ).fetchone()[0]
+            groups = db.execute(
+                f"SELECT count(DISTINCT sid) FROM records WHERE deleted=0 AND {clause} "
+                "AND instr(sid,':gm:')>0",
+                args,
+            ).fetchone()[0]
+            source_clause, source_args = self._scope_clause("r", scope, sid, users)
+            facts = db.execute(
+                f"""SELECT count(*) FROM facts WHERE deleted=0 AND (
+                  sid IN (SELECT sid FROM records WHERE deleted=0 AND {clause})
+                  OR EXISTS(SELECT 1 FROM json_each(facts.sources) v JOIN records r
+                            ON r.id=v.value WHERE r.deleted=0 AND {source_clause}))""",
+                [*args, *source_args],
+            ).fetchone()[0]
+        return {
+            "records": row["records"],
+            "facts": facts,
+            "users": people,
+            "sessions": row["sessions"],
+            "groups": groups,
+            "permanent": row["permanent"],
+        }
+
+    def needs_tool_cleanup(self):
+        with self.connect() as db:
+            return not db.execute(
+                "SELECT 1 FROM meta WHERE key='tools_cleanup'"
+            ).fetchone()
+
+    def cleanup_tool_records(self):
+        """One-time repair for legacy tool payloads that flood the context.
+
+        Self-recall echoes are soft-deleted (raw text stays in the database);
+        other tool records keep their content but gain a readable summary.
+        Idempotent: after the first pass nothing matches any more.
+        """
+        from .retrieval import (
+            TOOL_RESULT_PREFIX,
+            looks_like_memory_payload,
+            tool_call_summary,
+            tool_preview,
+        )
+
+        report = {"scanned": 0, "removed": 0, "rewritten": 0, "freed_chars": 0}
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT id,sid,role,summary,content FROM records WHERE deleted=0 AND "
+                "(summary LIKE ? OR summary LIKE ?)",
+                (TOOL_RESULT_PREFIX + "%", '%{"tool_calls"%'),
+            ).fetchall()
+            for row in rows:
+                report["scanned"] += 1
+                summary, content = row["summary"], row["content"]
+                if looks_like_memory_payload(
+                    summary
+                ) or looks_like_memory_payload(content):
+                    db.execute(
+                        "INSERT INTO versions(kind,target,snapshot,reason,created) "
+                        "VALUES ('record',?,?,?,?)",
+                        (
+                            row["id"],
+                            dump(dict(row)),
+                            "清理自身记忆读取回声",
+                            time.time(),
+                        ),
+                    )
+                    db.execute(
+                        "UPDATE records SET deleted=1,revision=revision+1 WHERE id=?",
+                        (row["id"],),
+                    )
+                    self._orphan_facts(db, row["id"])
+                    report["removed"] += 1
+                    report["freed_chars"] += len(summary)
+                    continue
+                if summary.startswith(TOOL_RESULT_PREFIX):
+                    if len(summary) <= 400:
+                        continue
+                    new_summary = TOOL_RESULT_PREFIX + tool_preview(
+                        summary[len(TOOL_RESULT_PREFIX) :]
+                    )
+                else:
+                    text_part, _, blob = summary.partition("\n{")
+                    label = ""
+                    try:
+                        label = tool_call_summary(
+                            json.loads("{" + blob).get("tool_calls", [])
+                        )
+                    except (ValueError, TypeError, AttributeError):
+                        label = ""
+                    new_summary = (
+                        (text_part.strip() + " ") if text_part.strip() else ""
+                    ) + (label or "[调用工具]")
+                if new_summary == summary:
+                    continue
+                db.execute(
+                    "INSERT INTO versions(kind,target,snapshot,reason,created) "
+                    "VALUES ('record',?,?,?,?)",
+                    (row["id"], dump(dict(row)), "工具记录摘要压缩", time.time()),
+                )
+                db.execute(
+                    "UPDATE records SET summary=?,revision=revision+1 WHERE id=?",
+                    (new_summary, row["id"]),
+                )
+                report["rewritten"] += 1
+                report["freed_chars"] += max(0, len(summary) - len(new_summary))
+            db.execute("INSERT OR REPLACE INTO meta VALUES ('tools_cleanup',1)")
+            self.bump(db)
+        return report
+
     def migration_status(self):
         with self.connect() as db:
             return {
@@ -909,27 +1052,28 @@ class Store:
             else:
                 db.execute("DELETE FROM vectors WHERE id=?", (target,))
                 if patch.get("deleted"):
-                    # Derived facts with no remaining live evidence must not be recalled.
-                    for fact in db.execute(
-                        """SELECT * FROM facts WHERE deleted=0
-                      AND EXISTS(SELECT 1 FROM json_each(facts.sources) WHERE value=?)
-                      AND NOT EXISTS(SELECT 1 FROM records,json_each(facts.sources) src WHERE records.id=src.value AND records.deleted=0)""",
-                        (target,),
-                    ).fetchall():
-                        db.execute(
-                            "INSERT INTO versions(kind,target,snapshot,reason,created) VALUES ('fact',?,?,?,?)",
-                            (
-                                fact["id"],
-                                dump(dict(fact)),
-                                "source deleted",
-                                time.time(),
-                            ),
-                        )
-                        db.execute(
-                            "UPDATE facts SET deleted=1,revision=revision+1 WHERE id=?",
-                            (fact["id"],),
-                        )
+                    self._orphan_facts(db, target)
             self.bump(db)
+
+    @staticmethod
+    def _orphan_facts(db, record_id):
+        """Derived facts with no remaining live evidence must not be recalled."""
+        for fact in db.execute(
+            """SELECT * FROM facts WHERE deleted=0
+              AND EXISTS(SELECT 1 FROM json_each(facts.sources) WHERE value=?)
+              AND NOT EXISTS(SELECT 1 FROM records,json_each(facts.sources) src
+                             WHERE records.id=src.value AND records.deleted=0)""",
+            (record_id,),
+        ).fetchall():
+            db.execute(
+                "INSERT INTO versions(kind,target,snapshot,reason,created) "
+                "VALUES ('fact',?,?,?,?)",
+                (fact["id"], dump(dict(fact)), "source deleted", time.time()),
+            )
+            db.execute(
+                "UPDATE facts SET deleted=1,revision=revision+1 WHERE id=?",
+                (fact["id"],),
+            )
 
     def search(
         self,
@@ -949,6 +1093,8 @@ class Store:
         lexical="",
         exclude_sid="",
         exclude_ids=(),
+        prefer_sid="",
+        prefer_users=(),
     ):
         clauses, args = ["deleted=0"], []
         if exclude_ids:
@@ -988,6 +1134,15 @@ class Store:
                 "EXISTS (SELECT 1 FROM json_each(records.users) WHERE value=?)"
             )
             args.append(subject)
+        tier_sql, tier_args = "", []
+        if prefer_sid or prefer_users:
+            # Session affinity only reorders; the recall scope stays untouched.
+            tier_sql = (
+                "CASE WHEN sid=? THEN 0 WHEN EXISTS(SELECT 1 FROM json_each(records.users) "
+                "WHERE value IN (SELECT value FROM json_each(?))) THEN 1 "
+                "WHEN visibility='global' THEN 2 ELSE 3 END, "
+            )
+            tier_args = [prefer_sid, dump(list(prefer_users))]
         with self.connect() as db:
             if lexical and not vector:
                 from .retrieval import relevance
@@ -1019,18 +1174,18 @@ class Store:
                 db.create_function("similarity", 1, cosine)
                 sql = f"""SELECT records.*,coalesce((SELECT similarity(vector) FROM vectors WHERE vectors.id=records.id
                   AND vectors.model=? AND vectors.revision=records.revision),-1) AS score FROM records WHERE {where}
-                  ORDER BY score DESC,end,id LIMIT ? OFFSET ?"""
-                rows = db.execute(sql, [model, *args, limit, offset])
+                  ORDER BY {tier_sql}score DESC,end,id LIMIT ? OFFSET ?"""
+                rows = db.execute(sql, [model, *args, *tier_args, limit, offset])
             else:
                 rows = db.execute(
                     "SELECT * FROM records WHERE "
                     + where
                     + (
-                        " ORDER BY lexical_score(summary) DESC,end,id LIMIT ? OFFSET ?"
+                        f" ORDER BY {tier_sql}lexical_score(summary) DESC,end,id LIMIT ? OFFSET ?"
                         if lexical
-                        else " ORDER BY end,id LIMIT ? OFFSET ?"
+                        else f" ORDER BY {tier_sql}end,id LIMIT ? OFFSET ?"
                     ),
-                    [*args, limit, offset],
+                    [*args, *tier_args, limit, offset],
                 )
             return {"total": total, "items": [self.row(r) for r in rows]}
 
@@ -1046,6 +1201,8 @@ class Store:
         include_shared=False,
         lexical="",
         exclude_ids=(),
+        prefer_sid="",
+        prefer_users=(),
     ):
         where, args = ["deleted=0"], []
         if exclude_ids:
@@ -1064,6 +1221,14 @@ class Store:
             if value:
                 where.append(key + "=?")
                 args.append(value)
+        tier_sql, tier_args = "", []
+        if prefer_sid or prefer_users:
+            # Same session first, then facts about the current participants.
+            tier_sql = (
+                "CASE WHEN sid=? THEN 0 WHEN subject IN "
+                "(SELECT value FROM json_each(?)) THEN 1 ELSE 2 END, "
+            )
+            tier_args = [prefer_sid, dump(list(prefer_users))]
         with self.connect() as db:
             if lexical:
                 from .retrieval import relevance
@@ -1078,11 +1243,11 @@ class Store:
                     "SELECT * FROM facts WHERE "
                     + " AND ".join(where)
                     + (
-                        " ORDER BY fact_score(content) DESC,audited,id LIMIT ? OFFSET ?"
+                        f" ORDER BY {tier_sql}fact_score(content) DESC,audited,id LIMIT ? OFFSET ?"
                         if lexical
-                        else " ORDER BY audited,id LIMIT ? OFFSET ?"
+                        else f" ORDER BY {tier_sql}audited,id LIMIT ? OFFSET ?"
                     ),
-                    [*args, limit, offset],
+                    [*args, *tier_args, limit, offset],
                 )
             ]
 
@@ -1099,19 +1264,6 @@ class Store:
             for row in rows:
                 result.setdefault(row["target"], []).append(dict(row))
             return result
-
-    def known_users(self, sid, global_scope=False):
-        with self.connect() as db:
-            where = "records.deleted=0" + ("" if global_scope else " AND records.sid=?")
-            return [
-                dict(r)
-                for r in db.execute(
-                    "SELECT value AS user_id,count(DISTINCT records.id) AS records FROM records,json_each(records.users) WHERE "
-                    + where
-                    + " GROUP BY value ORDER BY value",
-                    () if global_scope else (sid,),
-                )
-            ]
 
     def classify(self, row, output):
         with self.connect() as db:

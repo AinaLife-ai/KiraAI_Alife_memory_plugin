@@ -9,6 +9,7 @@
   </head>
   <body>
     <div class="ambient" aria-hidden="true"></div>
+    <div id="boot" class="boot" hidden></div>
     <div class="shell">
       <aside>
         <div class="brand">
@@ -38,7 +39,7 @@
           </div>
           <div class="actions">
             <button id="theme" aria-label="切换主题">◐</button
-            ><button id="motion" aria-pressed="false" aria-label="动效开关">✨</button
+            ><button id="motion" aria-pressed="false" aria-label="动效开关">❖</button
             ><button id="refresh" aria-pressed="true">
               <svg class="spin" viewBox="0 0 24 24" aria-hidden="true">
                 <path
@@ -224,6 +225,12 @@
             <p class="muted" style="margin-top: 14px">
               配置独立模型后，可在这里立即排队。失败会保留原始数据，修改配置后可重新发起。
             </p>
+            <div class="row" style="margin-top: 14px">
+              <button id="cleanupTools">清理历史工具记录</button>
+              <small class="muted" id="cleanupToolsHint"
+                >移除自身记忆读取回声，并把工具结果摘要压成预览（原文保留）</small
+              >
+            </div>
           </div>
           <div class="panel" id="jobs"></div>
         </section>
@@ -322,6 +329,7 @@
       <div class="actions">
         <button id="nameBatchLater">稍后</button
         ><button id="nameBatchNever">不再提示</button
+        ><button id="nameBatchStop" class="hide">停止</button
         ><button id="nameBatchGo" class="primary">一键拉取</button>
       </div>
     </dialog>

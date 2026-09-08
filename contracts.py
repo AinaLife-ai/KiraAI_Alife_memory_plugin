@@ -125,6 +125,9 @@ class Settings(Strict):
     mutual_exclusion: bool = True
     migration_max_chars: int = Field(default=120, ge=1, le=16000)
     compress_input_chars: int = Field(default=48000, ge=4000, le=500000)
+    boot_enabled: bool = True
+    boot_replay_seconds: int = Field(default=90, ge=0, le=86400)
+    session_affinity: bool = False
 
     @model_validator(mode="after")
     def valid_batch(self):
