@@ -38,6 +38,7 @@
           </div>
           <div class="actions">
             <button id="theme" aria-label="切换主题">◐</button
+            ><button id="motion" aria-pressed="false" aria-label="动效开关">✨</button
             ><button id="refresh" aria-pressed="true">
               <svg class="spin" viewBox="0 0 24 24" aria-hidden="true">
                 <path
@@ -183,6 +184,7 @@
               <output id="graphZoomValue" for="graphZoom">100%</output>
             </div>
             <div id="relations"></div>
+            <div id="graphFocus" class="graph-focus hide"></div>
           </div>
           <div id="factCards" class="cards"></div>
           <div class="pager">
@@ -307,6 +309,21 @@
         ><button id="copyExport" class="primary">复制全部</button>
       </div>
       <p id="exportHint" role="status"></p>
+    </dialog>
+    <dialog id="nameBatch" class="dialog">
+      <div class="panel-title"><h2>一键拉取当前昵称？</h2></div>
+      <p id="nameBatchIntro" class="muted"></p>
+      <ul class="muted">
+        <li>只更新显示名，稳定 ID 永不变；同名仍不会合并。</li>
+        <li>随时可以在本页人工修改，已有名字的会跳过。</li>
+        <li>之后每条新消息仍会自动记录昵称和群名。</li>
+      </ul>
+      <p id="nameBatchStatus" role="status"></p>
+      <div class="actions">
+        <button id="nameBatchLater">稍后</button
+        ><button id="nameBatchNever">不再提示</button
+        ><button id="nameBatchGo" class="primary">一键拉取</button>
+      </div>
     </dialog>
     <div id="toast" class="hide" role="status"></div>
     <script src="/plugin-bridge.js"></script>

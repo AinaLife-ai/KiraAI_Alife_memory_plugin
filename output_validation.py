@@ -52,6 +52,9 @@ def diagnostic(exc):
         "cross-scope or cross-category merge is forbidden",
         "unexpected_tool_call",
         "invalid audit source group",
+        "mixed visibility cannot be compressed",
+        "source changed during compression",
+        "unknown source id",
     }
     return str(exc) if str(exc) in known else "输出不是契约要求的JSON对象或类型"
 

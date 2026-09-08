@@ -23,9 +23,34 @@ def compression_plan(rows, cfg):
             continue
         group = [r for r in ordered if r["level"] == level]
         threshold, count = (cfg.threshold, cfg.batch_size) if level == 0 else (4, 3)
-        if len(group) >= threshold:
-            return group[:count], level + 1
+        # One archive carries a single visibility, so mixed buckets must not be
+        # packed together; each visibility compresses on its own schedule.
+        buckets = {}
+        for row in group:
+            buckets.setdefault(row.get("visibility", "session"), []).append(row)
+        for visibility in sorted(buckets, key=lambda v: (-len(buckets[v]), v)):
+            subset = buckets[visibility]
+            if len(subset) >= threshold:
+                return subset[:count], level + 1
     return None
+
+
+def failure_detail(exc):
+    """Readable, content-free job failure reason for the task list."""
+    if isinstance(exc, TimeoutError):
+        return (
+            "模型超时：已按配置重试，原始记忆未丢失。可更换压缩模型、提高模型超时"
+            "或减小每批条数；自动整理冷却5分钟后再试。"
+        )
+    if str(exc) == "structured_output_rejected":
+        return (
+            "structured_output_rejected · "
+            + getattr(exc, "diagnostic", "契约校验失败")
+            + "。源记忆未修改；请核对模型的JSON能力及输出长度限制。"
+        )
+    if isinstance(exc, ValueError):
+        return "ValueError: " + diagnostic(exc)
+    return type(exc).__name__
 
 
 class Engine:
@@ -320,21 +345,7 @@ class Engine:
             except Exception as exc:
                 # Provider exception bodies may contain credentials or private prompts.
                 await self.store.call(
-                    "finish",
-                    job["id"],
-                    "failed",
-                    (
-                        "模型超时：已按配置重试，原始记忆未丢失。可更换压缩模型、提高模型超时或减小每批条数；自动整理冷却5分钟后再试。"
-                        if isinstance(exc, TimeoutError)
-                        else type(exc).__name__
-                    )
-                    + (
-                        ": structured_output_rejected · "
-                        + getattr(exc, "diagnostic", "契约校验失败")
-                        + "。源记忆未修改；请核对模型的JSON能力及输出长度限制。"
-                        if str(exc) == "structured_output_rejected"
-                        else ""
-                    ),
+                    "finish", job["id"], "failed", failure_detail(exc)
                 )
                 logger.warning(
                     "[记忆·Z] 后台任务失败 %s · %s，耗时 %.1f 秒；源记忆保留",

@@ -40,7 +40,22 @@ function bindGraphSlider(container) {
   });
 }
 
-function drawMemoryGraph(container, facts, mode, names, openFact) {
+function resetGraphZoom(container) {
+  graphView.scale = 1;
+  graphView.x = 0;
+  graphView.y = 0;
+  const viewport = (container || document).querySelector("#memory-zoom");
+  if (viewport) viewport.setAttribute("transform", graphTransform());
+  graphSyncZoom();
+}
+
+function nodeColorClass(id) {
+  let hash = 0;
+  for (const ch of String(id)) hash = (hash * 31 + ch.codePointAt(0)) >>> 0;
+  return " c" + (hash % 8);
+}
+
+function drawMemoryGraph(container, facts, mode, names, openFact, onNode, selectedId) {
   container.replaceChildren();
   const nodes = new Map(),
     edges = [];
@@ -114,6 +129,8 @@ function drawMemoryGraph(container, facts, mode, names, openFact) {
   const viewport = element("g", { id: "memory-zoom" });
   viewport.setAttribute("transform", graphTransform());
   svg.append(viewport);
+  const drift = element("g", { class: "graph-drift" });
+  viewport.append(drift);
   const ordered = [...nodes.values()];
   ordered.forEach((node, i) => {
     const angle = (Math.PI * 2 * i) / ordered.length - Math.PI / 2;
@@ -121,6 +138,26 @@ function drawMemoryGraph(container, facts, mode, names, openFact) {
     node.y = 285 + Math.sin(angle) * 205;
   });
   const edgeGroups = [];
+  const nodeEntries = [];
+  let activeNode = null;
+  const dimEdges = (nodeId) => {
+    edgeGroups.forEach(({ group: edgeGroup, edge }) => {
+      const off = !!nodeId && edge.a !== nodeId && edge.b !== nodeId;
+      edgeGroup.classList.toggle("dimmed", off);
+      edgeGroup.setAttribute("tabindex", off ? "-1" : "0");
+    });
+  };
+  const applyVisual = (nodeId) => {
+    nodeEntries.forEach(({ node, group }) =>
+      group.classList.toggle("active", node.id === nodeId),
+    );
+    dimEdges(nodeId);
+  };
+  const applySelection = (nodeId) => {
+    activeNode = nodeId;
+    applyVisual(nodeId);
+    if (onNode) onNode(nodeId);
+  };
   edges.slice(0, 100).forEach((edge, i) => {
     const a = nodes.get(edge.a),
       b = nodes.get(edge.b);
@@ -156,34 +193,43 @@ function drawMemoryGraph(container, facts, mode, names, openFact) {
       edge.label,
     );
     group.append(label);
-    group.onclick = () => openFact(edge.fact);
+    group.onclick = () => {
+      if (group.classList.contains("dimmed")) return;
+      openFact(edge.fact);
+    };
     group.onkeydown = (event) => {
       if (["Enter", " "].includes(event.key)) {
         event.preventDefault();
-        openFact(edge.fact);
+        group.onclick();
       }
     };
-    viewport.append(group);
+    drift.append(group);
     edgeGroups.push({ group, edge });
   });
   for (const node of ordered) {
     const group = element("g", {
-      class: "graph-node" + (node.dimension ? " dimension-node" : ""),
+      class:
+        "graph-node" +
+        nodeColorClass(node.id) +
+        (node.dimension ? " dimension-node" : ""),
       tabindex: 0,
       role: "button",
-      "aria-label": node.label + " · " + node.id + "，聚焦联结",
+      "aria-label": node.label + " · " + node.id + "，点击查看联结与事实",
       transform: `translate(${node.x} ${node.y})`,
     });
-    group.append(element("circle", { r: 32, class: "node-halo" }));
-    group.append(element("circle", { r: 23 }));
-    group.append(
+    const float = element("g", { class: "node-float" });
+    float.style.animationDuration = 6 + ((node.x + node.y) % 5) + "s";
+    float.style.animationDelay = "-" + ((node.x * 7 + node.y * 13) % 9) + "s";
+    float.append(element("circle", { r: 32, class: "node-halo" }));
+    float.append(element("circle", { r: 23 }));
+    float.append(
       element(
         "text",
         { y: 5, class: "node-initial" },
         node.dimension ? "◇" : [...node.label][0],
       ),
     );
-    group.append(
+    float.append(
       element(
         "text",
         { y: 51, class: "node-label" },
@@ -191,23 +237,34 @@ function drawMemoryGraph(container, facts, mode, names, openFact) {
           ([...node.label].length > 11 ? "…" : ""),
       ),
     );
+    group.append(float);
     group.append(element("title", {}, node.label + "\n" + node.id));
-    const focus = () =>
-      edgeGroups.forEach(({ group: edgeGroup, edge }) =>
-        edgeGroup.classList.toggle(
-          "dimmed",
-          edge.a !== node.id && edge.b !== node.id,
-        ),
-      );
-    group.onmouseenter = focus;
-    group.onfocus = focus;
-    group.onclick = focus;
-    group.onmouseleave = () =>
-      edgeGroups.forEach(({ group: edgeGroup }) =>
-        edgeGroup.classList.remove("dimmed"),
-      );
+    const hover = () => {
+      if (!activeNode) dimEdges(node.id);
+    };
+    group.onmouseenter = hover;
+    group.onfocus = hover;
+    group.onmouseleave = () => {
+      if (!activeNode) dimEdges(null);
+    };
     group.onblur = group.onmouseleave;
-    viewport.append(group);
+    group.onclick = () =>
+      applySelection(activeNode === node.id ? null : node.id);
+    group.onkeydown = (event) => {
+      if (["Enter", " "].includes(event.key)) {
+        event.preventDefault();
+        group.onclick();
+      }
+    };
+    drift.append(group);
+    nodeEntries.push({ node, group });
+  }
+  svg.addEventListener("click", (event) => {
+    if (event.target === svg) applySelection(null);
+  });
+  if (selectedId && nodeEntries.some((entry) => entry.node.id === selectedId)) {
+    activeNode = selectedId;
+    applyVisual(selectedId);
   }
   svg.addEventListener(
     "wheel",

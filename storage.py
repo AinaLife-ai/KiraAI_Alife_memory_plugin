@@ -635,6 +635,32 @@ class Store:
                 self.bump(db)
             return report
 
+    def refreshable_names(self, limit=200):
+        """Entities that have a number but no current name, newest first."""
+        from . import identity
+
+        result = []
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT id FROM entities WHERE (name IS NULL OR name='') "
+                "ORDER BY updated DESC,id LIMIT ?",
+                (max(limit * 2, 400),),
+            )
+            for (entity_id,) in rows:
+                if entity_id in (identity.GLOBAL, identity.SELF, identity.UNSCOPED):
+                    continue
+                _adapter, number, _session = identity.split_adapter(entity_id)
+                if not number:
+                    shape = identity.pending_shape(entity_id) or identity.legacy_shape(
+                        entity_id
+                    )
+                    number = shape[2] if shape else ""
+                if number:
+                    result.append(entity_id)
+                if len(result) >= limit:
+                    break
+        return result
+
     def migration_status(self):
         with self.connect() as db:
             return {

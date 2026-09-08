@@ -235,3 +235,8 @@ class NameEdit(Strict):
 
 class EntityRefresh(Strict):
     entity_id: Short
+
+
+class NameBatch(Strict):
+    ids: list[Short] = Field(default_factory=list, max_length=200)
+    reason: Short = "批量确认当前QQ昵称"

@@ -31,6 +31,7 @@ from .contracts import (
     parse_output,
     NameEdit,
     EntityRefresh,
+    NameBatch,
 )
 from . import identity
 from .engine import Engine, compression_plan
@@ -178,22 +179,31 @@ class AlifeMemoryPlugin(BasePlugin):
         self.store = Store(Path(data_dir) / "alife-v2.sqlite3")
         await self.store.call("initialize")
         self.identity_report = {}
-        if await self.store.call("synthetic_identity"):
-            self.identity_report = await self.store.call(
-                "canonicalize_identity", self.adapter_names()
-            )
-            logger.info(
-                "[记忆·Z] 身份规范化：合并记录 %s · 事实 %s · 实体 %s · 待绑定 %s",
-                self.identity_report["records"],
-                self.identity_report["facts"],
-                self.identity_report["entities"],
-                len(self.identity_report["pending"]),
-            )
-            self.identity_settled = not self.identity_report["pending"]
+        try:
+            if await self.store.call("synthetic_identity"):
+                self.identity_report = await self.store.call(
+                    "canonicalize_identity", self.adapter_names()
+                )
+                logger.info(
+                    "[记忆·Z] 身份规范化：合并记录 %s · 事实 %s · 实体 %s · 待绑定 %s",
+                    self.identity_report["records"],
+                    self.identity_report["facts"],
+                    self.identity_report["entities"],
+                    len(self.identity_report["pending"]),
+                )
+                self.identity_settled = not self.identity_report["pending"]
+        except Exception:
+            logger.exception("[记忆·Z] 身份规范化未完成，将在下次启动或首次对话重试")
+            self.identity_settled = False
         self.engine = Engine(
             self.store, self.runtime_settings, self.model_call, self.embed, self.notice
         )
-        await self.migrate()
+        try:
+            await self.migrate()
+        except Exception:
+            # A failed migration must never block loading; sources stay read-only.
+            logger.exception("[记忆·Z] 迁移未完成；插件继续加载，原文件保留")
+            self.migration_blocked = False
         await self.engine.start()
         logger.info(
             "[记忆·Z] 记忆系统就绪 · 访问范围 %s · 向量检索%s",
@@ -300,7 +310,7 @@ class AlifeMemoryPlugin(BasePlugin):
         )
         return tuple(adapters.keys())
 
-    async def refresh_name(self, entity_id, adapter_hint=""):
+    async def refresh_name(self, entity_id, adapter_hint="", reason="adapter lookup"):
         # Prefer the session's adapter, then the id prefix, then every adapter.
         # A bare number kept from migration can still be looked up and bound.
         shape = identity.legacy_shape(entity_id) or identity.pending_shape(entity_id)
@@ -349,7 +359,7 @@ class AlifeMemoryPlugin(BasePlugin):
                     value,
                     kind="session" if group else "user",
                     source="onebot",
-                    reason="adapter lookup",
+                    reason=reason,
                 )
                 if synthetic:
                     await self.store.call(
@@ -1301,6 +1311,31 @@ class AlifeMemoryPlugin(BasePlugin):
             raise HTTPException(
                 422, "当前适配器无法查询该ID的名称，请手工校正或等待新消息"
             ) from None
+
+    @register.api(method="POST", path="/names/refresh-batch", auth=True)
+    async def api_name_refresh_batch(self, request: Request):
+        value = await self.body(request, NameBatch)
+        ids = value.ids or await self.store.call("refreshable_names", 200)
+        updated, failed = [], []
+        for entity_id in ids[:200]:
+            try:
+                entity = await self.refresh_name(
+                    entity_id, reason=value.reason
+                )
+                if entity.get("name"):
+                    updated.append(entity_id)
+                else:
+                    failed.append(entity_id)
+            except Exception:
+                failed.append(entity_id)
+            await asyncio.sleep(0.15)
+        return {
+            "ok": True,
+            "reason": value.reason,
+            "updated": updated,
+            "failed": failed,
+            "remaining": len(await self.store.call("refreshable_names", 200)),
+        }
 
     @register.api(method="POST", path="/migrate", auth=True)
     async def api_migrate(self):
