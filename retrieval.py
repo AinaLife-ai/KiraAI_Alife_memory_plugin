@@ -5,6 +5,45 @@ import json
 import time
 from collections import OrderedDict
 
+# Our own read tools return a distinctive JSON envelope. Those results are
+# self-recall echoes: storing them as memories only bloats the next context.
+_MEMORY_PAYLOAD_MARKERS = (
+    '"archives_in_context"',
+    '"children_total"',
+    '"next_page"',
+    '"subjects"',
+    '"entities"',
+    '"omitted_ids"',
+    '"related_archives"',
+)
+TOOL_RESULT_PREFIX = "工具感知结果："
+
+
+def looks_like_memory_payload(text):
+    head = (text or "")[:4000]
+    if head.startswith(TOOL_RESULT_PREFIX):
+        head = head[len(TOOL_RESULT_PREFIX) :].lstrip()
+    return head.startswith('{"ok":true') and any(
+        marker in head for marker in _MEMORY_PAYLOAD_MARKERS
+    )
+
+
+def tool_preview(text, limit=240):
+    """Short, single-line preview kept as the injected summary."""
+    flat = " ".join((text or "").split())
+    return flat[:limit] + ("…" if len(flat) > limit else "")
+
+
+def tool_call_summary(tool_calls, limit=60):
+    """Readable replacement for the raw tool_calls JSON blob."""
+    parts = []
+    for call in tool_calls or []:
+        function = call.get("function", {}) if isinstance(call, dict) else {}
+        name = function.get("name") or call.get("name") or "工具"
+        arguments = function.get("arguments") or ""
+        parts.append(f"{name}({arguments[:limit]})" if arguments else name)
+    return "[调用工具：" + "、".join(parts) + "]" if parts else ""
+
 
 def identity_info(entity_id):
     """Display labels; synthetic ids are pending/uncategorised, never a fake entity."""

@@ -44,6 +44,7 @@ const fields = {
   compress_instruction: "压缩补充要求",
   boot_enabled: "打开面板时播放载入动画",
   boot_replay_seconds: "载入动画重播冷却（秒）",
+  session_affinity: "全局召回优先当前会话",
 };
 let ctx = null,
   tab = "home",
@@ -1312,6 +1313,25 @@ $("#searchNames").onclick = () =>
   guard(() => {
     nameOffset = 0;
     return loadNames();
+  });
+$("#cleanupTools").onclick = () =>
+  guard(async () => {
+    const button = $("#cleanupTools");
+    button.disabled = true;
+    try {
+      const report = await api("/maintenance/tools", {});
+      $("#cleanupToolsHint").textContent =
+        "已清理：移除 " +
+        report.removed +
+        " 条 · 重写 " +
+        report.rewritten +
+        " 条 · 约省 " +
+        report.freed_chars +
+        " 字符（原文保留）";
+      await poll();
+    } finally {
+      button.disabled = false;
+    }
   });
 async function maybeAskNameBatch() {
   if (localStorage.getItem("alife-name-batch") === "off") return;

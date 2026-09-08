@@ -37,7 +37,16 @@ from . import identity
 from .engine import Engine, compression_plan
 from .storage import Conflict, Store
 from .migration import SOURCES
-from .retrieval import safe_facts, archive_view, RecallWindow, asks_for_more
+from .retrieval import (
+    TOOL_RESULT_PREFIX,
+    archive_view,
+    asks_for_more,
+    looks_like_memory_payload,
+    safe_facts,
+    tool_call_summary,
+    tool_preview,
+    RecallWindow,
+)
 from .setting_help import HELP
 
 PLUGIN_ID = "alife_memory_z"
@@ -97,6 +106,7 @@ class AlifeMemoryPlugin(BasePlugin):
         self.name_refresh_lock = asyncio.Lock()
         self.recall_window = RecallWindow()
         self._recall_outputs = {}
+        self._own_outputs = set()
 
     def conflicts(self):
         pm = getattr(self.ctx, "plugin_mgr", None)
@@ -204,6 +214,18 @@ class AlifeMemoryPlugin(BasePlugin):
             # A failed migration must never block loading; sources stay read-only.
             logger.exception("[记忆·Z] 迁移未完成；插件继续加载，原文件保留")
             self.migration_blocked = False
+        try:
+            if await self.store.call("needs_tool_cleanup"):
+                report = await self.store.call("cleanup_tool_records")
+                logger.info(
+                    "[记忆·Z] 历史工具记录清理：扫描 %s · 移除 %s · 重写 %s · 约省 %s 字符",
+                    report["scanned"],
+                    report["removed"],
+                    report["rewritten"],
+                    report["freed_chars"],
+                )
+        except Exception:
+            logger.exception("[记忆·Z] 历史工具记录清理未完成，可稍后在后台任务页重试")
         await self.engine.start()
         logger.info(
             "[记忆·Z] 记忆系统就绪 · 访问范围 %s · 向量检索%s",
@@ -541,6 +563,11 @@ class AlifeMemoryPlugin(BasePlugin):
         if continuation:
             query = previous["query"]
         rows = await self.store.call("context", sid, users, scope=cfg.recall_scope)
+        prefer = (
+            {"prefer_sid": sid, "prefer_users": tuple(users)}
+            if cfg.session_affinity
+            else {}
+        )
         facts = await self.store.call(
             "facts",
             sid,
@@ -548,6 +575,7 @@ class AlifeMemoryPlugin(BasePlugin):
             users=users,
             include_shared=True,
             exclude_ids=previous["facts"] if continuation else (),
+            **prefer,
         )
         related = []
         if cfg.recall_scope != "session" and query.strip():
@@ -560,6 +588,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 limit=cfg.top_k * 2,
                 exclude_sid="" if continuation else sid,
                 exclude_ids=previous["ids"] if continuation else (),
+                **prefer,
             )
             local_ids = {r["id"] for r in rows}
             related = [
@@ -579,6 +608,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 lexical=query,
                 limit=cfg.top_k,
                 exclude_ids=previous["facts"] if continuation else (),
+                **prefer,
             )
             facts = list({f["id"]: f for f in [*extra, *facts]}.values())
         while len(dump(related)) > cfg.context_chars // 4 and related:
@@ -590,6 +620,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 *users,
                 *(u for r in related for u in r["users"]),
                 *(r["sid"] for r in related),
+                *(f["sid"] for f in facts),
             },
             limit=30,
         )
@@ -601,6 +632,17 @@ class AlifeMemoryPlugin(BasePlugin):
             }
             for n in names
         ]
+        if cfg.session_affinity:
+            # Provenance lets the model prefer this session without hiding others.
+            session_names = {n["id"]: n["name"] for n in names}
+            for item in related:
+                item["source_session"] = item["sid"]
+                item["same_session"] = item["sid"] == sid
+                item["session_name"] = session_names.get(item["sid"], "")
+            for fact in facts:
+                fact["source_session"] = fact["sid"]
+                fact["same_session"] = fact["sid"] == sid
+                fact["session_name"] = session_names.get(fact["sid"], "")
         # Memory data is a request-only user block; host history stays byte-stable.
         # Keep complete records and give explicit IDs for anything outside the budget.
         budget = cfg.context_chars - len(dump(related)) - len(dump(names)) - 1000
@@ -723,9 +765,16 @@ class AlifeMemoryPlugin(BasePlugin):
             for m in event.messages
         ]
         await self.store.call("capture", sid, base + ":input", incoming)
-        content = response.text_response
+        text = response.text_response or ""
+        content = text
+        summary = text.strip()
         if response.tool_calls:
-            content += "\n" + dump({"tool_calls": response.tool_calls})
+            content += ("\n" if content else "") + dump(
+                {"tool_calls": response.tool_calls}
+            )
+            summary = (
+                (summary + "\n" if summary else "") + tool_call_summary(response.tool_calls)
+            )
         await self.store.call(
             "capture",
             sid,
@@ -734,6 +783,8 @@ class AlifeMemoryPlugin(BasePlugin):
                 {
                     "role": "assistant",
                     "content": content,
+                    # The raw tool_calls JSON stays in content, never in the summary.
+                    "summary": summary or "（无文字回复）",
                     "time": time.time(),
                     "users": users,
                 }
@@ -746,14 +797,14 @@ class AlifeMemoryPlugin(BasePlugin):
 
     def recall_result(self, event, value):
         text = dump(value)
-        key = (
-            event.sid,
-            str(event.event_id),
-            hashlib.sha256(text.encode()).hexdigest(),
-        )
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        key = (event.sid, str(event.event_id), digest)
         self._recall_outputs[key] = None
         while len(self._recall_outputs) > 128:
             self._recall_outputs.pop(next(iter(self._recall_outputs)))
+        self._own_outputs.add(digest)
+        while len(self._own_outputs) > 256:
+            self._own_outputs.pop()
         return text
 
     @on.tool_result(priority=Priority.LOW)
@@ -762,15 +813,18 @@ class AlifeMemoryPlugin(BasePlugin):
             return
         content = await result.assemble_result()
         text = content if isinstance(content, str) else dump(content)
-        recalled = (
-            event.sid,
-            str(event.event_id),
-            hashlib.sha256(text.encode()).hexdigest(),
-        )
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        recalled = (event.sid, str(event.event_id), digest)
         if recalled in self._recall_outputs:
             del self._recall_outputs[recalled]
             return
-        key = str(event.event_id) + ":tool:" + hashlib.sha256(text.encode()).hexdigest()
+        # The same payload may arrive under a different event id after a reload.
+        if digest in self._own_outputs:
+            self._own_outputs.discard(digest)
+            return
+        if looks_like_memory_payload(text):
+            return
+        key = str(event.event_id) + ":tool:" + digest
         await self.store.call(
             "capture",
             event.sid,
@@ -778,7 +832,9 @@ class AlifeMemoryPlugin(BasePlugin):
             [
                 {
                     "role": "assistant",
-                    "content": "工具感知结果：\n" + text,
+                    "content": TOOL_RESULT_PREFIX + "\n" + text,
+                    # Keep the full payload in content; inject only a short preview.
+                    "summary": TOOL_RESULT_PREFIX + tool_preview(text),
                     "time": time.time(),
                     "users": user_ids(event),
                 }
@@ -1377,6 +1433,11 @@ class AlifeMemoryPlugin(BasePlugin):
             "failed": failed,
             "remaining": len(await self.store.call("refreshable_names", 200)),
         }
+
+    @register.api(method="POST", path="/maintenance/tools", auth=True)
+    async def api_cleanup_tools(self):
+        report = await self.store.call("cleanup_tool_records")
+        return {"ok": True, **report}
 
     @register.api(method="POST", path="/migrate", auth=True)
     async def api_migrate(self):

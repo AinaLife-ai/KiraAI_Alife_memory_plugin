@@ -242,6 +242,12 @@
         "description": "面板重新显示时，隐藏超过这个秒数才重播载入动画。0=只在打开页面时播放一次。默认90秒。",
         "minimum": 0,
         "maximum": 86400
+      },
+      "session_affinity": {
+        "type": "switch",
+        "name": "全局召回优先当前会话",
+        "default": false,
+        "description": "开启后，全局召回优先当前会话的记忆，其次同参与者，最后其他会话；只调整顺序，不缩小召回范围。默认关闭。"
       }
     }
   }
