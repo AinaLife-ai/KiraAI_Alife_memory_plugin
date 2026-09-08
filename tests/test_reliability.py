@@ -6,6 +6,9 @@ import sqlite3
 from contextlib import closing
 import pytest
 from test_memory import c, s, e
+import importlib
+
+m = importlib.import_module("alife_test_plugin.migration")
 
 
 @pytest.mark.asyncio
@@ -261,3 +264,83 @@ async def test_mixed_model_failures_share_one_retry_budget(tmp_path):
     with pytest.raises(ValueError, match="structured_output_rejected"):
         await e.Engine(store, lambda: cfg, provider, None, None).compress("a:dm:u")
     assert len(calls) == 3 and len(store.active("a:dm:u")) == 4
+
+
+@pytest.mark.asyncio
+async def test_mixed_visibility_compresses_without_valueerror(tmp_path):
+    """Migrated per-user archives share a dm session with live session records."""
+    store = s.Store(tmp_path / "memory.db")
+    store.initialize()
+    sid = "qq:dm:769690776"
+    store.capture(
+        sid,
+        "live",
+        [
+            {
+                "role": "user",
+                "content": f"live {i}",
+                "users": ["qq:769690776"],
+                "time": float(1000 + i),
+            }
+            for i in range(4)
+        ],
+    )
+    with store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        store._ensure_entities(db, sid, {"qq:769690776"})
+        for i in range(4):
+            db.execute(
+                """INSERT INTO records
+                   (id,sid,role,level,start,end,summary,content,users,position,event_key,created,visibility)
+                   VALUES (?,?,'user',0,?,?,?,?,?,?,?,?,'user')""",
+                (
+                    f"mig{i}",
+                    sid,
+                    500 + i,
+                    500 + i,
+                    f"old {i}",
+                    f"old {i}",
+                    '["qq:769690776"]',
+                    i,
+                    f"mig:{i}",
+                    1.0,
+                ),
+            )
+    cfg = c.Settings(threshold=4, batch_size=2, model_retries=0)
+    plan = e.compression_plan(store.active(sid), cfg)
+    assert plan is not None
+    assert len({row["visibility"] for row in plan[0]}) == 1
+
+    async def provider(*args):
+        return '{"summary":"合并摘要", "facts":[]}'
+
+    engine = e.Engine(store, lambda: cfg, provider, None, None)
+    await engine.compress(sid)
+    assert any(r["level"] == 1 for r in store.export()["records"])
+
+
+def test_rerun_migration_keeps_edits_and_deletions(tmp_path):
+    """A second 重新迁移 must never duplicate, revive or overwrite memories."""
+    from test_canonical_identity import toml, write
+
+    root = tmp_path / "memory"
+    write(root, "entities/user_qq:5/facts/a.toml", toml("a", "旧事实A"))
+    write(root, "entities/user_qq:5/facts/b.toml", toml("b", "旧事实B"))
+    store = s.Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    first = store.import_legacy(m.snapshot(root, m.KIRAOS, 120))
+    assert first["imported"] == 2
+    rows = store.export()["records"]
+    record_a = next(r for r in rows if r["summary"] == "旧事实A")
+    record_b = next(r for r in rows if r["summary"] == "旧事实B")
+    store.edit("record", record_a["id"], record_a["revision"], {"summary": "手改A"}, "manual")
+    store.edit("record", record_b["id"], record_b["revision"], {"deleted": True}, "manual")
+    facts_before = len(store.facts(limit=50, global_scope=True))
+
+    again = store.import_legacy(m.snapshot(root, m.KIRAOS, 120))
+    assert again["imported"] == 0 and again["duplicate"] == 2
+    after = {r["id"]: r for r in store.export()["records"]}
+    assert len(after) == len(rows)
+    assert after[record_a["id"]]["summary"] == "手改A"
+    assert after[record_b["id"]]["deleted"] == 1
+    assert len(store.facts(limit=50, global_scope=True)) == facts_before

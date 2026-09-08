@@ -766,9 +766,9 @@ button:active:not(:disabled) {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
+  html:not([data-motion="force"]) *,
+  html:not([data-motion="force"]) *::before,
+  html:not([data-motion="force"]) *::after {
     scroll-behavior: auto !important;
     animation: none !important;
     transition: none !important;
@@ -1049,5 +1049,154 @@ button.primary:hover::after {
   to {
     opacity: 1;
     transform: none;
+  }
+}
+
+/* ---- 星图配色、节点漂浮与整图漂移 ---- */
+.graph-node {
+  --node-color: var(--accent);
+}
+.graph-node.c1 {
+  --node-color: #4a7fd6;
+}
+.graph-node.c2 {
+  --node-color: #2f9e8f;
+}
+.graph-node.c3 {
+  --node-color: #c2578a;
+}
+.graph-node.c4 {
+  --node-color: #b8792f;
+}
+.graph-node.c5 {
+  --node-color: #5a8f3c;
+}
+.graph-node.c6 {
+  --node-color: #8a5cc7;
+}
+.graph-node.c7 {
+  --node-color: #3d8fa8;
+}
+[data-theme="dark"] .graph-node.c1 {
+  --node-color: #7fa8f0;
+}
+[data-theme="dark"] .graph-node.c2 {
+  --node-color: #5fc9b8;
+}
+[data-theme="dark"] .graph-node.c3 {
+  --node-color: #e88cb8;
+}
+[data-theme="dark"] .graph-node.c4 {
+  --node-color: #e0a95f;
+}
+[data-theme="dark"] .graph-node.c5 {
+  --node-color: #8fc46a;
+}
+[data-theme="dark"] .graph-node.c6 {
+  --node-color: #b99af0;
+}
+[data-theme="dark"] .graph-node.c7 {
+  --node-color: #6fc2d8;
+}
+.graph-node circle {
+  stroke: var(--node-color);
+}
+.graph-node .node-initial,
+.graph-node .node-label {
+  fill: var(--node-color);
+}
+.graph-node .node-halo {
+  fill: var(--node-color);
+  opacity: 0.14;
+  stroke: var(--line);
+}
+.graph-node.active .node-halo {
+  opacity: 0.3;
+  animation: halo-pulse 2.4s ease-in-out infinite;
+}
+.graph-node .node-label {
+  animation: label-breathe 5s ease-in-out infinite;
+}
+.node-float {
+  animation: node-float 8s ease-in-out infinite;
+}
+.graph-drift {
+  transform-origin: 450px 285px;
+  animation: graph-drift 52s ease-in-out infinite;
+}
+#relations:hover .graph-drift {
+  animation-play-state: paused;
+}
+.graph-edge.dimmed {
+  pointer-events: none;
+}
+.graph-focus {
+  margin-top: 14px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+  animation: card-in 0.3s var(--ease) both;
+}
+.graph-focus > .row {
+  margin-bottom: 10px;
+}
+.graph-focus-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+}
+.graph-focus-row button {
+  padding: 5px 11px;
+  font-size: 12px;
+}
+#motion.on,
+#motion[aria-pressed="true"] {
+  color: var(--accent);
+}
+.dialog ul {
+  margin: 10px 0;
+  padding-left: 20px;
+  font-size: 13px;
+  line-height: 1.9;
+}
+@keyframes node-float {
+  0%,
+  100% {
+    transform: translate(0, 0);
+  }
+  50% {
+    transform: translate(1.6px, -2.4px);
+  }
+}
+@keyframes label-breathe {
+  0%,
+  100% {
+    opacity: 0.72;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@keyframes halo-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.18);
+  }
+}
+@keyframes graph-drift {
+  0%,
+  100% {
+    transform: rotate(-0.5deg) translateY(-3px);
+  }
+  50% {
+    transform: rotate(0.5deg) translateY(3px);
   }
 }

@@ -366,6 +366,10 @@ async function poll() {
 }
 async function selectTab(name) {
   tab = name;
+  if (name !== "profiles") {
+    resetGraphZoom(document.querySelector("#relations"));
+    clearGraphFocus();
+  }
   $$(".view").forEach((e) => e.classList.toggle("hide", e.id !== name));
   $$("[data-tab]").forEach((e) =>
     e.setAttribute("aria-current", e.dataset.tab === name ? "page" : "false"),
@@ -380,7 +384,10 @@ async function selectTab(name) {
   };
   $("#title").textContent = titles[name][0];
   $("#subtitle").textContent = titles[name][1];
-  if (name === "names") await loadNames();
+  if (name === "names") {
+    await loadNames();
+    await maybeAskNameBatch();
+  }
   if (name === "archives") await loadArchives();
   if (name === "profiles") await loadFacts();
   if (name === "settings" && !configDirty) await loadConfig();
@@ -442,8 +449,15 @@ async function loadFacts() {
   });
   shownFacts = await api("/facts?" + q);
   for (const f of shownFacts) Object.assign(displayNames, f.names || {});
-  $("#factCards").innerHTML = shownFacts.length
-    ? shownFacts
+  renderFactCards(shownFacts);
+  renderGraph();
+  $("#factPage").textContent = "第 " + (factOffset / 100 + 1) + " 页";
+  $("#factPrev").disabled = factOffset === 0;
+  $("#factNext").disabled = shownFacts.length < 100;
+}
+function renderFactCards(list) {
+  $("#factCards").innerHTML = list.length
+    ? list
         .map(
           (f, i) =>
             `<article class="card"><div class="row"><span class="tag">${esc(labels[f.category])}</span><strong>${esc(displayLabel(f.subject))}</strong></div><p>${esc(f.content)}</p><small>${esc(f.tags.join(" · "))}</small>${f.relation_warnings?.length ? '<div class="notice">待审校：' + esc(f.relation_warnings.map((w) => w.reason).join("；")) + "。该连线未用于关系召回。</div>" : ""}<p class="muted">${esc(f.reason ? "事实依据：" + f.reason : "")}${esc(f.scenario ? " · 场景：" + f.scenario : "")}</p>${f.edit_history?.length ? '<p class="muted">最近审校：' + esc(f.edit_history[0].reason) + " · " + date(f.edit_history[0].created) + "</p>" : ""}<footer><small>${f.sources.length} 个来源</small><button data-fact="${i}">编辑事实</button></footer></article>`,
@@ -451,12 +465,8 @@ async function loadFacts() {
         .join("")
     : empty("画像还在形成");
   $$("[data-fact]").forEach(
-    (e) => (e.onclick = () => openFact(shownFacts[Number(e.dataset.fact)])),
+    (e) => (e.onclick = () => openFact(list[Number(e.dataset.fact)])),
   );
-  renderGraph();
-  $("#factPage").textContent = "第 " + (factOffset / 100 + 1) + " 页";
-  $("#factPrev").disabled = factOffset === 0;
-  $("#factNext").disabled = shownFacts.length < 100;
 }
 function showEditor() {
   $$(".dialog-error").forEach((e) => e.remove());
@@ -839,6 +849,23 @@ function applyRefreshMode() {
 $("#theme").onclick = () =>
   (document.documentElement.dataset.theme =
     document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+let forceMotion = localStorage.getItem("alife-motion") === "force";
+function applyMotion() {
+  if (forceMotion) document.documentElement.dataset.motion = "force";
+  else delete document.documentElement.dataset.motion;
+  const button = $("#motion");
+  button.setAttribute("aria-pressed", String(forceMotion));
+  button.classList.toggle("on", forceMotion);
+  button.title = forceMotion
+    ? "动效已强制开启 · 点击跟随系统"
+    : "动效跟随系统 · 点击强制开启";
+}
+$("#motion").onclick = () => {
+  forceMotion = !forceMotion;
+  localStorage.setItem("alife-motion", forceMotion ? "force" : "auto");
+  applyMotion();
+};
+applyMotion();
 $("#new").onclick = newMemory;
 $("#closeEditor").onclick = () => {
   $("#editor").close();
@@ -862,6 +889,7 @@ for (const id of ["#session", "#level"])
 $("#category").onchange = () =>
   guard(() => {
     factOffset = 0;
+    clearGraphFocus();
     return loadFacts();
   });
 $("#subject").onkeydown = (e) => {
@@ -883,6 +911,7 @@ $("#next").onclick = () =>
 $("#filterFacts").onclick = () =>
   guard(() => {
     factOffset = 0;
+    clearGraphFocus();
     return loadFacts();
   });
 $("#factPrev").onclick = () =>
@@ -1017,6 +1046,14 @@ async function boot() {
     });
   }
   applyRefreshMode();
+  if (
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches &&
+    !forceMotion &&
+    !localStorage.getItem("alife-motion-hint")
+  ) {
+    localStorage.setItem("alife-motion-hint", "1");
+    toast("系统开启了“减少动态效果”，动效已关闭；点 ✨ 可强制开启");
+  }
 }
 let shownFacts = [],
   graphMode = "relations",
@@ -1041,8 +1078,83 @@ const displayLabel = (id) => {
   return name ? name + " · " + id : id;
 };
 function renderGraph() {
-  drawMemoryGraph($("#relations"), shownFacts, graphMode, displayNames, (f) =>
-    openFact(f),
+  drawMemoryGraph(
+    $("#relations"),
+    shownFacts,
+    graphMode,
+    displayNames,
+    (f) => openFact(f),
+    focusGraphEntity,
+    graphFilter,
+  );
+}
+let graphFilter = null;
+function clearGraphFocus() {
+  if (!graphFilter) {
+    $("#graphFocus").classList.add("hide");
+    return;
+  }
+  graphFilter = null;
+  $("#graphFocus").classList.add("hide");
+  renderFactCards(shownFacts);
+}
+function focusGraphEntity(id) {
+  const panel = $("#graphFocus");
+  if (!id) {
+    graphFilter = null;
+    panel.classList.add("hide");
+    renderFactCards(shownFacts);
+    renderGraph();
+    return;
+  }
+  graphFilter = id;
+  const related = shownFacts.filter(
+    (fact) =>
+      fact.subject === id ||
+      (fact.verified_relations || []).some(
+        (relation) => relation.subject === id || relation.object === id,
+      ),
+  );
+  renderFactCards(related);
+  renderGraphFocus(id, related);
+  renderGraph();
+  $("#factCards").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+function renderGraphFocus(id, facts) {
+  const rows = [];
+  for (const fact of facts)
+    for (const relation of fact.verified_relations || []) {
+      if (relation.subject !== id && relation.object !== id) continue;
+      const other = relation.subject === id ? relation.object : relation.subject;
+      rows.push({ label: relation.predicate + " → " + displayLabel(other), fact });
+    }
+  const panel = $("#graphFocus");
+  panel.innerHTML =
+    '<div class="row"><strong>' +
+    esc(displayLabel(id)) +
+    '</strong><small class="muted">' +
+    rows.length +
+    ' 条联结 · 已筛选下方事实卡片</small><button id="graphClear">清除筛选</button></div>' +
+    (rows.length
+      ? '<div class="graph-focus-list">' +
+        rows
+          .map(
+            (row, index) =>
+              '<div class="graph-focus-row"><span>' +
+              esc(row.label) +
+              '</span><button data-focus-fact="' +
+              index +
+              '">编辑依据</button></div>',
+          )
+          .join("") +
+        "</div>"
+      : '<p class="muted">该实体在当前筛选页没有可展示的联结。</p>');
+  panel.classList.remove("hide");
+  $("#graphClear").onclick = () => focusGraphEntity(null);
+  $$("[data-focus-fact]").forEach(
+    (button) =>
+      (button.onclick = () =>
+        openFact(rows[Number(button.dataset.focusFact)].fact)),
   );
 }
 $("#graphRelations").onclick = () => {
@@ -1103,6 +1215,61 @@ $("#searchNames").onclick = () =>
   guard(() => {
     nameOffset = 0;
     return loadNames();
+  });
+async function maybeAskNameBatch() {
+  if (localStorage.getItem("alife-name-batch") === "off") return;
+  if (sessionStorage.getItem("alife-name-batch-shown") === "1") return;
+  let rows = [];
+  try {
+    rows = await api("/names?offset=0");
+  } catch {
+    return;
+  }
+  const pending = rows.filter(
+    (row) =>
+      !row.name &&
+      row.kind !== "global" &&
+      row.kind !== "self" &&
+      row.id !== "unscoped" &&
+      /\d/.test(String(row.id).split(":").pop() || ""),
+  );
+  if (!pending.length) return;
+  sessionStorage.setItem("alife-name-batch-shown", "1");
+  $("#nameBatchIntro").textContent =
+    "记忆里有 " + pending.length + " 个号码还没有当前称呼，要从聊天平台一次性查询吗？";
+  $("#nameBatchStatus").textContent = "";
+  $("#nameBatchGo").disabled = false;
+  $("#nameBatch").showModal();
+}
+$("#nameBatchLater").onclick = () => $("#nameBatch").close();
+$("#nameBatchNever").onclick = () => {
+  localStorage.setItem("alife-name-batch", "off");
+  $("#nameBatch").close();
+};
+$("#nameBatchGo").onclick = () =>
+  guard(async () => {
+    const button = $("#nameBatchGo");
+    button.disabled = true;
+    $("#nameBatchStatus").textContent = "正在逐个查询平台昵称…";
+    try {
+      const result = await api("/names/refresh-batch", {
+        ids: [],
+        reason: "批量确认当前QQ昵称",
+      });
+      $("#nameBatchStatus").textContent =
+        "完成：成功 " +
+        result.updated.length +
+        " · 失败 " +
+        result.failed.length +
+        " · 还有 " +
+        result.remaining +
+        " 个未填";
+      await loadNames();
+      if (tab === "profiles") await loadFacts();
+      toast("已更新 " + result.updated.length + " 个昵称");
+    } finally {
+      button.disabled = false;
+    }
   });
 $("#namePrev").onclick = () =>
   guard(() => {
