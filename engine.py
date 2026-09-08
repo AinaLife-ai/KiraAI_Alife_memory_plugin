@@ -130,10 +130,12 @@ class Engine:
                 await self.index(record_id, cfg)
 
     async def index(self, record_id, cfg):
+        if not cfg.semantic_enabled or not self.settings().semantic_enabled:
+            return
         row = await self.store.call("get", record_id)
         if row:
             vector, model = await self.embed(row["summary"], cfg)
-            if vector:
+            if vector and self.settings() == cfg:
                 await self.store.call(
                     "set_vector", record_id, model, row["revision"], vector
                 )
@@ -185,8 +187,16 @@ class Engine:
                         if self.settings() == cfg:
                             await self.store.call("classify", row, output)
                 elif job["kind"] == "reindex":
+                    if not cfg.semantic_enabled:
+                        await self.store.call(
+                            "finish",
+                            job["id"],
+                            "completed",
+                            "vector search disabled; no model called",
+                        )
+                        continue
                     offset = 0
-                    while self.settings().enabled:
+                    while self.settings().enabled and self.settings().semantic_enabled:
                         rows = await self.store.call(
                             "search", job["sid"], limit=100, offset=offset
                         )

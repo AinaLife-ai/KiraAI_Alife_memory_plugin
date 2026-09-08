@@ -72,7 +72,7 @@ class Settings(Strict):
     compress_model: str = ""
     audit_model: str = ""
     embedding_model: str = ""
-    semantic_enabled: bool = True
+    semantic_enabled: bool = False
     audit_enabled: bool = True
     audit_interval: int = Field(default=1800, ge=30, le=604800)
     audit_batch: int = Field(default=20, ge=1, le=50)
@@ -91,6 +91,9 @@ class Settings(Strict):
         default="以自身视角保留事件、感情、人物、关键事实和生活轨迹。精简但不要按珍贵程度丢弃线索；只依据输入，保留时间、否定、条件和不确定性。",
         max_length=4000,
     )
+    auto_migrate: bool = True
+    mutual_exclusion: bool = True
+    migration_max_chars: int = Field(default=120, ge=1, le=16000)
 
     @model_validator(mode="after")
     def valid_batch(self):

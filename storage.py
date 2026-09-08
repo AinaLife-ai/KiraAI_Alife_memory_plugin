@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import time
 import uuid
@@ -93,8 +94,20 @@ class Store:
               id TEXT PRIMARY KEY REFERENCES records(id), model TEXT NOT NULL,
               revision INTEGER NOT NULL, vector TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS migration_items (
+              source TEXT NOT NULL, source_key TEXT NOT NULL, digest TEXT NOT NULL,
+              record_id TEXT REFERENCES records(id), reason TEXT NOT NULL,
+              file_hash TEXT NOT NULL, metadata TEXT NOT NULL, created REAL NOT NULL,
+              PRIMARY KEY(source,source_key,digest));
+            CREATE TABLE IF NOT EXISTS migration_reports (source TEXT PRIMARY KEY, report TEXT NOT NULL);
             INSERT OR IGNORE INTO meta VALUES ('revision',0);
             """)
+            if "visibility" not in {
+                r[1] for r in db.execute("PRAGMA table_info(records)")
+            }:
+                db.execute(
+                    "ALTER TABLE records ADD COLUMN visibility TEXT NOT NULL DEFAULT 'session'"
+                )
             db.execute(
                 "UPDATE jobs SET state='queued',detail='resumed after restart' WHERE state='running'"
             )
@@ -152,6 +165,49 @@ class Store:
                 )
             ]
 
+    def context(self, sid, users=()):
+        with self.connect() as db:
+            return [
+                self.row(r)
+                for r in db.execute(
+                    """SELECT * FROM records WHERE active=1 AND deleted=0 AND
+                (sid=? OR visibility='global' OR (visibility='user' AND EXISTS
+                  (SELECT 1 FROM json_each(records.users) WHERE value IN (SELECT value FROM json_each(?)))))
+                ORDER BY permanent DESC,level DESC,position,id""",
+                    (sid, dump(list(users))),
+                )
+            ]
+
+    def import_legacy(self, snapshot):
+        from .migration import import_snapshot
+
+        return import_snapshot(self, snapshot)
+
+    def scan_legacy(self, root, plugin_id, limit):
+        from .migration import snapshot
+
+        return snapshot(root, plugin_id, limit)
+
+    def migration_status(self):
+        with self.connect() as db:
+            return {
+                "reports": [
+                    json.loads(r[0])
+                    for r in db.execute(
+                        "SELECT report FROM migration_reports ORDER BY source"
+                    )
+                ],
+                "skips": [
+                    dict(r)
+                    for r in db.execute(
+                        "SELECT source,reason,count(*) AS count FROM migration_items WHERE reason<>'' GROUP BY source,reason"
+                    )
+                ],
+                "total_imported": db.execute(
+                    "SELECT count(DISTINCT record_id) FROM migration_items"
+                ).fetchone()[0],
+            }
+
     def sessions(self):
         with self.connect() as db:
             return [
@@ -169,6 +225,13 @@ class Store:
                 ).fetchone()
             )
             if result:
+                result["legacy_sources"] = [
+                    dict(r)
+                    for r in db.execute(
+                        "SELECT source,source_key,digest,file_hash,metadata FROM migration_items WHERE record_id=?",
+                        (record_id,),
+                    )
+                ]
                 result["children"] = [
                     r[0]
                     for r in db.execute(
@@ -285,6 +348,13 @@ class Store:
                     time.time(),
                 ),
             )
+            visibility = {r.get("visibility", "session") for r in candidates}
+            if len(visibility) != 1:
+                raise ValueError("mixed visibility cannot be compressed")
+            db.execute(
+                "UPDATE records SET visibility=? WHERE id=?",
+                (visibility.pop(), archive_id),
+            )
             for index, row in enumerate(candidates):
                 db.execute(
                     "INSERT INTO edges VALUES (?,?,?)", (archive_id, row["id"], index)
@@ -381,14 +451,17 @@ class Store:
         active=False,
         vector=None,
         model="",
+        lexical="",
     ):
         clauses, args = ["deleted=0"], []
         if scope == "session":
-            clauses.append("sid=?")
-            args.append(sid)
+            clauses.append(
+                "(sid=? OR visibility='global' OR (visibility='user' AND EXISTS (SELECT 1 FROM json_each(records.users) WHERE value IN (SELECT value FROM json_each(?)))) )"
+            )
+            args.extend([sid, dump(list(users))])
         elif scope == "linked":
             clauses.append(
-                "(sid=? OR EXISTS (SELECT 1 FROM json_each(records.users) WHERE value IN (SELECT value FROM json_each(?))))"
+                "(sid=? OR visibility='global' OR EXISTS (SELECT 1 FROM json_each(records.users) WHERE value IN (SELECT value FROM json_each(?))))"
             )
             args.extend([sid, dump(list(users))])
         if keyword:
@@ -410,8 +483,26 @@ class Store:
                 "EXISTS (SELECT 1 FROM json_each(records.users) WHERE value=?)"
             )
             args.append(subject)
-        where = " AND ".join(clauses)
         with self.connect() as db:
+            if lexical and not vector:
+                # Local lexical ranking: words plus Chinese bigrams, no provider.
+                chunks = re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", lexical.lower())
+                tokens = {
+                    t
+                    for c in chunks
+                    for t in (
+                        [c]
+                        if not re.match(r"[\u3400-\u9fff]", c) or len(c) < 2
+                        else [c[i : i + 2] for i in range(len(c) - 1)]
+                    )
+                }
+                db.create_function(
+                    "lexical_score",
+                    1,
+                    lambda text: sum(t in text.lower() for t in tokens),
+                )
+                clauses.append("lexical_score(summary)>0")
+            where = " AND ".join(clauses)
             total = db.execute(
                 "SELECT count(*) FROM records WHERE " + where, args
             ).fetchone()[0]
@@ -438,18 +529,36 @@ class Store:
                 rows = db.execute(
                     "SELECT * FROM records WHERE "
                     + where
-                    + " ORDER BY end,id LIMIT ? OFFSET ?",
+                    + (
+                        " ORDER BY lexical_score(summary) DESC,end,id LIMIT ? OFFSET ?"
+                        if lexical
+                        else " ORDER BY end,id LIMIT ? OFFSET ?"
+                    ),
                     [*args, limit, offset],
                 )
             return {"total": total, "items": [self.row(r) for r in rows]}
 
     def facts(
-        self, sid="", subject="", category="", limit=100, offset=0, global_scope=False
+        self,
+        sid="",
+        subject="",
+        category="",
+        limit=100,
+        offset=0,
+        global_scope=False,
+        users=(),
+        include_shared=False,
     ):
         where, args = ["deleted=0"], []
         if not global_scope:
-            where.append("sid=?")
-            args.append(sid)
+            if include_shared:
+                where.append("""(sid=? OR EXISTS (SELECT 1 FROM records,json_each(facts.sources) AS src WHERE records.id=src.value
+                  AND records.deleted=0 AND (records.visibility='global' OR (records.visibility='user' AND EXISTS
+                  (SELECT 1 FROM json_each(records.users) WHERE value IN (SELECT value FROM json_each(?)))))))""")
+                args.extend([sid, dump(list(users))])
+            else:
+                where.append("sid=?")
+                args.append(sid)
         for key, value in [("subject", subject), ("category", category)]:
             if value:
                 where.append(key + "=?")
@@ -639,5 +748,12 @@ class Store:
         with self.connect() as db:
             return {
                 t: [dict(r) for r in db.execute("SELECT * FROM " + t)]
-                for t in ("records", "edges", "facts", "versions")
+                for t in (
+                    "records",
+                    "edges",
+                    "facts",
+                    "versions",
+                    "migration_items",
+                    "migration_reports",
+                )
             }

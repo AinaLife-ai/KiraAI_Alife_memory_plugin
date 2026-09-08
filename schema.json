@@ -61,14 +61,14 @@
       },
       "embedding_model": {
         "type": "model_select",
-        "name": "向量模型",
+        "name": "可选向量模型（启用后可能计费）",
         "default": "",
         "model_type": "embedding"
       },
       "semantic_enabled": {
         "type": "switch",
-        "name": "语义检索",
-        "default": true
+        "name": "启用向量检索（默认关闭）",
+        "default": false
       },
       "audit_enabled": {
         "type": "switch",
@@ -174,6 +174,23 @@
         "type": "string",
         "name": "压缩补充要求",
         "default": "以自身视角保留事件、感情、人物、关键事实和生活轨迹。精简但不要按珍贵程度丢弃线索；只依据输入，保留时间、否定、条件和不确定性。"
+      },
+      "auto_migrate": {
+        "type": "switch",
+        "name": "自动安全迁移旧记忆",
+        "default": true
+      },
+      "mutual_exclusion": {
+        "type": "switch",
+        "name": "迁移成功后互斥旧插件",
+        "default": true
+      },
+      "migration_max_chars": {
+        "type": "integer",
+        "name": "KiraOS 迁移字符上限",
+        "default": 120,
+        "minimum": 1,
+        "maximum": 16000
       }
     }
   }
