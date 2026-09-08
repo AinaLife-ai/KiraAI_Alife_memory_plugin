@@ -46,6 +46,36 @@ def tool_call_summary(tool_calls, limit=60):
     return "[调用工具：" + "、".join(parts) + "]" if parts else ""
 
 
+_NOISE = re.compile(r"[\s，。、；：！？,.!?;:'\"“”‘’()（）\[\]【】<>《》\-—~～/\\]+")
+
+
+def normalize_text(text):
+    """Case- and punctuation-insensitive form used for duplicate detection."""
+    return _NOISE.sub("", (text or "").casefold())
+
+
+def _bigrams(text):
+    flat = normalize_text(text)
+    if len(flat) < 2:
+        return {flat} if flat else set()
+    return {flat[i : i + 2] for i in range(len(flat) - 1)}
+
+
+def similarity(left, right):
+    """Bigram containment: "does one memory largely cover the other".
+
+    Jaccard over long texts is too diluted for near-duplicate detection, so we
+    score the overlap against the smaller side and require a real overlap.
+    """
+    a, b = _bigrams(left), _bigrams(right)
+    if not a or not b:
+        return 0.0
+    overlap = len(a & b)
+    if overlap < 4:
+        return 0.0
+    return overlap / min(len(a), len(b))
+
+
 def identity_info(entity_id):
     """Display labels; synthetic ids are pending/uncategorised, never a fake entity."""
     from . import identity

@@ -1052,11 +1052,28 @@ class AlifeMemoryPlugin(BasePlugin):
         if not self.runtime_settings().enabled:
             return dump({"ok": False, "error": "memory_paused"})
         value = NewMemory(sid=event.sid, content=content, users=user_ids(event))
+        existing = await self.store.call("find_permanent", value.sid, value.content)
+        if existing:
+            # An identical permanent memory is not stored twice; re-saving revives it.
+            if not existing["active"]:
+                await self.store.call(
+                    "edit",
+                    "record",
+                    existing["id"],
+                    existing["revision"],
+                    {"active": True},
+                    "memorize revived an archived permanent memory",
+                )
+            return self.recall_result(
+                event, {"ok": True, "id": existing["id"], "existing": True}
+            )
         now = time.time()
         record_id = await self.store.call(
             "memorize", value.sid, value.content, value.users, now, now
         )
         await self.engine.enqueue("classify", record_id)
+        if self.settings.permanent_dedupe:
+            await self.engine.enqueue("dedupe", value.sid, automatic=True)
         return self.recall_result(event, {"ok": True, "id": record_id})
 
     @register.tool(

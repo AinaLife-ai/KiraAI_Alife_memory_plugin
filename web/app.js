@@ -45,6 +45,8 @@ const fields = {
   boot_enabled: "打开面板时播放载入动画",
   boot_replay_seconds: "载入动画重播冷却（秒）",
   session_affinity: "全局召回优先当前会话",
+  permanent_dedupe: "自动合并相似永久记忆",
+  dedupe_threshold: "永久记忆相似度阈值",
 };
 let ctx = null,
   tab = "home",

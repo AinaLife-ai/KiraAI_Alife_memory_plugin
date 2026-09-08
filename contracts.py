@@ -91,6 +91,21 @@ class Audit(Strict):
     actions: list[AuditAction] = Field(max_length=50)
 
 
+class RecordMerge(Strict):
+    """Verdict for a cluster of similar permanent memories."""
+
+    action: Literal["keep", "merge"]
+    content: str = Field(default="", max_length=16000)
+    reason: Short
+    source_ids: list[Short] = Field(min_length=2, max_length=10)
+
+    @model_validator(mode="after")
+    def valid(self):
+        if self.action == "merge" and not self.content.strip():
+            raise ValueError("merged content required")
+        return self
+
+
 class Settings(Strict):
     enabled: bool = True
     capture_enabled: bool = True
@@ -128,6 +143,8 @@ class Settings(Strict):
     boot_enabled: bool = True
     boot_replay_seconds: int = Field(default=90, ge=0, le=86400)
     session_affinity: bool = False
+    permanent_dedupe: bool = True
+    dedupe_threshold: float = Field(default=0.3, ge=0.1, le=0.95)
 
     @model_validator(mode="after")
     def valid_batch(self):
@@ -214,7 +231,7 @@ class NewMemory(Strict):
 
 
 class Job(Strict):
-    kind: Literal["compress", "audit", "reindex"]
+    kind: Literal["compress", "audit", "reindex", "dedupe"]
     sid: Short
 
 

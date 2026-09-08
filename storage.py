@@ -1009,6 +1009,83 @@ class Store:
             self.bump(db)
             return record_id
 
+    def find_permanent(self, sid, content):
+        """Exact (normalised) duplicate among this session's permanent memories."""
+        from .retrieval import normalize_text
+
+        target = normalize_text(content)
+        with self.connect() as db:
+            for row in db.execute(
+                "SELECT * FROM records WHERE sid=? AND permanent=1 AND deleted=0 "
+                "ORDER BY end DESC,id",
+                (sid,),
+            ):
+                if normalize_text(row["content"]) == target:
+                    return self.row(row)
+        return None
+
+    def permanent_records(self, sid):
+        """Active permanent memories of one session, newest first."""
+        with self.connect() as db:
+            return [
+                self.row(row)
+                for row in db.execute(
+                    "SELECT * FROM records WHERE sid=? AND permanent=1 AND deleted=0 "
+                    "AND active=1 ORDER BY end DESC,id",
+                    (sid,),
+                )
+            ]
+
+    def sessions_with_permanents(self):
+        with self.connect() as db:
+            return [
+                row[0]
+                for row in db.execute(
+                    "SELECT sid FROM records WHERE permanent=1 AND deleted=0 "
+                    "AND active=1 GROUP BY sid HAVING count(*)>1"
+                )
+            ]
+
+    def merge_records(self, target_id, source_ids, content, reason):
+        """Fold similar permanent memories into the newest one; originals stay."""
+        ids = list(dict.fromkeys(source_ids))
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = {}
+            for record_id in ids:
+                row = db.execute(
+                    "SELECT * FROM records WHERE id=? AND deleted=0", (record_id,)
+                ).fetchone()
+                if not row or not row["permanent"]:
+                    raise ValueError("invalid merge source")
+                rows[record_id] = row
+            if target_id not in rows:
+                raise ValueError("invalid merge target")
+            sid = rows[target_id]["sid"]
+            if any(row["sid"] != sid for row in rows.values()):
+                raise ValueError("cross-session merge is forbidden")
+            for record_id, row in rows.items():
+                db.execute(
+                    "INSERT INTO versions(kind,target,snapshot,reason,created) "
+                    "VALUES ('record',?,?,?,?)",
+                    (record_id, dump(dict(row)), reason, time.time()),
+                )
+            # Summary is what the model sees; content keeps the archive text.
+            db.execute(
+                "UPDATE records SET summary=?,revision=revision+1 WHERE id=?",
+                (content, target_id),
+            )
+            for record_id in ids:
+                if record_id == target_id:
+                    continue
+                db.execute(
+                    "UPDATE records SET active=0,revision=revision+1 WHERE id=?",
+                    (record_id,),
+                )
+                db.execute("DELETE FROM vectors WHERE id=?", (record_id,))
+            self.bump(db)
+        return {"target": target_id, "folded": len(ids)}
+
     def edit(self, kind, target, revision, patch, reason):
         table = "records" if kind == "record" else "facts"
         allowed = (
