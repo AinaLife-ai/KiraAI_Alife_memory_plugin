@@ -1,21 +1,27 @@
 {
   "plugin_id": "alife_memory_z",
   "display_name": "Alife Memory Z",
-  "version": "1.1.1",
+  "version": "2.0.0",
   "author": "znq19",
   "repo": "https://github.com/znq19/KiraAI_Alife_memory_plugin",
-  "description": "受 Alife 分层记忆启发的 KiraAI 长期记忆·Z 版：主动与自动精准跨维度检索、异步压缩、来源追溯、去重合并、后台反思纠错与热管理。所有配置均可侧边栏 WebUI 设置和管理。",
-  "core_version": ">=2.33.1",
-  "tags": ["memory", "agent", "rag", "async", "retrieval", "cross-dimension"],
+  "description": "忠实移植 Alife 持久记忆：分层归档、永久原文、主动回忆、严格结构化审计与实时编辑。",
+  "tags": [
+    "memory",
+    "agent",
+    "rag",
+    "async",
+    "retrieval",
+    "cross-dimension"
+  ],
   "icon": "icon.png",
   "locales": {
     "zh": {
       "display_name": "Alife 长期记忆·Z",
-      "description": "主动与自动精准跨维度检索、异步分层压缩、自动去重合并、后台反思纠错的 KiraAI 长期记忆中枢·Z 版。所有配置均可侧边栏 WebUI 设置和管理。"
+      "description": "忠实移植 Alife 持久记忆：分层归档、永久原文、主动回忆、严格结构化审计与实时编辑。"
     },
     "en": {
       "display_name": "Alife Memory Z",
-      "description": "Proactive and automatic precise cross-dimensional retrieval, asynchronous hierarchical memory with deduplication and reflection-based correction. Z Edition. All settings configurable via WebUI sidebar."
+      "description": "Alife persistent memory port: lossless source archives, hierarchical context, proactive recall, strict structured auditing and live editing."
     }
   }
 }
