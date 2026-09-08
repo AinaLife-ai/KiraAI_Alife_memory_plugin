@@ -127,18 +127,32 @@ class Engine:
                 + cfg.compress_instruction
                 if purpose == "compress"
                 else (
-                    "records 按时间从新到旧排列，records[0] 是最新的那条。"
-                    "只输出一个 action：keep 或 merge。"
-                    "只有同时满足三条才 merge：①指向同一个对象（同一个人、同一个群、"
-                    "同一份名单或同一个约定）；②说的是该对象的同一件事或同一属性；"
-                    "③互为重复，或后者是对前者的更正/补充。"
-                    "任意一条不满足就 keep，例如主体不同（阿远 vs 小夏）、只是话题相近、"
-                    "说的是两件不同的事。"
-                    "互相矛盾时按更正处理：content 只保留时间较晚的说法，reason 说明是更正，"
-                    "不要保留已被推翻的旧结论。"
-                    "content 必须自包含：写清对象、时间与结论；原样保留人名、群名、数字、"
-                    "QQ号与日期；不得丢掉任何一条独有的关键信息；不得写“同上”或引用其他记录ID。"
-                    "source_ids 至少两条，逐字复制 records[].id；禁止编造ID。"
+                    (
+                        "records 按时间从新到旧排列，records[0] 是最新的那条。"
+                        "只输出一个 action：merge（不允许 keep）。"
+                        "以 records[0]（最新）为基准：先保留它的内容与结论，"
+                        "再把其余记录里独有的人名、群名、数字、QQ号、日期、状态等全部补充进去；"
+                        "冲突之处以时间较晚的说法为准。"
+                        "如果这些记忆涉及不同主体（阿远 vs 小夏），"
+                        "必须在同一条 content 里分别写明，不得丢弃任何主体或任何独有信息。"
+                        "content 必须自包含，不得写“同上”或引用其他记录ID。"
+                        "source_ids 至少两条，逐字复制 records[].id；禁止编造ID。"
+                        if cfg.dedupe_force_merge
+                        else (
+                            "records 按时间从新到旧排列，records[0] 是最新的那条。"
+                            "只输出一个 action：keep 或 merge。"
+                            "只有同时满足三条才 merge：①指向同一个对象（同一个人、同一个群、"
+                            "同一份名单或同一个约定）；②说的是该对象的同一件事或同一属性；"
+                            "③互为重复，或后者是对前者的更正/补充。"
+                            "任意一条不满足就 keep，例如主体不同（阿远 vs 小夏）、只是话题相近、"
+                            "说的是两件不同的事。"
+                            "互相矛盾时按更正处理：content 只保留时间较晚的说法，reason 说明是更正，"
+                            "不要保留已被推翻的旧结论。"
+                            "content 必须自包含：写清对象、时间与结论；原样保留人名、群名、数字、"
+                            "QQ号与日期；不得丢掉任何一条独有的关键信息；不得写“同上”或引用其他记录ID。"
+                            "source_ids 至少两条，逐字复制 records[].id；禁止编造ID。"
+                        )
+                    )
                     if purpose == "dedupe"
                     else "审计输出只含actions，禁止输出summary/facts。target_id和source_ids均来自facts[].id，不是evidence[].id或facts[].sources。keep/correct的source_ids只能是[target_id]；merge至少两个同会话、同主体、同分类事实ID，每个事实只能参与一次操作。无需操作时actions=[]。依据证据审计，保留否定、时间和不确定性；不同事件不得因相似而合并。关系警告需核对原文，correct时提供修正后的relations；无法证实连线时设为空数组。无须改关系时设null。"
                 )
@@ -347,21 +361,37 @@ class Engine:
                 ],
             }
             output = await self.structured(RecordMerge, "dedupe", payload, cfg)
-            if output["action"] != "merge":
+            if output["action"] == "merge":
+                if not set(output["source_ids"]) <= ids:
+                    raise ValueError("unknown source id")
+                sources = output["source_ids"]
+                content = output["content"]
+                reason = output["reason"]
+            elif cfg.dedupe_force_merge:
+                # Force mode never leaves near-duplicates behind: fall back to
+                # the union of the original texts, newest first.
+                sources = [item["id"] for item in group]
+                content = "\n".join(
+                    dict.fromkeys(
+                        item["summary"].strip()
+                        for item in group
+                        if item["summary"].strip()
+                    )
+                )[:16000]
+                reason = "强制合并：模型选择保留，改为按原文拼接合并"
+                logger.info(
+                    "[记忆·Z] 强制合并相似永久记忆（模型曾选择保留：%s）",
+                    output["reason"],
+                )
+            else:
                 logger.info(
                     "[记忆·Z] 相似永久记忆判定为保留：%s", output["reason"]
                 )
                 continue
-            if not set(output["source_ids"]) <= ids:
-                raise ValueError("unknown source id")
             if self.settings() != cfg:
                 return
             result = await self.store.call(
-                "merge_records",
-                group[0]["id"],
-                output["source_ids"],
-                output["content"],
-                output["reason"],
+                "merge_records", group[0]["id"], sources, content, reason
             )
             logger.info(
                 "[记忆·Z] 合并 %s 条相似永久记忆 → %s",

@@ -2,6 +2,12 @@
 
 将 [Alife 持久记忆](https://github.com/BDFFZI/Alife/tree/0b9836a3a6cc38f9a63b5271768963d9eb970b03/sources/Alife.Function/Alife.Function.Memory) 的分层归档机制移植到 KiraAI。沿用 `alife_memory_z`、长期记忆·Z 名称和原图标；核心围绕原始经历与可回溯存档重建。
 
+## 2.2.5 更新
+
+相似永久记忆**检测到就强制合并**：以最新那条为基准，把其余各条独有的信息全部并入；模型若仍想保留，程序会用原文拼接兜底合并。新增开关 `dedupe_force_merge`（默认开），关闭则回到"只在确属重复或更正时才合并"的保守策略。
+
+详见[检测到相似就强制合并](docs/FORCE_MERGE_2_2_5.md)。
+
 ## 2.2.4 更新
 
 同一会话只给新情报：搜索默认排除本会话已经给过的记忆（含每轮注入的存档与事实、按 ID 读过的存档），只返回新内容；`already_seen` 报告跳过数量，`allow_seen=true` 可显式重搜，`ReadMemoryArchive(id)` 永远能重读。`MemoryOverview` 的事实同样去重。同时删除写死的「还有别的吗」启发式（`re.fullmatch` 只认 8 个固定短语），改由模型通过 `SearchMemoryArchive(next_batch=true)` 驱动。

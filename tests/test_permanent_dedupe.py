@@ -85,7 +85,9 @@ async def test_consolidate_merges_only_when_model_says_so(tmp_path):
             ensure_ascii=False,
         )
 
-    cfg = c.Settings(dedupe_threshold=0.3, model_retries=0)
+    cfg = c.Settings(
+        dedupe_threshold=0.3, model_retries=0, dedupe_force_merge=False
+    )
     engine = e.Engine(store, lambda: cfg, keep_model, None, None)
     await engine.consolidate(SID)
     assert len(store.permanent_records(SID)) == 3
@@ -139,3 +141,35 @@ def test_dedupe_disabled_leaves_memories_alone(tmp_path):
     engine = e.Engine(store, lambda: cfg, merge_model, None, None)
     asyncio.run(engine.consolidate(SID))
     assert len(store.permanent_records(SID)) == 3
+
+
+@pytest.mark.asyncio
+async def test_force_merge_switch_changes_dedupe_instruction(tmp_path):
+    captured = {}
+
+    async def model(_model, purpose, instruction, _schema, _payload):
+        captured[purpose] = instruction
+        return json.dumps(
+            {
+                "action": "merge",
+                "content": "合并结果",
+                "reason": "测试",
+                "source_ids": _payload["records"] and [
+                    item["id"] for item in _payload["records"]
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    for index, (flag, marker) in enumerate(
+        ((True, "不允许 keep"), (False, "只有同时满足三条才 merge"))
+    ):
+        store = s.Store(tmp_path / f"db{index}.sqlite3")
+        store.initialize()
+        seed(store)
+        cfg = c.Settings(
+            dedupe_force_merge=flag, dedupe_threshold=0.25, model_retries=0
+        )
+        engine = e.Engine(store, lambda: cfg, model, None, None)
+        await engine.consolidate(SID)
+        assert marker in captured["dedupe"]
