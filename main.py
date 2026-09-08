@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from fastapi import HTTPException, Request
+from openai import APITimeoutError, APIConnectionError
 from core.plugin import BasePlugin, PageMenu, PluginPage, Priority, on, register
 from core.provider import LLMRequest
 from core.agent.message import OpenAIMessage
@@ -28,10 +29,14 @@ from .contracts import (
     Settings,
     dump,
     parse_output,
+    NameEdit,
+    EntityRefresh,
 )
 from .engine import Engine, compression_plan
 from .storage import Conflict, Store
 from .migration import SOURCES
+from .retrieval import safe_facts
+from .setting_help import HELP
 
 PLUGIN_ID = "alife_memory_z"
 logger = get_logger(PLUGIN_ID, "light_purple")
@@ -40,6 +45,9 @@ MEMORY_RULES = (
     "层级只表示压缩次数，100 是永久记忆。主动使用 ReadMemoryArchive 逐层读取 children 找回原文，"
     "SearchMemoryArchive 按关键词/时间/层级搜索，Memorize 保存珍贵核心记忆，Forget 仅移出永久记忆，"
     "MemoryOverview 查看用户、画像和关系。如缺少上下文先检索再回答，不得假装记得。"
+    "跨会话记忆必须核对来源会话、用户ID和时间，别人的经历不等于当前用户的经历。"
+    "MemoryNames 可按现名或曾用名查稳定ID，CorrectMemoryName 有证据时更新称呼；同名不代表同一人。"
+    "needs_review 的关系只是待核对的历史描述，不可作为确定关系。"
 )
 
 
@@ -81,6 +89,7 @@ class AlifeMemoryPlugin(BasePlugin):
         self.migration_lock = asyncio.Lock()
         self.migration_blocked = False
         self.migration_note = ""
+        self.name_refresh_lock = asyncio.Lock()
 
     def conflicts(self):
         pm = getattr(self.ctx, "plugin_mgr", None)
@@ -156,6 +165,11 @@ class AlifeMemoryPlugin(BasePlugin):
         )
         await self.migrate()
         await self.engine.start()
+        logger.info(
+            "[记忆·Z] 记忆系统就绪 · 访问范围 %s · 向量检索%s",
+            self.settings.recall_scope,
+            "开启" if self.settings.semantic_enabled else "关闭",
+        )
 
     async def terminate(self):
         if self.engine:
@@ -185,7 +199,12 @@ class AlifeMemoryPlugin(BasePlugin):
             ]
         )
         # Host providers do not uniformly expose response_format; validation remains mandatory.
-        response = await client.chat(req)
+        try:
+            response = await client.chat(req)
+        except APITimeoutError:
+            raise TimeoutError() from None
+        except APIConnectionError:
+            raise ConnectionError() from None
         if response.tool_calls:
             raise ValueError("unexpected_tool_call")
         return response.text_response
@@ -220,12 +239,150 @@ class AlifeMemoryPlugin(BasePlugin):
             ),
         )
 
+    async def observe_event_names(self, event):
+        adapter = event.session.adapter_name
+        for msg in event.messages:
+            sender = getattr(msg, "sender", None)
+            if sender:
+                await self.store.call(
+                    "observe_name",
+                    f"{adapter}:{sender.user_id}",
+                    sender.nickname,
+                    context=event.sid,
+                    observed=float(msg.timestamp),
+                )
+        title = getattr(event.session, "session_title", None)
+        await self.store.call(
+            "observe_name",
+            event.sid,
+            title,
+            kind="session",
+            context=event.sid,
+            observed=float(getattr(event, "timestamp", None) or time.time()),
+        )
+
+    async def refresh_name(self, entity_id):
+        # Use the installed adapter instance name, never guess a platform from an ID.
+        entities = await self.store.call("entities", ids=[entity_id])
+        if not entities:
+            raise ValueError("unknown entity")
+        parts = entity_id.split(":")
+        if len(parts) not in (2, 3) or (
+            len(parts) == 3 and parts[1] not in {"dm", "gm"}
+        ):
+            raise ValueError("unsupported entity id")
+        manager = getattr(self.ctx, "adapter_mgr", None)
+        adapter = manager.get_adapter(parts[0]) if manager else None
+        bot = getattr(adapter, "bot", None)
+        group = len(parts) == 3 and parts[1] == "gm"
+        method = getattr(bot, "get_group_info" if group else "get_user_info", None)
+        if method is None:
+            raise ValueError("adapter does not support name lookup")
+        async with self.name_refresh_lock:
+            response = await asyncio.wait_for(
+                method(**{"group_id" if group else "user_id": parts[-1]}), 10
+            )
+            data = response.get("data", {}) if isinstance(response, dict) else {}
+            name = data.get("group_name" if group else "nickname")
+            if not name or str(name).casefold() in {"none", "null"}:
+                raise ValueError("adapter returned no name")
+            await self.store.call(
+                "observe_name",
+                entity_id,
+                name,
+                kind="session" if len(parts) == 3 else "user",
+                source="onebot",
+                reason="adapter lookup",
+            )
+        return (await self.store.call("entities", ids=[entity_id]))[0]
+
+    @register.tool(
+        name="MemoryNames",
+        description="按现名、曾用名或ID查人物/群名称及历史。同名返回多个候选，不自动合并身份。",
+        params={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": False,
+        },
+    )
+    async def memory_names(self, event, query="", offset=0):
+        if not self.runtime_settings().enabled or type(offset) is not int or offset < 0:
+            return dump({"ok": False, "error": "memory_paused_or_invalid_offset"})
+        ids = await self.store.call(
+            "entity_ids", event.sid, user_ids(event), self.settings.recall_scope
+        )
+        return dump(
+            {
+                "ok": True,
+                "entities": await self.store.call(
+                    "entities", query, ids=ids, offset=offset
+                ),
+            }
+        )
+
+    @register.tool(
+        name="CorrectMemoryName",
+        description="有明确证据时修正已知ID的当前称呼，保留曾用名、来源与时间。不能更改ID或合并同名用户。",
+        params={
+            "type": "object",
+            "properties": {
+                "entity_id": {"type": "string"},
+                "name": {"type": "string"},
+                "revision": {"type": "integer"},
+                "reason": {"type": "string"},
+            },
+            "required": ["entity_id", "name", "revision", "reason"],
+            "additionalProperties": False,
+        },
+    )
+    async def correct_name(self, event, entity_id, name, revision, reason):
+        try:
+            edit = NameEdit(
+                entity_id=entity_id, name=name, revision=revision, reason=reason
+            )
+            ids = await self.store.call(
+                "entity_ids", event.sid, user_ids(event), self.settings.recall_scope
+            )
+            if not self.runtime_settings().enabled or entity_id not in ids:
+                raise ValueError("not accessible")
+            await self.store.call(
+                "observe_name", **edit.model_dump(), source="bot", context=event.sid
+            )
+            return dump({"ok": True})
+        except ValueError:
+            return dump({"ok": False, "error": "invalid_or_conflicting_name"})
+
+    @register.tool(
+        name="RefreshMemoryName",
+        description="从当前 OneBot 适配器查询已知人物或群的最新名称；无需模型，只更新名称历史。",
+        params={
+            "type": "object",
+            "properties": {"entity_id": {"type": "string"}},
+            "required": ["entity_id"],
+            "additionalProperties": False,
+        },
+    )
+    async def refresh_memory_name(self, event, entity_id):
+        try:
+            ids = await self.store.call(
+                "entity_ids", event.sid, user_ids(event), self.settings.recall_scope
+            )
+            if not self.runtime_settings().enabled or entity_id not in ids:
+                raise ValueError("not accessible")
+            return dump({"ok": True, "entity": await self.refresh_name(entity_id)})
+        except (ValueError, TimeoutError):
+            return dump({"ok": False, "error": "name_lookup_unavailable"})
+
     @on.llm_request(priority=Priority.LOW)
     async def on_request(self, event, req: LLMRequest, *_):
         cfg = self.runtime_settings()
         if not cfg.enabled:
             return
         sid = event.sid
+        await self.observe_event_names(event)
         rows = await self.store.call("active", sid)
         # Seed pre-install history once; never erase the core's own history on disk.
         if not rows and req.messages and cfg.capture_enabled:
@@ -244,13 +401,64 @@ class AlifeMemoryPlugin(BasePlugin):
         if not cfg.auto_inject:
             return
         users = user_ids(event)
-        rows = await self.store.call("context", sid, users)
+        query = " ".join(text_of(m) for m in event.messages)
+        rows = await self.store.call("context", sid, users, scope=cfg.recall_scope)
         facts = await self.store.call(
             "facts", sid, limit=cfg.top_k * 10, users=users, include_shared=True
         )
+        related = []
+        if cfg.recall_scope != "session" and query.strip():
+            matches = await self.store.call(
+                "search",
+                sid,
+                lexical=query,
+                scope=cfg.recall_scope,
+                users=users,
+                limit=cfg.top_k * 2,
+                exclude_sid=sid,
+            )
+            local_ids = {r["id"] for r in rows}
+            related = [
+                {
+                    k: r[k]
+                    for k in ("id", "sid", "users", "summary", "start", "end", "level")
+                }
+                for r in matches["items"]
+                if r["id"] not in local_ids
+            ][: cfg.top_k]
+            extra = await self.store.call(
+                "facts",
+                sid,
+                global_scope=cfg.recall_scope == "global",
+                users=users,
+                include_shared=True,
+                lexical=query,
+                limit=cfg.top_k,
+            )
+            facts = list({f["id"]: f for f in [*extra, *facts]}.values())
+        while len(dump(related)) > cfg.context_chars // 4 and related:
+            related.pop()
+        names = await self.store.call(
+            "entities",
+            ids={
+                sid,
+                *users,
+                *(u for r in related for u in r["users"]),
+                *(r["sid"] for r in related),
+            },
+            limit=30,
+        )
+        names = [
+            {
+                "id": n["id"],
+                "name": n["name"],
+                "aliases": list(dict.fromkeys(h["name"] for h in n["history"]))[:5],
+            }
+            for n in names
+        ]
         # Memory data is a request-only user block; host history stays byte-stable.
         # Keep complete records and give explicit IDs for anything outside the budget.
-        budget = cfg.context_chars
+        budget = cfg.context_chars - len(dump(related)) - len(dump(names)) - 1000
         selected, omitted = [], []
         priority = (
             [r for r in rows if r["permanent"]]
@@ -262,6 +470,8 @@ class AlifeMemoryPlugin(BasePlugin):
             rendered = dump(
                 {
                     "archive": row["id"],
+                    "sid": row["sid"],
+                    "users": row["users"],
                     "level": row["level"],
                     "start": row["start"],
                     "end": row["end"],
@@ -283,8 +493,10 @@ class AlifeMemoryPlugin(BasePlugin):
             "archives_in_context": len(selected),
             "omitted_count": len(omitted),
             "omitted_ids": omitted[:30],
-            "facts": facts,
+            "facts": safe_facts(facts),
             "archives": selected,
+            "related_archives": related,
+            "names": names,
         }
         req.system_prompt.append(
             Prompt(
@@ -307,6 +519,10 @@ class AlifeMemoryPlugin(BasePlugin):
                 perception["omitted_ids"].append(removed["archive"])
             perception["archives_in_context"] = len(perception["archives"])
             content = dump(perception)
+        for key in ("names", "related_archives", "omitted_ids"):
+            while len(content) > cfg.context_chars and perception[key]:
+                perception[key].pop()
+                content = dump(perception)
         req.user_prompt.insert(
             0,
             Prompt(
@@ -338,6 +554,7 @@ class AlifeMemoryPlugin(BasePlugin):
         if not response.text_response and not response.tool_calls:
             return
         sid, users = event.sid, user_ids(event)
+        await self.observe_event_names(event)
         base = str(event.event_id)
         incoming = [
             {
@@ -368,7 +585,7 @@ class AlifeMemoryPlugin(BasePlugin):
         if random.random() < self.settings.probability:
             rows = await self.store.call("active", sid)
             if compression_plan(rows, self.settings):
-                await self.engine.enqueue("compress", sid)
+                await self.engine.enqueue("compress", sid, automatic=True)
 
     @on.tool_result(priority=Priority.LOW)
     async def on_tool_result(self, event, result, *_):
@@ -421,7 +638,9 @@ class AlifeMemoryPlugin(BasePlugin):
     )
     async def read_archive(self, event, id: str):
         try:
-            return dump({"ok": True, "archive": await self.accessible(event, id)})
+            row = await self.accessible(event, id)
+            names = await self.store.call("entities", ids=[row["sid"], *row["users"]])
+            return dump({"ok": True, "archive": row, "names": names})
         except ValueError:
             return dump({"ok": False, "error": "archive_not_accessible"})
 
@@ -569,7 +788,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 "active_archives": len(context),
                 "known_users": known,
                 "subjects": sorted({r["subject"] for r in rows}),
-                "facts": rows,
+                "facts": safe_facts(rows),
                 "next_offset": offset + len(rows),
             }
         )
@@ -634,9 +853,15 @@ class AlifeMemoryPlugin(BasePlugin):
             "conflicts": self.conflicts(),
         }
         status["sessions"] = await self.store.call("sessions")
+        names = await self.store.call("entities", ids=status["sessions"], limit=1000)
+        status["session_names"] = {n["id"]: n["name"] for n in names if n["name"]}
         status["assets"] = await asyncio.to_thread(
             lambda: hashlib.sha256(
-                (Path(__file__).parent / "web/index.html").read_bytes()
+                b"".join(
+                    p.name.encode() + p.read_bytes()
+                    for p in sorted((Path(__file__).parent / "web").iterdir())
+                    if p.is_file()
+                )
             ).hexdigest()
         )
         return status
@@ -647,6 +872,7 @@ class AlifeMemoryPlugin(BasePlugin):
             "revision": revision(self.settings),
             "settings": self.settings.model_dump(),
             "schema": Settings.model_json_schema(),
+            "help": HELP,
         }
 
     @register.api(method="POST", path="/config", auth=True)
@@ -700,7 +926,7 @@ class AlifeMemoryPlugin(BasePlugin):
         vector, model = (
             await self.embed(q.prompt, self.settings) if q.prompt else (None, "")
         )
-        return await self.store.call(
+        result = await self.store.call(
             "search",
             **q.model_dump(exclude={"prompt"}),
             scope="session" if q.sid else "global",
@@ -708,6 +934,12 @@ class AlifeMemoryPlugin(BasePlugin):
             model=model,
             lexical=q.prompt if not vector else "",
         )
+        ids = {u for r in result["items"] for u in r["users"]} | {
+            r["sid"] for r in result["items"]
+        }
+        names = await self.store.call("entities", ids=ids, limit=1000)
+        result["names"] = {n["id"]: n["name"] for n in names if n["name"]}
+        return result
 
     @register.api(method="GET", path="/memory/{record_id}", auth=True)
     async def api_memory(self, record_id: str):
@@ -722,15 +954,27 @@ class AlifeMemoryPlugin(BasePlugin):
     ):
         if offset < 0:
             raise HTTPException(422, "invalid offset")
-        return await self.store.call(
+        rows = await self.store.call(
             "facts", sid, subject, category, 100, offset, not bool(sid)
         )
+        ids = {f["subject"] for f in rows} | {
+            r[k] for f in rows for r in f["relations"] for k in ("subject", "object")
+        }
+        names = {
+            n["id"]: n["name"]
+            for n in await self.store.call("entities", ids=ids, limit=1000)
+            if n["name"]
+        }
+        return [
+            {**f, "display_name": names.get(f["subject"], ""), "names": names}
+            for f in rows
+        ]
 
     @register.api(method="POST", path="/edit", auth=True)
     async def api_edit(self, request: Request):
         edit = await self.body(request, Edit)
         try:
-            if edit.kind == "fact":
+            if edit.kind == "fact" and edit.patch != {"deleted": True}:
 
                 def validate_fact():
                     with self.store.connect() as db:
@@ -783,7 +1027,32 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @register.api(method="GET", path="/export", auth=True)
     async def api_export(self):
-        return {"format": "alife-memory-z-v2", **await self.store.call("export")}
+        return {"format": "alife-memory-z-v3", **await self.store.call("export")}
+
+    @register.api(method="GET", path="/names", auth=True)
+    async def api_names(self, query: str = "", offset: int = 0):
+        if offset < 0 or len(query) > 500:
+            raise HTTPException(422, "invalid name query")
+        return await self.store.call("entities", query=query, offset=offset)
+
+    @register.api(method="POST", path="/names", auth=True)
+    async def api_name_edit(self, request: Request):
+        edit = await self.body(request, NameEdit)
+        try:
+            await self.store.call("observe_name", **edit.model_dump(), source="admin")
+            return {"ok": True}
+        except Conflict:
+            raise HTTPException(409, "name changed") from None
+
+    @register.api(method="POST", path="/names/refresh", auth=True)
+    async def api_name_refresh(self, request: Request):
+        edit = await self.body(request, EntityRefresh)
+        try:
+            return await self.refresh_name(edit.entity_id)
+        except Exception:
+            raise HTTPException(
+                422, "当前适配器无法查询该ID的名称，请手工校正或等待新消息"
+            ) from None
 
     @register.api(method="POST", path="/migrate", auth=True)
     async def api_migrate(self):

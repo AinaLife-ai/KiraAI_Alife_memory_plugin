@@ -7,22 +7,26 @@
       "enabled": {
         "type": "switch",
         "name": "启用记忆系统",
-        "default": true
+        "default": true,
+        "description": "总开关。关闭后暂停记录、召回和后台整理，已有记忆保留。"
       },
       "capture_enabled": {
         "type": "switch",
         "name": "记录对话与感知",
-        "default": true
+        "default": true,
+        "description": "把新对话、图片识别等感知结果写进记忆；关闭后仍可查旧记忆。"
       },
       "auto_inject": {
         "type": "switch",
         "name": "持续上下文注入",
-        "default": true
+        "default": true,
+        "description": "每轮主动给 Bot 提供相关记忆；关闭后只能通过记忆工具主动查找。"
       },
       "threshold": {
         "type": "integer",
         "name": "首层压缩阈值",
         "default": 100,
+        "description": "同一会话攒到多少条原始记录才开始整理。默认100；一问一答通常是2条。",
         "minimum": 4,
         "maximum": 10000
       },
@@ -30,6 +34,7 @@
         "type": "integer",
         "name": "首层每批条数",
         "default": 70,
+        "description": "每次最多整理多少条，必须小于压缩阈值。默认70；模型慢可改20。超时会自动减批。",
         "minimum": 2,
         "maximum": 9999
       },
@@ -37,6 +42,7 @@
         "type": "float",
         "name": "自动压缩概率",
         "default": 0.4,
+        "description": "每次检查时开始整理的机会。0为仅手动，0.4为40%，1为满足阈值就整理。",
         "minimum": 0,
         "maximum": 1
       },
@@ -44,6 +50,7 @@
         "type": "integer",
         "name": "最大压缩层级",
         "default": 8,
+        "description": "最多压缩多少层。默认8通常够用；层数表示整理次数，不表示重要程度。",
         "minimum": 1,
         "maximum": 32
       },
@@ -51,34 +58,40 @@
         "type": "model_select",
         "name": "压缩模型",
         "default": "",
+        "description": "负责把经历整理成摘要。默认用KiraAI快速模型；经常超时就换较快的模型。会产生正常语言模型费用。",
         "model_type": "llm"
       },
       "audit_model": {
         "type": "model_select",
         "name": "审计模型",
         "default": "",
+        "description": "负责核对事实、修正与合并重复内容。默认用KiraAI主模型，建议选择理解准确的模型。",
         "model_type": "llm"
       },
       "embedding_model": {
         "type": "model_select",
         "name": "可选向量模型（启用后可能计费）",
         "default": "",
+        "description": "仅在向量检索开启时使用。保持关闭就没有额外向量调用。",
         "model_type": "embedding"
       },
       "semantic_enabled": {
         "type": "switch",
         "name": "启用向量检索（默认关闭）",
-        "default": false
+        "default": false,
+        "description": "默认关闭，本地词语检索免费可用。开启才会为索引和查询调用向量模型，可能计费。"
       },
       "audit_enabled": {
         "type": "switch",
         "name": "后台审计",
-        "default": true
+        "default": true,
+        "description": "定期核对已有事实并合并重复项，需要调用审计模型。手动审计仍可使用。"
       },
       "audit_interval": {
         "type": "integer",
         "name": "审计间隔（秒）",
         "default": 1800,
+        "description": "多久自动审计一次。1800秒=30分钟；调大可减少模型调用。",
         "minimum": 30,
         "maximum": 604800
       },
@@ -86,6 +99,7 @@
         "type": "integer",
         "name": "每批审计事实数",
         "default": 20,
+        "description": "每次最多核对多少条事实。默认20；审计慢时可调到5～10。",
         "minimum": 1,
         "maximum": 50
       },
@@ -93,13 +107,15 @@
         "type": "integer",
         "name": "模型超时（秒）",
         "default": 120,
+        "description": "单次模型请求最多等多久。默认120秒；慢模型可改240。超时保留原文并按次数重试。",
         "minimum": 5,
         "maximum": 600
       },
       "model_retries": {
         "type": "integer",
-        "name": "格式错误重试次数",
+        "name": "模型失败重试次数",
         "default": 2,
+        "description": "超时、连接中断或格式错误后最多重试几次。默认2；设0不重试，次数越多可能越费。",
         "minimum": 0,
         "maximum": 4
       },
@@ -107,6 +123,7 @@
         "type": "integer",
         "name": "后台并发数",
         "default": 2,
+        "description": "最多同时运行多少个后台任务。默认2；服务商限流时改1。不会增加同时聊天人数。",
         "minimum": 1,
         "maximum": 4
       },
@@ -114,6 +131,7 @@
         "type": "integer",
         "name": "上下文字符预算",
         "default": 24000,
+        "description": "每轮给Bot的记忆总字数上限。默认24000；调大记得更多，但对话输入费用可能增加。",
         "minimum": 2000,
         "maximum": 500000
       },
@@ -121,6 +139,7 @@
         "type": "integer",
         "name": "估算 Token 警告线",
         "default": 120000,
+        "description": "聊天历史估算达到多少Token时在日志提醒。只提醒，不删除或截断聊天。",
         "minimum": 1000,
         "maximum": 2000000
       },
@@ -133,12 +152,14 @@
           "上次",
           "曾经"
         ],
+        "description": "看到这些词时提醒Bot查往事，每行一个。例如：记得、上次。不会强制发送消息。",
         "item_type": "string"
       },
       "recall_scope": {
         "type": "string",
-        "name": "机器人可访问范围",
-        "default": "session",
+        "name": "Bot可访问范围",
+        "default": "global",
+        "description": "全局：可跨群、跨私聊、跨用户回忆；同参与者：关联当前用户；当前会话：限制在此处。全局仍按话题筛选并标注来源。已有设置保留，想统一记忆请选择全局。",
         "options": [
           "session",
           "linked",
@@ -149,18 +170,21 @@
         "type": "integer",
         "name": "感知事实批量（×10）",
         "default": 5,
+        "description": "每轮最多自动找回几条相关跨会话存档。默认5；本地事实最多读取这个数的10倍，再受总字数限制。",
         "minimum": 1,
         "maximum": 30
       },
       "proactive_enabled": {
         "type": "switch",
         "name": "定时主动感知",
-        "default": false
+        "default": false,
+        "description": "按间隔唤起Bot思考是否有适合跟进的事。只有填了目标会话才生效，Bot可选择保持安静。"
       },
       "proactive_interval": {
         "type": "integer",
         "name": "主动感知间隔（秒）",
         "default": 3600,
+        "description": "主动思考的最短周期。3600秒=1小时；不代表每小时一定发消息。",
         "minimum": 60,
         "maximum": 604800
       },
@@ -168,29 +192,42 @@
         "type": "list",
         "name": "主动感知会话",
         "default": [],
+        "description": "每行一个完整会话ID。示例 qq:gm:123456（群聊）或 qq:dm:654321（私聊）；qq必须是你的适配器实例名，可从后台任务的会话列表复制。留空不会主动思考。",
         "item_type": "string"
       },
       "compress_instruction": {
         "type": "string",
         "name": "压缩补充要求",
-        "default": "以自身视角保留事件、感情、人物、关键事实和生活轨迹。精简但不要按珍贵程度丢弃线索；只依据输入，保留时间、否定、条件和不确定性。"
+        "default": "以自身视角保留事件、感情、人物、关键事实和生活轨迹。精简但不要按珍贵程度丢弃线索；只依据输入，保留时间、否定、条件和不确定性。",
+        "description": "补充你希望保留的内容。例如：保留约定的日期和参与者。无需再要求JSON，程序会严格检查格式。"
       },
       "auto_migrate": {
         "type": "switch",
         "name": "自动安全迁移旧记忆",
-        "default": true
+        "default": true,
+        "description": "自动只读接续默认记忆和KiraOS，重复检查会去重。原文件保留，随时能切回旧插件。"
       },
       "mutual_exclusion": {
         "type": "switch",
         "name": "迁移成功后互斥旧插件",
-        "default": true
+        "default": true,
+        "description": "迁移成功后停用旧记忆插件，避免重复注入；重新启用旧插件时本插件让位。会停用整个KiraOS。"
       },
       "migration_max_chars": {
         "type": "integer",
         "name": "KiraOS 迁移字符上限",
         "default": 120,
+        "description": "KiraOS旧内容超过这个字符数就整条跳过，不截断。默认120；调整后可重新检查迁移。",
         "minimum": 1,
         "maximum": 16000
+      },
+      "compress_input_chars": {
+        "type": "integer",
+        "name": "每批压缩输入预算（字符）",
+        "default": 48000,
+        "description": "一次压缩的输入软上限。默认48000；大批记录会自动拆小，最少保留2条完整记录，单条特别长时可超过此值。不会截掉原文。",
+        "minimum": 4000,
+        "maximum": 500000
       }
     }
   }

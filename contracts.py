@@ -23,6 +23,29 @@ Category = Literal[
 ]
 
 
+def relation_issue(relation):
+    """A speech act alone does not establish a relationship between two entities."""
+    if relation["predicate"].strip().casefold() in {
+        "认为",
+        "觉得",
+        "说",
+        "提到",
+        "表示",
+        "评价",
+        "是",
+        "相关",
+        "关系",
+        "thinks",
+        "says",
+        "is",
+        "mentions",
+    }:
+        return "谓词没有表达具体关系；请按原文补全，无法确定时删除这条连线"
+    if relation["subject"] == relation["object"]:
+        return "关系两端相同，需核对身份"
+    return ""
+
+
 class Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
@@ -31,6 +54,12 @@ class Relation(Strict):
     subject: Short
     predicate: Short
     object: Short
+
+    @model_validator(mode="after")
+    def meaningful(self):
+        if issue := relation_issue(self.model_dump()):
+            raise ValueError(issue)
+        return self
 
 
 class Fact(Strict):
@@ -55,6 +84,7 @@ class AuditAction(Strict):
     source_ids: list[Short] = Field(min_length=1, max_length=100)
     content: Text
     reason: Short
+    relations: list[Relation] | None = Field(default=None, max_length=20)
 
 
 class Audit(Strict):
@@ -82,7 +112,7 @@ class Settings(Strict):
     context_chars: int = Field(default=24000, ge=2000, le=500000)
     token_warning: int = Field(default=120000, ge=1000, le=2000000)
     recall_keywords: list[Short] = ["记得", "之前", "上次", "曾经"]
-    recall_scope: Literal["session", "linked", "global"] = "session"
+    recall_scope: Literal["session", "linked", "global"] = "global"
     top_k: int = Field(default=5, ge=1, le=30)
     proactive_enabled: bool = False
     proactive_interval: int = Field(default=3600, ge=60, le=604800)
@@ -94,6 +124,7 @@ class Settings(Strict):
     auto_migrate: bool = True
     mutual_exclusion: bool = True
     migration_max_chars: int = Field(default=120, ge=1, le=16000)
+    compress_input_chars: int = Field(default=48000, ge=4000, le=500000)
 
     @model_validator(mode="after")
     def valid_batch(self):
@@ -187,3 +218,20 @@ class Job(Strict):
 class ConfigEdit(Strict):
     revision: Short
     settings: Settings
+
+
+class NameEdit(Strict):
+    entity_id: Short
+    name: Short
+    revision: int = Field(ge=1)
+    reason: Short
+
+    @model_validator(mode="after")
+    def valid_name(self):
+        if any(ord(c) < 32 for c in self.name):
+            raise ValueError("invalid name")
+        return self
+
+
+class EntityRefresh(Strict):
+    entity_id: Short

@@ -11,6 +11,11 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 schema = module.Settings.model_json_schema()
+help_spec = importlib.util.spec_from_file_location(
+    "setting_help", root / "setting_help.py"
+)
+help_module = importlib.util.module_from_spec(help_spec)
+help_spec.loader.exec_module(help_module)
 names = dict(
     zip(
         module.Settings.model_fields,
@@ -30,12 +35,12 @@ names = dict(
             "审计间隔（秒）",
             "每批审计事实数",
             "模型超时（秒）",
-            "格式错误重试次数",
+            "模型失败重试次数",
             "后台并发数",
             "上下文字符预算",
             "估算 Token 警告线",
             "回忆提示词",
-            "机器人可访问范围",
+            "Bot可访问范围",
             "感知事实批量（×10）",
             "定时主动感知",
             "主动感知间隔（秒）",
@@ -44,6 +49,7 @@ names = dict(
             "自动安全迁移旧记忆",
             "迁移成功后互斥旧插件",
             "KiraOS 迁移字符上限",
+            "每批压缩输入预算（字符）",
         ],
     )
 )
@@ -60,6 +66,7 @@ for key, p in schema["properties"].items():
         "type": kind,
         "name": names[key],
         "default": module.Settings().model_dump()[key],
+        "description": help_module.HELP[key],
     }
     for constraint in ("minimum", "maximum"):
         if constraint in p:

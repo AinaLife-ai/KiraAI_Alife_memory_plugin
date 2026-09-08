@@ -8,13 +8,12 @@ import asyncio
 import hashlib
 import json
 import math
-import re
 import sqlite3
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from pathlib import Path
-from .contracts import dump
+from .contracts import dump, relation_issue
 
 
 class Conflict(ValueError):
@@ -60,6 +59,15 @@ class Store:
 
     def initialize(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            with closing(sqlite3.connect(self.path)) as source:
+                if source.execute("PRAGMA user_version").fetchone()[0] < 3:
+                    backup = self.path.with_name(self.path.stem + ".pre-v3.sqlite3")
+                    if not backup.exists():
+                        temporary = backup.with_suffix(".tmp")
+                        with closing(sqlite3.connect(temporary)) as target:
+                            source.backup(target)
+                        temporary.replace(backup)
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
@@ -101,6 +109,14 @@ class Store:
               PRIMARY KEY(source,source_key,digest));
             CREATE TABLE IF NOT EXISTS migration_reports (source TEXT PRIMARY KEY, report TEXT NOT NULL);
             INSERT OR IGNORE INTO meta VALUES ('revision',0);
+            CREATE TABLE IF NOT EXISTS entities (
+              id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+              revision INTEGER NOT NULL DEFAULT 1, updated REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS entity_names (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, entity_id TEXT NOT NULL REFERENCES entities(id),
+              name TEXT NOT NULL, source TEXT NOT NULL, context TEXT NOT NULL,
+              observed REAL NOT NULL, reason TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS name_entity ON entity_names(entity_id,observed DESC);
             """)
             if "visibility" not in {
                 r[1] for r in db.execute("PRAGMA table_info(records)")
@@ -110,6 +126,13 @@ class Store:
                 )
             db.execute(
                 "UPDATE jobs SET state='queued',detail='resumed after restart' WHERE state='running'"
+            )
+            db.execute("PRAGMA user_version=3")
+            db.execute(
+                "INSERT OR IGNORE INTO entities(id,kind,name,updated) SELECT DISTINCT value,'user','',0 FROM records,json_each(records.users)"
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO entities(id,kind,name,updated) SELECT DISTINCT sid,'session','',0 FROM records"
             )
 
     @staticmethod
@@ -124,11 +147,126 @@ class Store:
         for key in ("users", "tags", "relations", "sources"):
             if key in result:
                 result[key] = json.loads(result[key])
+        if "relations" in result:
+            result["relation_warnings"] = [
+                {"relation": r, "reason": relation_issue(r)}
+                for r in result["relations"]
+                if relation_issue(r)
+            ]
+            result["verified_relations"] = [
+                r for r in result["relations"] if not relation_issue(r)
+            ]
         return result
+
+    def observe_name(
+        self,
+        entity_id,
+        name,
+        kind="user",
+        source="adapter",
+        context="",
+        observed=None,
+        revision=None,
+        reason="",
+    ):
+        name = str(name or "").strip()
+        if not name or len(name) > 500 or any(ord(c) < 32 for c in name):
+            return False
+        observed = time.time() if observed is None else observed
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            old = db.execute(
+                "SELECT * FROM entities WHERE id=?", (entity_id,)
+            ).fetchone()
+            if revision is not None and (not old or old["revision"] != revision):
+                raise Conflict("name changed")
+            if old and old["name"] == name:
+                if observed > old["updated"]:
+                    db.execute(
+                        "UPDATE entities SET updated=? WHERE id=?",
+                        (observed, entity_id),
+                    )
+                return False
+            if old and observed < old["updated"]:
+                return False
+            db.execute(
+                """INSERT INTO entities(id,kind,name,updated) VALUES (?,?,?,?)
+              ON CONFLICT(id) DO UPDATE SET name=excluded.name,revision=entities.revision+1,updated=excluded.updated""",
+                (entity_id, kind, name, observed),
+            )
+            db.execute(
+                "INSERT INTO entity_names(entity_id,name,source,context,observed,reason) VALUES (?,?,?,?,?,?)",
+                (entity_id, name, source, context, observed, reason),
+            )
+            self.bump(db)
+            return True
+
+    def entities(self, query="", ids=None, limit=100, offset=0):
+        clauses, args = [], []
+        if ids is not None:
+            clauses.append("e.id IN (SELECT value FROM json_each(?))")
+            args.append(dump(list(ids)))
+        if query:
+            clauses.append(
+                "(instr(lower(e.id),lower(?))>0 OR EXISTS (SELECT 1 FROM entity_names n WHERE n.entity_id=e.id AND instr(lower(n.name),lower(?))>0))"
+            )
+            args.extend([query, query])
+        with self.connect() as db:
+            rows = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT e.* FROM entities e"
+                    + (" WHERE " + " AND ".join(clauses) if clauses else "")
+                    + " ORDER BY e.updated DESC,e.id LIMIT ? OFFSET ?",
+                    [*args, limit, offset],
+                )
+            ]
+            for r in rows:
+                r["history"] = [
+                    dict(n)
+                    for n in db.execute(
+                        "SELECT name,source,context,observed,reason FROM entity_names WHERE entity_id=? ORDER BY observed DESC,id DESC LIMIT 50",
+                        (r["id"],),
+                    )
+                ]
+            return rows
+
+    def entity_ids(self, sid, users=(), scope="session"):
+        # Resolve identities from the same scope predicate, independently of pagination.
+        with self.connect() as db:
+            if scope == "global":
+                return [r[0] for r in db.execute("SELECT id FROM entities")]
+            rows = [
+                self.row(r)
+                for r in db.execute(
+                    """SELECT sid,users FROM records WHERE deleted=0
+              AND (sid=? OR visibility='global' OR ((visibility='user' OR ?='linked') AND EXISTS
+                (SELECT 1 FROM json_each(records.users) WHERE value IN (SELECT value FROM json_each(?)))))""",
+                    (sid, scope, dump(list(users))),
+                )
+            ]
+            ids = {sid, *users}
+            for row in rows:
+                ids.update(row["users"])
+                ids.add(row["sid"])
+            return sorted(ids)
+
+    def can_schedule(self, kind, sid):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT state,updated FROM jobs WHERE kind=? AND sid=? ORDER BY created DESC LIMIT 1",
+                (kind, sid),
+            ).fetchone()
+            return (
+                not row
+                or row["state"] != "failed"
+                or time.time() - row["updated"] >= 300
+            )
 
     def capture(self, sid, event_key, messages):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._ensure_entities(db, sid, {u for m in messages for u in m["users"]})
             pos = db.execute(
                 "SELECT coalesce(max(position),0) FROM records WHERE sid=?", (sid,)
             ).fetchone()[0]
@@ -154,6 +292,17 @@ class Store:
                 )
             self.bump(db)
 
+    @staticmethod
+    def _ensure_entities(db, sid, users):
+        db.execute(
+            "INSERT OR IGNORE INTO entities(id,kind,name,updated) VALUES (?,'session','',0)",
+            (sid,),
+        )
+        db.executemany(
+            "INSERT OR IGNORE INTO entities(id,kind,name,updated) VALUES (?,'user','',0)",
+            [(u,) for u in users],
+        )
+
     def active(self, sid):
         with self.connect() as db:
             return [
@@ -165,16 +314,16 @@ class Store:
                 )
             ]
 
-    def context(self, sid, users=()):
+    def context(self, sid, users=(), scope="session"):
         with self.connect() as db:
             return [
                 self.row(r)
                 for r in db.execute(
                     """SELECT * FROM records WHERE active=1 AND deleted=0 AND
-                (sid=? OR visibility='global' OR (visibility='user' AND EXISTS
+                (sid=? OR visibility='global' OR (?='global' AND permanent=1) OR ((visibility='user' OR ?='linked') AND EXISTS
                   (SELECT 1 FROM json_each(records.users) WHERE value IN (SELECT value FROM json_each(?)))))
                 ORDER BY permanent DESC,level DESC,position,id""",
-                    (sid, dump(list(users))),
+                    (sid, scope, scope, dump(list(users))),
                 )
             ]
 
@@ -374,6 +523,7 @@ class Store:
     def memorize(self, sid, content, users, start, end):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._ensure_entities(db, sid, users)
             record_id = f"100-{int(start * 1000)}-{int(end * 1000)}-{uid()[:12]}"
             db.execute(
                 """INSERT INTO records(id,sid,role,level,start,end,summary,content,users,permanent,position,created)
@@ -434,6 +584,27 @@ class Store:
                 db.execute("UPDATE facts SET fingerprint=? WHERE id=?", (uid(), target))
             else:
                 db.execute("DELETE FROM vectors WHERE id=?", (target,))
+                if patch.get("deleted"):
+                    # Derived facts with no remaining live evidence must not be recalled.
+                    for fact in db.execute(
+                        """SELECT * FROM facts WHERE deleted=0
+                      AND EXISTS(SELECT 1 FROM json_each(facts.sources) WHERE value=?)
+                      AND NOT EXISTS(SELECT 1 FROM records,json_each(facts.sources) src WHERE records.id=src.value AND records.deleted=0)""",
+                        (target,),
+                    ).fetchall():
+                        db.execute(
+                            "INSERT INTO versions(kind,target,snapshot,reason,created) VALUES ('fact',?,?,?,?)",
+                            (
+                                fact["id"],
+                                dump(dict(fact)),
+                                "source deleted",
+                                time.time(),
+                            ),
+                        )
+                        db.execute(
+                            "UPDATE facts SET deleted=1,revision=revision+1 WHERE id=?",
+                            (fact["id"],),
+                        )
             self.bump(db)
 
     def search(
@@ -452,8 +623,12 @@ class Store:
         vector=None,
         model="",
         lexical="",
+        exclude_sid="",
     ):
         clauses, args = ["deleted=0"], []
+        if exclude_sid:
+            clauses.append("sid<>?")
+            args.append(exclude_sid)
         if scope == "session":
             clauses.append(
                 "(sid=? OR visibility='global' OR (visibility='user' AND EXISTS (SELECT 1 FROM json_each(records.users) WHERE value IN (SELECT value FROM json_each(?)))) )"
@@ -465,8 +640,10 @@ class Store:
             )
             args.extend([sid, dump(list(users))])
         if keyword:
-            clauses.append("instr(lower(summary),lower(?))>0")
-            args.append(keyword)
+            clauses.append("""(instr(lower(summary),lower(?))>0 OR EXISTS
+              (SELECT 1 FROM entity_names n WHERE instr(lower(n.name),lower(?))>0
+              AND (n.entity_id=records.sid OR n.entity_id IN (SELECT value FROM json_each(records.users)))))""")
+            args.extend([keyword, keyword])
         if level is not None:
             clauses.append("level=?")
             args.append(level)
@@ -485,21 +662,12 @@ class Store:
             args.append(subject)
         with self.connect() as db:
             if lexical and not vector:
-                # Local lexical ranking: words plus Chinese bigrams, no provider.
-                chunks = re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", lexical.lower())
-                tokens = {
-                    t
-                    for c in chunks
-                    for t in (
-                        [c]
-                        if not re.match(r"[\u3400-\u9fff]", c) or len(c) < 2
-                        else [c[i : i + 2] for i in range(len(c) - 1)]
-                    )
-                }
+                from .retrieval import relevance
+
                 db.create_function(
                     "lexical_score",
                     1,
-                    lambda text: sum(t in text.lower() for t in tokens),
+                    lambda text: relevance(lexical, text),
                 )
                 clauses.append("lexical_score(summary)>0")
             where = " AND ".join(clauses)
@@ -548,6 +716,7 @@ class Store:
         global_scope=False,
         users=(),
         include_shared=False,
+        lexical="",
     ):
         where, args = ["deleted=0"], []
         if not global_scope:
@@ -564,12 +733,23 @@ class Store:
                 where.append(key + "=?")
                 args.append(value)
         with self.connect() as db:
+            if lexical:
+                from .retrieval import relevance
+
+                db.create_function(
+                    "fact_score", 1, lambda text: relevance(lexical, text)
+                )
+                where.append("fact_score(content)>0")
             return [
                 self.row(r)
                 for r in db.execute(
                     "SELECT * FROM facts WHERE "
                     + " AND ".join(where)
-                    + " ORDER BY audited,id LIMIT ? OFFSET ?",
+                    + (
+                        " ORDER BY fact_score(content) DESC,audited,id LIMIT ? OFFSET ?"
+                        if lexical
+                        else " ORDER BY audited,id LIMIT ? OFFSET ?"
+                    ),
                     [*args, limit, offset],
                 )
             ]
@@ -644,6 +824,8 @@ class Store:
                 relations = {
                     dump(rel): rel for k in group for rel in by_id[k]["relations"]
                 }
+                if a.get("relations") is not None:
+                    relations = {dump(rel): rel for rel in a["relations"]}
                 tags = sorted({tag for k in group for tag in by_id[k]["tags"]})
                 db.execute(
                     "UPDATE facts SET content=?,sources=?,relations=?,tags=?,fingerprint=?,revision=revision+1 WHERE id=?",
@@ -755,5 +937,7 @@ class Store:
                     "versions",
                     "migration_items",
                     "migration_reports",
+                    "entities",
+                    "entity_names",
                 )
             }
