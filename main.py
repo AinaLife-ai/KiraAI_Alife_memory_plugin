@@ -487,7 +487,7 @@ class AlifeMemoryPlugin(BasePlugin):
             await self.store.call(
                 "observe_name", **edit.model_dump(), source="bot", context=event.sid
             )
-            return dump({"ok": True})
+            return self.recall_result(event, {"ok": True})
         except ValueError:
             return dump({"ok": False, "error": "invalid_or_conflicting_name"})
 
@@ -511,13 +511,14 @@ class AlifeMemoryPlugin(BasePlugin):
                 and not await self.store.call("entities", ids=[entity_id])
             ):
                 raise ValueError("not accessible")
-            return dump(
+            return self.recall_result(
+                event,
                 {
                     "ok": True,
                     "entity": await self.refresh_name(
                         entity_id, event.session.adapter_name
                     ),
-                }
+                },
             )
         except (ValueError, TimeoutError):
             return dump({"ok": False, "error": "name_lookup_unavailable"})
@@ -1056,7 +1057,7 @@ class AlifeMemoryPlugin(BasePlugin):
             "memorize", value.sid, value.content, value.users, now, now
         )
         await self.engine.enqueue("classify", record_id)
-        return dump({"ok": True, "id": record_id})
+        return self.recall_result(event, {"ok": True, "id": record_id})
 
     @register.tool(
         name="Forget",
@@ -1079,7 +1080,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 {"active": False},
                 "agent forgot permanent memory",
             )
-            return dump({"ok": True, "archive_preserved": True})
+            return self.recall_result(event, {"ok": True, "archive_preserved": True})
         except ValueError:
             return dump({"ok": False, "error": "not_accessible_or_not_permanent"})
 
@@ -1152,7 +1153,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 reason=reason,
             )
             await self.store.call("edit", **edit.model_dump())
-            return dump({"ok": True})
+            return self.recall_result(event, {"ok": True})
         except ValueError:
             return dump({"ok": False, "error": "invalid_or_conflicting_edit"})
 
