@@ -442,7 +442,7 @@ async function loadFacts() {
     ? shownFacts
         .map(
           (f, i) =>
-            `<article class="card"><div class="row"><span class="tag">${esc(labels[f.category])}</span><strong>${esc(displayLabel(f.subject))}</strong></div><p>${esc(f.content)}</p><small>${esc(f.tags.join(" · "))}</small>${f.relation_warnings?.length ? '<div class="notice">待审校：' + esc(f.relation_warnings.map((w) => w.reason).join("；")) + "。该连线未用于关系召回。</div>" : ""}<footer><small>${f.sources.length} 个来源</small><button data-fact="${i}">编辑事实</button></footer></article>`,
+            `<article class="card"><div class="row"><span class="tag">${esc(labels[f.category])}</span><strong>${esc(displayLabel(f.subject))}</strong></div><p>${esc(f.content)}</p><small>${esc(f.tags.join(" · "))}</small>${f.relation_warnings?.length ? '<div class="notice">待审校：' + esc(f.relation_warnings.map((w) => w.reason).join("；")) + "。该连线未用于关系召回。</div>" : ""}<p class="muted">${esc(f.reason ? "事实依据：" + f.reason : "")}${esc(f.scenario ? " · 场景：" + f.scenario : "")}</p>${f.edit_history?.length ? '<p class="muted">最近审校：' + esc(f.edit_history[0].reason) + " · " + date(f.edit_history[0].created) + "</p>" : ""}<footer><small>${f.sources.length} 个来源</small><button data-fact="${i}">编辑事实</button></footer></article>`,
         )
         .join("")
     : empty("画像还在形成");
@@ -569,7 +569,13 @@ function openFact(row) {
     '<small class="wide">关系示例：[{"subject":"qq:123","predicate":"朋友","object":"qq:456"}]。只填有证据的完整关系；无法确认时填 []。不要用“认为”代替关系。</small>',
   );
   $("#sources").classList.remove("hide");
-  $("#sourceText").textContent = "支持来源：" + row.sources.join("\n");
+  $("#sourceText").textContent =
+    "支持来源：" +
+    row.sources.join("\n") +
+    "\n\n最近修改 / 模型审校：\n" +
+    (row.edit_history || [])
+      .map((h) => date(h.created) + " · " + h.reason)
+      .join("\n");
   $("#sourceLinks").innerHTML = row.sources
     .map(
       (id) =>
@@ -977,8 +983,20 @@ let shownFacts = [],
   nameOffset = 0,
   selectedName = null;
 const displayNames = {};
-const displayLabel = (id) =>
-  displayNames[id] ? displayNames[id] + " · " + id : id;
+const legacyLabel = (id) =>
+  id === "legacy:global"
+    ? "旧插件·全局记忆"
+    : id === "legacy:unscoped"
+      ? "旧插件·来源会话未确定"
+      : id.startsWith("legacy:user:")
+        ? "旧插件·人物档案"
+        : id.startsWith("legacy:")
+          ? "旧插件·历史实体"
+          : "";
+const displayLabel = (id) => {
+  const name = displayNames[id] || legacyLabel(id);
+  return name ? name + " · " + id : id;
+};
 function renderGraph() {
   drawMemoryGraph($("#relations"), shownFacts, graphMode, displayNames, (f) =>
     openFact(f),
@@ -1008,7 +1026,7 @@ async function loadNames() {
     ? rows
         .map(
           (n, i) =>
-            `<article class="card"><span class="tag">${n.kind === "user" ? "人物" : "会话 / 群"}</span><h3>${esc(n.name || "名称待补全")}</h3><small>${esc(n.id)}</small><p class="muted">曾用名：${esc([...new Set(n.history.map((h) => h.name))].filter((x) => x !== n.name).join("、") || "暂无")}</p><footer><small>${n.updated ? date(n.updated) : "等待新消息或手动更新"}</small><button data-name="${i}">查看与审校</button></footer></article>`,
+            `<article class="card"><span class="tag">${n.id.startsWith("legacy:") ? "旧插件迁移" : n.kind === "user" ? "人物" : "会话 / 群"}</span><h3>${esc(n.name || n.label || "名称待补全")}</h3><small>${esc(n.id)}</small><p class="muted">${esc(n.identity_note || "")}</p><p class="muted">曾用名：${esc([...new Set(n.history.map((h) => h.name))].filter((x) => x !== n.name).join("、") || "暂无")}</p><p class="muted">最近审校依据：${esc(n.history.find((h) => h.reason)?.reason || "尚无人工审校记录")}</p><footer><small>${n.updated ? date(n.updated) : "等待新消息或手动更新"}</small><button data-name="${i}">查看与审校</button></footer></article>`,
         )
         .join("")
     : empty("未找到名称");
@@ -1022,7 +1040,11 @@ async function loadNames() {
 function openName(n) {
   $$(".dialog-error").forEach((e) => e.remove());
   selectedName = n;
-  $("#nameIdentity").textContent = n.id;
+  $("#nameIdentity").textContent = n.id + " · " + (n.identity_note || "");
+  $("#lookupName").disabled = !n.lookup_id;
+  $("#lookupName").title = n.lookup_id
+    ? "按稳定账号查询平台名称"
+    : "迁移归档区没有可确认的平台账号，请手动补充称呼";
   $("#nameValue").value = n.name;
   $("#nameReason").value = "";
   $("#nameHistory").innerHTML =
@@ -1073,11 +1095,15 @@ $("#lookupName").onclick = () =>
     const b = $("#lookupName");
     b.disabled = true;
     try {
-      openName(await api("/names/refresh", { entity_id: selectedName.id }));
+      openName(
+        await api("/names/refresh", {
+          entity_id: selectedName.lookup_id || selectedName.id,
+        }),
+      );
       await loadNames();
       toast("已从聊天平台更新");
     } finally {
-      b.disabled = false;
+      b.disabled = !selectedName.lookup_id;
     }
   });
 guard(boot);

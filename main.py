@@ -35,7 +35,7 @@ from .contracts import (
 from .engine import Engine, compression_plan
 from .storage import Conflict, Store
 from .migration import SOURCES
-from .retrieval import safe_facts
+from .retrieval import safe_facts, archive_view, RecallWindow, asks_for_more
 from .setting_help import HELP
 
 PLUGIN_ID = "alife_memory_z"
@@ -48,6 +48,7 @@ MEMORY_RULES = (
     "跨会话记忆必须核对来源会话、用户ID和时间，别人的经历不等于当前用户的经历。"
     "MemoryNames 可按现名或曾用名查稳定ID，CorrectMemoryName 有证据时更新称呼；同名不代表同一人。"
     "needs_review 的关系只是待核对的历史描述，不可作为确定关系。"
+    "历史摘要不是本轮回答模板，结合近期已说过的话去重；用户追问还有别的时用SearchMemoryArchive(next_batch=true)找新证据，没找到就坦诚说明，不反复复述或编造。ReadMemoryArchive默认对子ID分页；按next_child_offset续读，必要时include_content=true读取完整归档正文。"
 )
 
 
@@ -90,6 +91,8 @@ class AlifeMemoryPlugin(BasePlugin):
         self.migration_blocked = False
         self.migration_note = ""
         self.name_refresh_lock = asyncio.Lock()
+        self.recall_window = RecallWindow()
+        self._recall_outputs = {}
 
     def conflicts(self):
         pm = getattr(self.ctx, "plugin_mgr", None)
@@ -310,17 +313,20 @@ class AlifeMemoryPlugin(BasePlugin):
     )
     async def memory_names(self, event, query="", offset=0):
         if not self.runtime_settings().enabled or type(offset) is not int or offset < 0:
-            return dump({"ok": False, "error": "memory_paused_or_invalid_offset"})
+            return self.recall_result(
+                event, {"ok": False, "error": "memory_paused_or_invalid_offset"}
+            )
         ids = await self.store.call(
             "entity_ids", event.sid, user_ids(event), self.settings.recall_scope
         )
-        return dump(
+        return self.recall_result(
+            event,
             {
                 "ok": True,
                 "entities": await self.store.call(
                     "entities", query, ids=ids, offset=offset
                 ),
-            }
+            },
         )
 
     @register.tool(
@@ -402,9 +408,22 @@ class AlifeMemoryPlugin(BasePlugin):
             return
         users = user_ids(event)
         query = " ".join(text_of(m) for m in event.messages)
+        recall_key = (sid, tuple(users), cfg.recall_scope)
+        previous = self.recall_window.get(recall_key)
+        plain = " ".join(
+            getattr(part, "text", "") for m in event.messages for part in m.chain
+        ).strip()
+        continuation = asks_for_more(plain) and bool(previous["query"])
+        if continuation:
+            query = previous["query"]
         rows = await self.store.call("context", sid, users, scope=cfg.recall_scope)
         facts = await self.store.call(
-            "facts", sid, limit=cfg.top_k * 10, users=users, include_shared=True
+            "facts",
+            sid,
+            limit=cfg.top_k * 10,
+            users=users,
+            include_shared=True,
+            exclude_ids=previous["facts"] if continuation else (),
         )
         related = []
         if cfg.recall_scope != "session" and query.strip():
@@ -415,7 +434,8 @@ class AlifeMemoryPlugin(BasePlugin):
                 scope=cfg.recall_scope,
                 users=users,
                 limit=cfg.top_k * 2,
-                exclude_sid=sid,
+                exclude_sid="" if continuation else sid,
+                exclude_ids=previous["ids"] if continuation else (),
             )
             local_ids = {r["id"] for r in rows}
             related = [
@@ -424,7 +444,7 @@ class AlifeMemoryPlugin(BasePlugin):
                     for k in ("id", "sid", "users", "summary", "start", "end", "level")
                 }
                 for r in matches["items"]
-                if r["id"] not in local_ids
+                if continuation or r["id"] not in local_ids
             ][: cfg.top_k]
             extra = await self.store.call(
                 "facts",
@@ -434,6 +454,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 include_shared=True,
                 lexical=query,
                 limit=cfg.top_k,
+                exclude_ids=previous["facts"] if continuation else (),
             )
             facts = list({f["id"]: f for f in [*extra, *facts]}.values())
         while len(dump(related)) > cfg.context_chars // 4 and related:
@@ -487,6 +508,8 @@ class AlifeMemoryPlugin(BasePlugin):
         # Never rewrite host history or put changing memory in the system prefix.
         perception = {
             "scope": cfg.recall_scope,
+            "recall_continuation": continuation,
+            "new_related_count": len(related),
             "session": sid,
             "participants": users,
             "self": getattr(event, "self_id", ""),
@@ -523,6 +546,16 @@ class AlifeMemoryPlugin(BasePlugin):
             while len(content) > cfg.context_chars and perception[key]:
                 perception[key].pop()
                 content = dump(perception)
+        perception["new_related_count"] = len(perception["related_archives"])
+        content = dump(perception)
+        self.recall_window.remember(
+            recall_key,
+            query,
+            [r["archive"] for r in perception["archives"]]
+            + [r["id"] for r in perception["related_archives"]],
+            [f["id"] for f in perception["facts"]],
+            continuation=continuation,
+        )
         req.user_prompt.insert(
             0,
             Prompt(
@@ -587,12 +620,32 @@ class AlifeMemoryPlugin(BasePlugin):
             if compression_plan(rows, self.settings):
                 await self.engine.enqueue("compress", sid, automatic=True)
 
+    def recall_result(self, event, value):
+        text = dump(value)
+        key = (
+            event.sid,
+            str(event.event_id),
+            hashlib.sha256(text.encode()).hexdigest(),
+        )
+        self._recall_outputs[key] = None
+        while len(self._recall_outputs) > 128:
+            self._recall_outputs.pop(next(iter(self._recall_outputs)))
+        return text
+
     @on.tool_result(priority=Priority.LOW)
     async def on_tool_result(self, event, result, *_):
         if not self.runtime_settings().enabled or not self.settings.capture_enabled:
             return
         content = await result.assemble_result()
         text = content if isinstance(content, str) else dump(content)
+        recalled = (
+            event.sid,
+            str(event.event_id),
+            hashlib.sha256(text.encode()).hexdigest(),
+        )
+        if recalled in self._recall_outputs:
+            del self._recall_outputs[recalled]
+            return
         key = str(event.event_id) + ":tool:" + hashlib.sha256(text.encode()).hexdigest()
         await self.store.call(
             "capture",
@@ -631,18 +684,49 @@ class AlifeMemoryPlugin(BasePlugin):
         description="读取 Alife 存档及子存档 ID，逐层恢复原始经历。",
         params={
             "type": "object",
-            "properties": {"id": {"type": "string"}},
+            "properties": {
+                "id": {"type": "string"},
+                "child_offset": {"type": "integer", "minimum": 0},
+                "child_count": {"type": "integer", "minimum": 1, "maximum": 50},
+                "include_content": {"type": "boolean"},
+            },
             "required": ["id"],
             "additionalProperties": False,
         },
     )
-    async def read_archive(self, event, id: str):
+    async def read_archive(
+        self, event, id: str, child_offset=0, child_count=20, include_content=False
+    ):
         try:
+            if (
+                type(child_offset) is not int
+                or child_offset < 0
+                or type(child_count) is not int
+                or not 1 <= child_count <= 50
+                or type(include_content) is not bool
+            ):
+                raise ValueError("invalid archive paging")
             row = await self.accessible(event, id)
+            recall_key = (event.sid, tuple(user_ids(event)), self.settings.recall_scope)
+            previous = self.recall_window.get(recall_key)
+            self.recall_window.remember(
+                recall_key, previous["query"], [id], continuation=True
+            )
             names = await self.store.call("entities", ids=[row["sid"], *row["users"]])
-            return dump({"ok": True, "archive": row, "names": names})
+            return self.recall_result(
+                event,
+                {
+                    "ok": True,
+                    "archive": archive_view(
+                        row, child_offset, child_count, include_content
+                    ),
+                    "names": names,
+                },
+            )
         except ValueError:
-            return dump({"ok": False, "error": "archive_not_accessible"})
+            return self.recall_result(
+                event, {"ok": False, "error": "archive_not_accessible"}
+            )
 
     @register.tool(
         name="SearchMemoryArchive",
@@ -650,6 +734,15 @@ class AlifeMemoryPlugin(BasePlugin):
         params={
             "type": "object",
             "properties": {
+                "exclude_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 200,
+                },
+                "next_batch": {
+                    "type": "boolean",
+                    "description": "继续上次主题并排除已返回记忆；不用重复同一页",
+                },
                 "keyword": {"type": "string"},
                 "prompt": {"type": "string"},
                 "level": {"type": "integer", "minimum": 0, "maximum": 100},
@@ -671,10 +764,39 @@ class AlifeMemoryPlugin(BasePlugin):
         count=5,
         start=None,
         end=None,
+        exclude_ids=None,
+        next_batch=False,
     ):
         if not self.runtime_settings().enabled:
-            return dump({"ok": False, "error": "memory_paused"})
+            return self.recall_result(event, {"ok": False, "error": "memory_paused"})
         try:
+            if type(next_batch) is not bool or (
+                exclude_ids is not None
+                and (
+                    not isinstance(exclude_ids, list)
+                    or len(exclude_ids) > 200
+                    or any(not isinstance(i, str) or len(i) > 500 for i in exclude_ids)
+                )
+            ):
+                raise ValueError("invalid continuation")
+            key = (event.sid, tuple(user_ids(event)), self.settings.recall_scope)
+            previous = self.recall_window.get(key)
+            if next_batch and not (keyword or prompt):
+                prompt = previous["query"]
+                if not prompt:
+                    return self.recall_result(
+                        event,
+                        {
+                            "ok": False,
+                            "error": "recall_topic_required",
+                            "hint": "请提供想继续回忆的主题",
+                        },
+                    )
+            excluded = list(
+                dict.fromkeys(
+                    [*(exclude_ids or []), *(previous["ids"] if next_batch else [])]
+                )
+            )
             q = Search(
                 sid=event.sid,
                 keyword=keyword,
@@ -696,12 +818,42 @@ class AlifeMemoryPlugin(BasePlugin):
                 vector=vector,
                 model=model,
                 lexical=q.prompt if not vector else "",
+                exclude_ids=excluded,
             )
-            for row in result["items"]:
-                row.pop("content", None)
-            return dump({"ok": True, **result})
+            result["items"] = [
+                {
+                    k: r[k]
+                    for k in (
+                        "id",
+                        "sid",
+                        "role",
+                        "level",
+                        "start",
+                        "end",
+                        "summary",
+                        "users",
+                        "revision",
+                        "permanent",
+                    )
+                }
+                for r in result["items"]
+            ]
+            self.recall_window.remember(
+                key,
+                prompt or keyword,
+                [r["id"] for r in result["items"]],
+                continuation=next_batch,
+            )
+            result["next_page"] = (
+                page + 1 if q.offset + len(result["items"]) < result["total"] else None
+            )
+            result["excluded_count"] = len(excluded)
+            result["hint"] = (
+                "继续找不同内容可用next_batch=true且page=1；没有新证据时请明确说明，不复述旧内容。"
+            )
+            return self.recall_result(event, {"ok": True, **result})
         except ValueError:
-            return dump({"ok": False, "error": "invalid_search"})
+            return self.recall_result(event, {"ok": False, "error": "invalid_search"})
 
     @register.tool(
         name="Memorize",
@@ -765,9 +917,9 @@ class AlifeMemoryPlugin(BasePlugin):
     )
     async def overview(self, event, subject="", offset=0):
         if not self.runtime_settings().enabled:
-            return dump({"ok": False, "error": "memory_paused"})
+            return self.recall_result(event, {"ok": False, "error": "memory_paused"})
         if type(offset) != int or offset < 0:
-            return dump({"ok": False, "error": "invalid_offset"})
+            return self.recall_result(event, {"ok": False, "error": "invalid_offset"})
         rows = await self.store.call(
             "facts",
             event.sid,
@@ -782,7 +934,8 @@ class AlifeMemoryPlugin(BasePlugin):
         known = await self.store.call(
             "known_users", event.sid, self.settings.recall_scope == "global"
         )
-        return dump(
+        return self.recall_result(
+            event,
             {
                 "ok": True,
                 "active_archives": len(context),
@@ -790,7 +943,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 "subjects": sorted({r["subject"] for r in rows}),
                 "facts": safe_facts(rows),
                 "next_offset": offset + len(rows),
-            }
+            },
         )
 
     @register.tool(
@@ -965,8 +1118,14 @@ class AlifeMemoryPlugin(BasePlugin):
             for n in await self.store.call("entities", ids=ids, limit=1000)
             if n["name"]
         }
+        history = await self.store.call("edit_history", "fact", [f["id"] for f in rows])
         return [
-            {**f, "display_name": names.get(f["subject"], ""), "names": names}
+            {
+                **f,
+                "display_name": names.get(f["subject"], ""),
+                "names": names,
+                "edit_history": history.get(f["id"], []),
+            }
             for f in rows
         ]
 

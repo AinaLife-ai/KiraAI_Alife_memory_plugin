@@ -45,6 +45,161 @@ def make_event():
     )
 
 
+@pytest.mark.asyncio
+async def test_followup_recall_returns_new_records_and_tools_continue(tmp_path):
+    import json
+
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False, "top_k": 2}}
+    )
+    await plugin.initialize()
+    try:
+        for i in range(8):
+            plugin.store.capture(
+                "test:gm:elsewhere",
+                str(i),
+                [
+                    dict(
+                        role="user",
+                        content=f"喜欢猫的不同经历{i}",
+                        users=["test:cheng"],
+                        time=float(i),
+                    )
+                ],
+            )
+        event = make_event()
+        req = LLMRequest()
+        await plugin.on_request(event, req)
+        first = json.loads(
+            next(p.content for p in req.user_prompt if p.name == "alife_memory")
+        )
+        first_ids = {r["id"] for r in first["related_archives"]}
+        event.messages[0].chain = MessageChain([Text("还有别的吗？")])
+        event.messages[0].message_str = "[小明] 还有别的吗？"
+        req2 = LLMRequest()
+        await plugin.on_request(event, req2)
+        second = json.loads(
+            next(p.content for p in req2.user_prompt if p.name == "alife_memory")
+        )
+        second_ids = {r["id"] for r in second["related_archives"]}
+        assert first_ids and second_ids and not first_ids & second_ids
+        assert second["recall_continuation"]
+        tool = json.loads(await plugin.search_archive(event, next_batch=True, count=2))
+        assert tool["ok"] and len(tool["items"]) == 2
+        assert not {r["id"] for r in tool["items"]} & (first_ids | second_ids)
+        assert req.system_prompt[0].content == req2.system_prompt[0].content
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_own_recall_result_is_not_captured_as_new_experience(tmp_path):
+    from core.agent.tool import ToolResult
+
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        event = make_event()
+        rid = plugin.store.memorize(event.sid, "值得保留的旧事", ["test:u"], 1.0, 1.0)
+        result = await plugin.read_archive(event, rid)
+        before = plugin.store.status()["records"]
+        await plugin.on_tool_result(event, ToolResult(result))
+        assert plugin.store.status()["records"] == before
+        await plugin.on_tool_result(event, ToolResult("外部工具发现的新事实"))
+        assert plugin.store.status()["records"] == before + 1
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_continuation_excludes_local_context_and_direct_reads(tmp_path):
+    import json
+
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        event = make_event()
+        local = plugin.store.memorize(
+            event.sid, "我喜欢猫的本地记忆", ["test:u"], 1.0, 1.0
+        )
+        request = LLMRequest()
+        await plugin.on_request(event, request)
+        result = json.loads(await plugin.search_archive(event, next_batch=True))
+        assert local not in {r["id"] for r in result["items"]}
+        other = plugin.store.memorize(
+            "test:gm:other", "我喜欢猫的别处记忆", ["test:v"], 2.0, 2.0
+        )
+        await plugin.read_archive(event, other)
+        result = json.loads(await plugin.search_archive(event, next_batch=True))
+        assert other not in {r["id"] for r in result["items"]}
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_followup_facts_excluded_before_limit(tmp_path):
+    import json
+
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False, "top_k": 2}}
+    )
+    await plugin.initialize()
+    try:
+        for i in range(4):
+            rid = plugin.store.memorize(
+                "test:gm:other", f"喜欢猫的证据{i}", ["test:v"], float(i), float(i)
+            )
+            with plugin.store.connect() as db:
+                plugin.store._add_fact(
+                    db,
+                    "test:gm:other",
+                    dict(
+                        category="fact",
+                        subject="test:v",
+                        content=f"喜欢猫的不同事实{i}",
+                        reason="",
+                        scenario="",
+                        tags=[],
+                        relations=[],
+                        source_ids=[rid],
+                    ),
+                )
+        event = make_event()
+        seen = []
+        for _ in range(3):
+            req = LLMRequest()
+            await plugin.on_request(event, req)
+            perception = json.loads(
+                next(p.content for p in req.user_prompt if p.name == "alife_memory")
+            )
+            seen.append({f["id"] for f in perception["facts"]})
+            event.messages[0].chain = MessageChain([Text("还有别的吗？")])
+            event.messages[0].message_str = "[小明] 还有别的吗？"
+        assert [len(x) for x in seen] == [2, 2, 0] and not seen[0] & seen[1]
+    finally:
+        await plugin.terminate()
+
+
 def test_host_schema_matches_every_validated_setting():
     import json
     from core.config.config_field import create_field_from_schema

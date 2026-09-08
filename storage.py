@@ -14,6 +14,8 @@ import uuid
 from contextlib import contextmanager, closing
 from pathlib import Path
 from .contracts import dump, relation_issue
+from .output_validation import validate_audit
+from .retrieval import identity_info
 
 
 class Conflict(ValueError):
@@ -134,6 +136,9 @@ class Store:
             db.execute(
                 "INSERT OR IGNORE INTO entities(id,kind,name,updated) SELECT DISTINCT sid,'session','',0 FROM records"
             )
+            db.execute(
+                "INSERT OR IGNORE INTO entities(id,kind,name,updated) SELECT DISTINCT subject,'user','',0 FROM facts WHERE subject LIKE 'legacy:%'"
+            )
 
     @staticmethod
     def bump(db):
@@ -180,7 +185,7 @@ class Store:
             ).fetchone()
             if revision is not None and (not old or old["revision"] != revision):
                 raise Conflict("name changed")
-            if old and old["name"] == name:
+            if old and old["name"] == name and revision is None:
                 if observed > old["updated"]:
                     db.execute(
                         "UPDATE entities SET updated=? WHERE id=?",
@@ -222,6 +227,7 @@ class Store:
                 )
             ]
             for r in rows:
+                r.update(identity_info(r["id"]))
                 r["history"] = [
                     dict(n)
                     for n in db.execute(
@@ -229,6 +235,13 @@ class Store:
                         (r["id"],),
                     )
                 ]
+                if not r["name"] and r["lookup_id"] and r["lookup_id"] != r["id"]:
+                    linked = db.execute(
+                        "SELECT name FROM entities WHERE id=?", (r["lookup_id"],)
+                    ).fetchone()
+                    if linked and linked[0]:
+                        r["label"] = linked[0] + " · 旧人物档案"
+                        r["name_source_id"] = r["lookup_id"]
             return rows
 
     def entity_ids(self, sid, users=(), scope="session"):
@@ -624,8 +637,12 @@ class Store:
         model="",
         lexical="",
         exclude_sid="",
+        exclude_ids=(),
     ):
         clauses, args = ["deleted=0"], []
+        if exclude_ids:
+            clauses.append("id NOT IN (SELECT value FROM json_each(?))")
+            args.append(dump(list(exclude_ids)))
         if exclude_sid:
             clauses.append("sid<>?")
             args.append(exclude_sid)
@@ -717,8 +734,12 @@ class Store:
         users=(),
         include_shared=False,
         lexical="",
+        exclude_ids=(),
     ):
         where, args = ["deleted=0"], []
+        if exclude_ids:
+            where.append("id NOT IN (SELECT value FROM json_each(?))")
+            args.append(dump(list(exclude_ids)))
         if not global_scope:
             if include_shared:
                 where.append("""(sid=? OR EXISTS (SELECT 1 FROM records,json_each(facts.sources) AS src WHERE records.id=src.value
@@ -754,6 +775,20 @@ class Store:
                 )
             ]
 
+    def edit_history(self, kind, targets):
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT target,reason,created FROM
+              (SELECT target,reason,created,id,row_number() OVER (PARTITION BY target ORDER BY id DESC) AS n
+               FROM versions WHERE kind=? AND target IN (SELECT value FROM json_each(?)))
+              WHERE n<=5 ORDER BY id DESC""",
+                (kind, dump(list(targets))),
+            )
+            result = {}
+            for row in rows:
+                result.setdefault(row["target"], []).append(dict(row))
+            return result
+
     def known_users(self, sid, global_scope=False):
         with self.connect() as db:
             where = "records.deleted=0" + ("" if global_scope else " AND records.sid=?")
@@ -783,26 +818,7 @@ class Store:
 
     def audit(self, candidates, output):
         by_id = {r["id"]: r for r in candidates}
-        touched = set()
-        for action in output["actions"]:
-            target = by_id.get(action["target_id"])
-            if not target or not set(action["source_ids"]) <= by_id.keys():
-                raise ValueError("unknown audit evidence")
-            if action["target_id"] in touched:
-                raise ValueError("overlapping audit actions")
-            group = {action["target_id"], *action["source_ids"]}
-            if action["action"] == "merge":
-                if len(group) < 2 or touched & group:
-                    raise ValueError("invalid merge")
-                if any(
-                    (by_id[k]["sid"], by_id[k]["subject"], by_id[k]["category"])
-                    != (target["sid"], target["subject"], target["category"])
-                    for k in group
-                ):
-                    raise ValueError("cross-scope or cross-category merge is forbidden")
-            touched.update(
-                group if action["action"] == "merge" else {action["target_id"]}
-            )
+        validate_audit(candidates, output)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             for old in candidates:
@@ -813,13 +829,13 @@ class Store:
                     raise Conflict("audit evidence changed")
             for a in output["actions"]:
                 old = by_id[a["target_id"]]
-                if a["action"] == "keep":
-                    continue
                 group = {a["target_id"], *a["source_ids"]}
                 db.execute(
                     "INSERT INTO versions(kind,target,snapshot,reason,created) VALUES ('fact',?,?,?,?)",
                     (old["id"], dump(old), a["reason"], time.time()),
                 )
+                if a["action"] == "keep":
+                    continue
                 sources = sorted({s for k in group for s in by_id[k]["sources"]})
                 relations = {
                     dump(rel): rel for k in group for rel in by_id[k]["relations"]
