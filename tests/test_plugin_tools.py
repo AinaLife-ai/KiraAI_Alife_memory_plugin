@@ -44,3 +44,25 @@ async def test_own_tool_output_is_not_stored(tmp_path):
     rows = store.export()["records"]
     assert len(rows) == before + 1
     assert rows[-1]["summary"].startswith("工具感知结果：")
+
+
+@pytest.mark.asyncio
+async def test_memorize_skips_duplicates_and_revives_forgotten(tmp_path):
+    import json
+
+    plugin, store = _plugin(tmp_path)
+    plugin.engine = _Engine()
+    event = _event()
+    first = json.loads(await plugin.memorize(event, "主人喜欢乌龙茶"))
+    assert first.get("existing") is not True
+    before = len(store.export()["records"])
+
+    again = json.loads(await plugin.memorize(event, "主人喜欢乌龙茶。"))
+    assert again == {"ok": True, "id": first["id"], "existing": True}
+    assert len(store.export()["records"]) == before
+
+    await plugin.forget(event, first["id"])
+    assert store.get(first["id"])["active"] == 0
+    revived = json.loads(await plugin.memorize(event, "主人喜欢乌龙茶"))
+    assert revived["existing"] is True
+    assert store.get(first["id"])["active"] == 1

@@ -1,5 +1,6 @@
 """Context hygiene: tool payloads never flood the injected memory block."""
 
+import asyncio
 import importlib
 import json
 import sys
@@ -12,6 +13,8 @@ package.__path__ = [str(ROOT)]
 sys.modules.setdefault("alife_hygiene_test", package)
 s = importlib.import_module("alife_hygiene_test.storage")
 r = importlib.import_module("alife_hygiene_test.retrieval")
+e = importlib.import_module("alife_hygiene_test.engine")
+c = importlib.import_module("alife_hygiene_test.contracts")
 
 PREFIX = r.TOOL_RESULT_PREFIX
 SID = "qq:gm:188395693"
@@ -167,6 +170,109 @@ def test_totals_and_top_users_respect_scope(tmp_path):
     assert session["sessions"] == 1 and session["groups"] == 1
     whole = store.totals(SID, ["qq:1"], "global")
     assert whole["records"] == 5 and whole["users"] == 3 and whole["sessions"] == 2
+
+
+def test_search_hides_archived_until_explicit(tmp_path):
+    store = s.Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    for i in range(4):
+        store.capture(
+            SID,
+            f"ev{i}",
+            [
+                {
+                    "role": "user",
+                    "content": f"绿岛酒吧 第{i}条经历",
+                    "time": float(i),
+                    "users": ["qq:1"],
+                }
+            ],
+        )
+    cfg = c.Settings(threshold=4, batch_size=2, model_retries=0)
+
+    async def model(*args):
+        return json.dumps(
+            {"summary": "两条经历的合并摘要：绿岛酒吧", "facts": []}, ensure_ascii=False
+        )
+
+    asyncio.run(e.Engine(store, lambda: cfg, model, None, None).compress(SID))
+    archived = [
+        row
+        for row in store.export()["records"]
+        if row["level"] == 0 and row["active"] == 0
+    ]
+    assert len(archived) == 2
+
+    live = store.search(keyword="绿岛酒吧", scope="global", limit=10, active=True)
+    assert live["total"] == 3 and all(item["active"] == 1 for item in live["items"])
+    everything = store.search(keyword="绿岛酒吧", scope="global", limit=10)
+    assert everything["total"] == 5
+
+
+def test_forget_cold_archives_and_id_read_still_works(tmp_path):
+    store = s.Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    record_id = store.memorize(SID, "主人喜欢乌龙茶", ["qq:1"], 1.0, 1.0)
+    row = store.get(record_id)
+    store.edit("record", record_id, row["revision"], {"active": False}, "forget")
+    cold = store.get(record_id)
+    assert cold["cold"] == 1 and cold["active"] == 0 and cold["archived_at"] > 0
+    # Cold archives never show up in search, even with archived included.
+    assert store.search(keyword="乌龙茶", scope="global")["total"] == 0
+    assert store.search(keyword="乌龙茶", scope="global", cold_after_days=0)["total"] == 0
+    assert store.get(record_id) is not None  # ...but reading by id still works
+    store.edit("record", record_id, cold["revision"], {"active": True}, "restore")
+    revived = store.get(record_id)
+    assert revived["cold"] == 0 and revived["archived_at"] == 0
+    assert store.search(keyword="乌龙茶", scope="global")["total"] == 1
+
+
+def test_archived_fades_to_cold_after_days(tmp_path):
+    store = s.Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    for i in range(4):
+        store.capture(
+            SID,
+            f"ev{i}",
+            [
+                {
+                    "role": "user",
+                    "content": f"绿岛酒吧 第{i}条经历",
+                    "time": float(i),
+                    "users": ["qq:1"],
+                }
+            ],
+        )
+    cfg = c.Settings(threshold=4, batch_size=2, model_retries=0)
+
+    async def model(*args):
+        return json.dumps({"summary": "绿岛酒吧 合并摘要", "facts": []}, ensure_ascii=False)
+
+    asyncio.run(e.Engine(store, lambda: cfg, model, None, None).compress(SID))
+    archived = [
+        row
+        for row in store.export()["records"]
+        if row["level"] == 0 and row["active"] == 0
+    ]
+    assert archived and all(row["cold"] == 0 for row in archived)
+    assert (
+        store.search(keyword="绿岛酒吧", scope="global", cold_after_days=180)["total"]
+        == 5
+    )
+    with store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            "UPDATE records SET archived_at=? WHERE id=?", (1.0, archived[0]["id"])
+        )
+    assert (
+        store.search(keyword="绿岛酒吧", scope="global", cold_after_days=180)["total"]
+        == 4
+    )
+    assert (
+        store.search(keyword="绿岛酒吧", scope="global", cold_after_days=0)["total"]
+        == 5
+    )
+    assert store.get(archived[0]["id"]) is not None
 
 
 def test_session_affinity_reorders_without_narrowing(tmp_path):
