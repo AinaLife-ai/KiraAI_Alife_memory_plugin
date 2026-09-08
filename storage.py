@@ -662,6 +662,80 @@ class Store:
                     break
         return result
 
+    @staticmethod
+    def _scope_clause(alias, scope, sid, users):
+        """Visibility predicate shared by totals and top-user ranking."""
+        if scope == "global":
+            return "1=1", []
+        if scope == "linked":
+            return (
+                f"({alias}.sid=? OR {alias}.visibility='global' OR EXISTS "
+                f"(SELECT 1 FROM json_each({alias}.users) WHERE value IN "
+                "(SELECT value FROM json_each(?))))",
+                [sid, dump(list(users))],
+            )
+        return (
+            f"({alias}.sid=? OR {alias}.visibility='global' OR "
+            f"({alias}.visibility='user' AND EXISTS "
+            f"(SELECT 1 FROM json_each({alias}.users) WHERE value IN "
+            "(SELECT value FROM json_each(?)))))",
+            [sid, dump(list(users))],
+        )
+
+    def totals(self, sid="", users=(), scope="session"):
+        clause, args = self._scope_clause("records", scope, sid, users)
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT count(*) AS records, coalesce(sum(permanent),0) AS permanent, "
+                f"count(DISTINCT sid) AS sessions FROM records WHERE deleted=0 AND {clause}",
+                args,
+            ).fetchone()
+            people = db.execute(
+                "SELECT count(DISTINCT value) FROM records, json_each(records.users) "
+                f"WHERE records.deleted=0 AND {clause}",
+                args,
+            ).fetchone()[0]
+            groups = db.execute(
+                f"SELECT count(DISTINCT sid) FROM records WHERE deleted=0 AND {clause} "
+                "AND instr(sid,':gm:')>0",
+                args,
+            ).fetchone()[0]
+            source_clause, source_args = self._scope_clause("r", scope, sid, users)
+            facts = db.execute(
+                f"""SELECT count(*) FROM facts WHERE deleted=0 AND (
+                  sid IN (SELECT sid FROM records WHERE deleted=0 AND {clause})
+                  OR EXISTS(SELECT 1 FROM json_each(facts.sources) v JOIN records r
+                            ON r.id=v.value WHERE r.deleted=0 AND {source_clause}))""",
+                [*args, *source_args],
+            ).fetchone()[0]
+        return {
+            "records": row["records"],
+            "facts": facts,
+            "users": people,
+            "sessions": row["sessions"],
+            "groups": groups,
+            "permanent": row["permanent"],
+        }
+
+    def top_users(self, sid="", users=(), scope="session", limit=10):
+        clause, args = self._scope_clause("records", scope, sid, users)
+        with self.connect() as db:
+            rows = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT value AS user_id, count(DISTINCT records.id) AS records "
+                    f"FROM records, json_each(records.users) WHERE records.deleted=0 AND {clause} "
+                    "GROUP BY value ORDER BY records DESC, value LIMIT ?",
+                    [*args, limit],
+                )
+            ]
+            total = db.execute(
+                "SELECT count(DISTINCT value) FROM records, json_each(records.users) "
+                f"WHERE records.deleted=0 AND {clause}",
+                args,
+            ).fetchone()[0]
+        return {"items": rows, "total": total}
+
     def needs_tool_cleanup(self):
         with self.connect() as db:
             return not db.execute(

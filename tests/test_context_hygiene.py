@@ -140,6 +140,39 @@ def test_cleanup_is_idempotent_and_drops_orphan_facts(tmp_path):
     assert again["freed_chars"] == 0
 
 
+def test_totals_and_top_users_respect_scope(tmp_path):
+    store = s.Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    for uid, count in (("qq:1", 3), ("qq:2", 1)):
+        for i in range(count):
+            store.capture(
+                SID,
+                f"{uid}-{i}",
+                [
+                    {
+                        "role": "user",
+                        "content": f"{uid} 的第 {i} 条",
+                        "time": float(i),
+                        "users": [uid],
+                    }
+                ],
+            )
+    store.capture(
+        "qq:dm:9",
+        "x",
+        [{"role": "user", "content": "私聊消息", "time": 1.0, "users": ["qq:9"]}],
+    )
+    session = store.totals(SID, ["qq:1"], "session")
+    assert session["records"] == 4 and session["users"] == 2
+    assert session["sessions"] == 1 and session["groups"] == 1
+    whole = store.totals(SID, ["qq:1"], "global")
+    assert whole["records"] == 5 and whole["users"] == 3 and whole["sessions"] == 2
+    top = store.top_users(SID, ["qq:1"], "global", limit=10)
+    assert top["total"] == 3 and top["items"][0]["user_id"] == "qq:1"
+    capped = store.top_users(SID, ["qq:1"], "global", limit=1)
+    assert len(capped["items"]) == 1 and capped["total"] == 3
+
+
 def test_session_affinity_reorders_without_narrowing(tmp_path):
     store = s.Store(tmp_path / "db.sqlite3")
     store.initialize()
