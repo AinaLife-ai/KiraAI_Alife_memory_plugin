@@ -1,5 +1,6 @@
 """Our own tool outputs must never become new memories."""
 
+import json
 import types
 
 import pytest
@@ -66,3 +67,34 @@ async def test_memorize_skips_duplicates_and_revives_forgotten(tmp_path):
     revived = json.loads(await plugin.memorize(event, "主人喜欢乌龙茶"))
     assert revived["existing"] is True
     assert store.get(first["id"])["active"] == 1
+
+
+@pytest.mark.asyncio
+async def test_search_returns_only_new_memories(tmp_path):
+    plugin, store = _plugin(tmp_path)
+    plugin.engine = _Engine()
+    event = _event()
+    for i in range(3):
+        store.capture(
+            event.sid,
+            f"e{i}",
+            [
+                {
+                    "role": "user",
+                    "content": f"关于喵梓的记忆{i}",
+                    "time": float(i),
+                    "users": [],
+                }
+            ],
+        )
+    first = json.loads(await plugin.search_archive(event, keyword="喵梓"))
+    assert len(first["items"]) == 3 and first["already_seen"] == 0
+
+    second = json.loads(await plugin.search_archive(event, keyword="喵梓"))
+    assert second["items"] == [] and second["already_seen"] == 3
+    assert "ReadMemoryArchive" in second["hint"]
+
+    again = json.loads(
+        await plugin.search_archive(event, keyword="喵梓", allow_seen=True)
+    )
+    assert len(again["items"]) == 3

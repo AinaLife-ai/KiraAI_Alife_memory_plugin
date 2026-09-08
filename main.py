@@ -40,7 +40,6 @@ from .migration import SOURCES
 from .retrieval import (
     TOOL_RESULT_PREFIX,
     archive_view,
-    asks_for_more,
     looks_like_memory_payload,
     safe_facts,
     tool_call_summary,
@@ -104,7 +103,7 @@ class AlifeMemoryPlugin(BasePlugin):
         self.identity_report = {}
         self.identity_settled = True
         self.name_refresh_lock = asyncio.Lock()
-        self.recall_window = RecallWindow()
+        self.seen_window = RecallWindow()
         self._recall_outputs = {}
         self._own_outputs = set()
 
@@ -556,13 +555,6 @@ class AlifeMemoryPlugin(BasePlugin):
         users = user_ids(event)
         query = " ".join(text_of(m) for m in event.messages)
         recall_key = (sid, tuple(users), cfg.recall_scope)
-        previous = self.recall_window.get(recall_key)
-        plain = " ".join(
-            getattr(part, "text", "") for m in event.messages for part in m.chain
-        ).strip()
-        continuation = asks_for_more(plain) and bool(previous["query"])
-        if continuation:
-            query = previous["query"]
         rows = await self.store.call("context", sid, users, scope=cfg.recall_scope)
         prefer = (
             {"prefer_sid": sid, "prefer_users": tuple(users)}
@@ -575,7 +567,6 @@ class AlifeMemoryPlugin(BasePlugin):
             limit=cfg.top_k * 10,
             users=users,
             include_shared=True,
-            exclude_ids=previous["facts"] if continuation else (),
             **prefer,
         )
         related = []
@@ -587,8 +578,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 scope=cfg.recall_scope,
                 users=users,
                 limit=cfg.top_k * 2,
-                exclude_sid="" if continuation else sid,
-                exclude_ids=previous["ids"] if continuation else (),
+                exclude_sid=sid,
                 active=cfg.search_active_only,
                 cold_after_days=cfg.cold_after_days,
                 **prefer,
@@ -611,7 +601,7 @@ class AlifeMemoryPlugin(BasePlugin):
                     "archived": not r["active"],
                 }
                 for r in matches["items"]
-                if continuation or r["id"] not in local_ids
+                if r["id"] not in local_ids
             ][: cfg.top_k]
             extra = await self.store.call(
                 "facts",
@@ -621,7 +611,6 @@ class AlifeMemoryPlugin(BasePlugin):
                 include_shared=True,
                 lexical=query,
                 limit=cfg.top_k,
-                exclude_ids=previous["facts"] if continuation else (),
                 **prefer,
             )
             facts = list({f["id"]: f for f in [*extra, *facts]}.values())
@@ -688,7 +677,6 @@ class AlifeMemoryPlugin(BasePlugin):
         # Never rewrite host history or put changing memory in the system prefix.
         perception = {
             "scope": cfg.recall_scope,
-            "recall_continuation": continuation,
             "new_related_count": len(related),
             "session": sid,
             "participants": users,
@@ -728,13 +716,13 @@ class AlifeMemoryPlugin(BasePlugin):
                 content = dump(perception)
         perception["new_related_count"] = len(perception["related_archives"])
         content = dump(perception)
-        self.recall_window.remember(
+        # Everything injected here counts as "already seen" for later searches.
+        self.seen_window.remember(
             recall_key,
-            query,
+            "",
             [r["archive"] for r in perception["archives"]]
             + [r["id"] for r in perception["related_archives"]],
             [f["id"] for f in perception["facts"]],
-            continuation=continuation,
         )
         req.user_prompt.insert(
             0,
@@ -902,10 +890,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 raise ValueError("invalid archive paging")
             row = await self.accessible(event, id)
             recall_key = (event.sid, tuple(user_ids(event)), self.settings.recall_scope)
-            previous = self.recall_window.get(recall_key)
-            self.recall_window.remember(
-                recall_key, previous["query"], [id], continuation=True
-            )
+            self.seen_window.remember(recall_key, "", [id])
             names = await self.store.call("entities", ids=[row["sid"], *row["users"]])
             return self.recall_result(
                 event,
@@ -948,6 +933,10 @@ class AlifeMemoryPlugin(BasePlugin):
                     "type": "boolean",
                     "description": "包含已归档的旧记忆；默认只搜常驻",
                 },
+                "allow_seen": {
+                    "type": "boolean",
+                    "description": "允许重复返回本会话已给过的记忆；默认只给新情报",
+                },
             },
             "additionalProperties": False,
         },
@@ -965,21 +954,27 @@ class AlifeMemoryPlugin(BasePlugin):
         exclude_ids=None,
         next_batch=False,
         include_archived=False,
+        allow_seen=False,
     ):
         if not self.runtime_settings().enabled:
             return self.recall_result(event, {"ok": False, "error": "memory_paused"})
         try:
-            if type(next_batch) is not bool or type(include_archived) is not bool or (
+            if (
+                type(next_batch) is not bool
+                or type(include_archived) is not bool
+                or type(allow_seen) is not bool
+                or (
                 exclude_ids is not None
                 and (
                     not isinstance(exclude_ids, list)
                     or len(exclude_ids) > 200
                     or any(not isinstance(i, str) or len(i) > 500 for i in exclude_ids)
                 )
+                )
             ):
                 raise ValueError("invalid continuation")
             key = (event.sid, tuple(user_ids(event)), self.settings.recall_scope)
-            previous = self.recall_window.get(key)
+            previous = self.seen_window.get(key)
             if next_batch and not (keyword or prompt):
                 prompt = previous["query"]
                 if not prompt:
@@ -991,11 +986,8 @@ class AlifeMemoryPlugin(BasePlugin):
                             "hint": "请提供想继续回忆的主题",
                         },
                     )
-            excluded = list(
-                dict.fromkeys(
-                    [*(exclude_ids or []), *(previous["ids"] if next_batch else [])]
-                )
-            )
+            seen = [] if allow_seen else list(previous["ids"])
+            excluded = list(dict.fromkeys([*(exclude_ids or []), *seen]))
             q = Search(
                 sid=event.sid,
                 keyword=keyword,
@@ -1044,19 +1036,23 @@ class AlifeMemoryPlugin(BasePlugin):
                 }
                 for r in result["items"]
             ]
-            self.recall_window.remember(
-                key,
-                prompt or keyword,
-                [r["id"] for r in result["items"]],
-                continuation=next_batch,
+            self.seen_window.remember(
+                key, prompt or keyword, [r["id"] for r in result["items"]]
             )
             result["next_page"] = (
                 page + 1 if q.offset + len(result["items"]) < result["total"] else None
             )
             result["excluded_count"] = len(excluded)
-            result["hint"] = (
-                "继续找不同内容可用next_batch=true且page=1；没有新证据时请明确说明，不复述旧内容。"
-            )
+            result["already_seen"] = len(seen)
+            if not result["items"] and seen:
+                result["hint"] = (
+                    "本轮没有新内容：相关记忆此前已经给过。"
+                    "如需重看，用 ReadMemoryArchive(id)，或传 allow_seen=true 重搜。"
+                )
+            else:
+                result["hint"] = (
+                    "默认只返回本会话未给过的记忆；继续找不同内容可用 next_batch=true。"
+                )
             return self.recall_result(event, {"ok": True, **result})
         except ValueError:
             return self.recall_result(event, {"ok": False, "error": "invalid_search"})
@@ -1128,7 +1124,7 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @register.tool(
         name="MemoryOverview",
-        description="感知总体记忆、用户画像、关系、偏好、约定；返回统计总量（记录/事实/人数/会话/永久记忆）；subject 为实体 ID，支持翻页。",
+        description="感知总体记忆、用户画像、关系、偏好、约定；返回统计总量（记录/事实/人数/会话/永久记忆）；已给过的事实不再重复返回，再次调用可获取下一批；subject 为实体 ID。",
         params={
             "type": "object",
             "properties": {
@@ -1143,16 +1139,21 @@ class AlifeMemoryPlugin(BasePlugin):
             return self.recall_result(event, {"ok": False, "error": "memory_paused"})
         if type(offset) != int or offset < 0:
             return self.recall_result(event, {"ok": False, "error": "invalid_offset"})
+        key = (event.sid, tuple(user_ids(event)), self.settings.recall_scope)
+        seen = self.seen_window.get(key)["facts"]
         rows = await self.store.call(
             "facts",
             event.sid,
             subject=subject,
-            offset=offset,
+            # Facts already delivered are skipped, so each call yields new ones.
+            offset=0 if seen else offset,
             limit=50,
             global_scope=self.settings.recall_scope == "global",
             users=user_ids(event),
             include_shared=True,
+            exclude_ids=seen,
         )
+        self.seen_window.remember(key, "", [], [row["id"] for row in rows])
         context = await self.store.call("context", event.sid, user_ids(event))
         totals = await self.store.call(
             "totals", event.sid, user_ids(event), self.settings.recall_scope
@@ -1163,6 +1164,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 "ok": True,
                 "active_archives": len(context),
                 "totals": totals,
+                "already_seen": len(seen),
                 "subjects": sorted({r["subject"] for r in rows}),
                 "facts": safe_facts(rows),
                 "next_offset": offset + len(rows),

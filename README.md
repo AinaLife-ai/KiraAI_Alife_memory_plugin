@@ -2,6 +2,12 @@
 
 将 [Alife 持久记忆](https://github.com/BDFFZI/Alife/tree/0b9836a3a6cc38f9a63b5271768963d9eb970b03/sources/Alife.Function/Alife.Function.Memory) 的分层归档机制移植到 KiraAI。沿用 `alife_memory_z`、长期记忆·Z 名称和原图标；核心围绕原始经历与可回溯存档重建。
 
+## 2.2.4 更新
+
+同一会话只给新情报：搜索默认排除本会话已经给过的记忆（含每轮注入的存档与事实、按 ID 读过的存档），只返回新内容；`already_seen` 报告跳过数量，`allow_seen=true` 可显式重搜，`ReadMemoryArchive(id)` 永远能重读。`MemoryOverview` 的事实同样去重。同时删除写死的「还有别的吗」启发式（`re.fullmatch` 只认 8 个固定短语），改由模型通过 `SearchMemoryArchive(next_batch=true)` 驱动。
+
+详见[同一会话只给新情报](docs/NEW_ONLY_RECALL_2_2_4.md)。
+
 ## 2.2.3 更新
 
 永久记忆不再重复堆积：`Memorize` 遇到完全相同的永久记忆直接返回已有条目（被 Forget 过的会恢复），不新增；新增后台任务 `dedupe` 用**审计模型**检查相似的永久记忆，确属同一件事的重复或更正时自动合并——保留最新一条、其余移出常驻上下文（原文与版本保留）。开关 `permanent_dedupe`（默认开）与阈值 `dedupe_threshold`（默认 0.25）可在设置页热更改；后台任务页可手动触发。

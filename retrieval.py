@@ -187,7 +187,11 @@ def archive_view(row, child_offset=0, child_count=20, include_content=False):
 
 
 class RecallWindow:
-    """Ephemeral delivered-result history, bounded and isolated by caller and scope."""
+    """Delivered-result history: what this conversation has already been shown.
+
+    It accumulates for the lifetime of the conversation (30 minutes), so the
+    model never receives the same memory twice unless it explicitly asks for it.
+    """
 
     def __init__(self):
         self.entries = OrderedDict()
@@ -199,26 +203,18 @@ class RecallWindow:
                 del self.entries[k]
         return self.entries.get(key, {"query": "", "ids": [], "facts": []})
 
-    def remember(self, key, query, ids, facts=(), continuation=False):
-        old = self.get(key) if continuation else {"ids": [], "facts": []}
+    def remember(self, key, query, ids, facts=()):
+        old = self.get(key)
         self.entries[key] = dict(
-            query=query,
-            ids=list(dict.fromkeys([*old["ids"], *ids]))[-200:],
-            facts=list(dict.fromkeys([*old["facts"], *facts]))[-200:],
+            # An empty query never overwrites the last search topic.
+            query=query or old["query"],
+            ids=list(dict.fromkeys([*old["ids"], *ids]))[-300:],
+            facts=list(dict.fromkeys([*old["facts"], *facts]))[-300:],
             updated=time.monotonic(),
         )
         self.entries.move_to_end(key)
         while len(self.entries) > 256:
             self.entries.popitem(last=False)
-
-
-def asks_for_more(text):
-    return bool(
-        re.fullmatch(
-            r"[\s，,。.!！?？]*(还有别的(?:吗|么)?|还有呢|还有吗|还有么|再说点|继续回忆|再想想|别的呢)[\s，,。.!！?？]*",
-            text,
-        )
-    )
 
 
 STOP = {
