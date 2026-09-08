@@ -139,3 +139,34 @@ def test_dedupe_disabled_leaves_memories_alone(tmp_path):
     engine = e.Engine(store, lambda: cfg, merge_model, None, None)
     asyncio.run(engine.consolidate(SID))
     assert len(store.permanent_records(SID)) == 3
+
+
+@pytest.mark.asyncio
+async def test_merge_first_switch_changes_dedupe_instruction(tmp_path):
+    store = s.Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    ids = seed(store)
+    captured = {}
+
+    async def model(_model, purpose, instruction, _schema, _payload):
+        captured[purpose] = instruction
+        return json.dumps(
+            {
+                "action": "keep",
+                "content": "",
+                "reason": "测试",
+                "source_ids": ids[:2],
+            },
+            ensure_ascii=False,
+        )
+
+    for flag, marker in (
+        (True, "默认选择 merge"),
+        (False, "只有同时满足三条才 merge"),
+    ):
+        cfg = c.Settings(
+            dedupe_merge_first=flag, dedupe_threshold=0.25, model_retries=0
+        )
+        engine = e.Engine(store, lambda: cfg, model, None, None)
+        await engine.consolidate(SID)
+        assert marker in captured["dedupe"]

@@ -127,18 +127,33 @@ class Engine:
                 + cfg.compress_instruction
                 if purpose == "compress"
                 else (
-                    "records 按时间从新到旧排列，records[0] 是最新的那条。"
-                    "只输出一个 action：keep 或 merge。"
-                    "只有同时满足三条才 merge：①指向同一个对象（同一个人、同一个群、"
-                    "同一份名单或同一个约定）；②说的是该对象的同一件事或同一属性；"
-                    "③互为重复，或后者是对前者的更正/补充。"
-                    "任意一条不满足就 keep，例如主体不同（阿远 vs 小夏）、只是话题相近、"
-                    "说的是两件不同的事。"
-                    "互相矛盾时按更正处理：content 只保留时间较晚的说法，reason 说明是更正，"
-                    "不要保留已被推翻的旧结论。"
-                    "content 必须自包含：写清对象、时间与结论；原样保留人名、群名、数字、"
-                    "QQ号与日期；不得丢掉任何一条独有的关键信息；不得写“同上”或引用其他记录ID。"
-                    "source_ids 至少两条，逐字复制 records[].id；禁止编造ID。"
+                    (
+                        "records 按时间从新到旧排列，records[0] 是最新的那条。"
+                        "只输出一个 action：keep 或 merge。"
+                        "默认选择 merge：只要这些记忆围绕同一个对象或同一主题"
+                        "（同一份名单、同一个约定、同一件事），就合并成一条，"
+                        "把每条独有的关键信息全部并入 content（可以比原来长），"
+                        "原样保留人名、群名、数字、QQ号与日期；content 必须自包含，"
+                        "不得写“同上”或引用其他记录ID。"
+                        "只有主体或对象明显不同（阿远 vs 小夏）、或确实是两件互不相干的事时才 keep。"
+                        "互相矛盾时以时间较晚的说法为准，并在 reason 说明是更正。"
+                        "source_ids 至少两条，逐字复制 records[].id；禁止编造ID。"
+                        if cfg.dedupe_merge_first
+                        else (
+                            "records 按时间从新到旧排列，records[0] 是最新的那条。"
+                            "只输出一个 action：keep 或 merge。"
+                            "只有同时满足三条才 merge：①指向同一个对象（同一个人、同一个群、"
+                            "同一份名单或同一个约定）；②说的是该对象的同一件事或同一属性；"
+                            "③互为重复，或后者是对前者的更正/补充。"
+                            "任意一条不满足就 keep，例如主体不同（阿远 vs 小夏）、只是话题相近、"
+                            "说的是两件不同的事。"
+                            "互相矛盾时按更正处理：content 只保留时间较晚的说法，reason 说明是更正，"
+                            "不要保留已被推翻的旧结论。"
+                            "content 必须自包含：写清对象、时间与结论；原样保留人名、群名、数字、"
+                            "QQ号与日期；不得丢掉任何一条独有的关键信息；不得写“同上”或引用其他记录ID。"
+                            "source_ids 至少两条，逐字复制 records[].id；禁止编造ID。"
+                        )
+                    )
                     if purpose == "dedupe"
                     else "审计输出只含actions，禁止输出summary/facts。target_id和source_ids均来自facts[].id，不是evidence[].id或facts[].sources。keep/correct的source_ids只能是[target_id]；merge至少两个同会话、同主体、同分类事实ID，每个事实只能参与一次操作。无需操作时actions=[]。依据证据审计，保留否定、时间和不确定性；不同事件不得因相似而合并。关系警告需核对原文，correct时提供修正后的relations；无法证实连线时设为空数组。无须改关系时设null。"
                 )
