@@ -129,7 +129,7 @@ class Store:
             db.execute(
                 "UPDATE jobs SET state='queued',detail='resumed after restart' WHERE state='running'"
             )
-            db.execute("PRAGMA user_version=3")
+            db.execute("PRAGMA user_version=4")
             db.execute(
                 "INSERT OR IGNORE INTO entities(id,kind,name,updated) SELECT DISTINCT value,'user','',0 FROM records,json_each(records.users)"
             )
@@ -240,7 +240,7 @@ class Store:
                         "SELECT name FROM entities WHERE id=?", (r["lookup_id"],)
                     ).fetchone()
                     if linked and linked[0]:
-                        r["label"] = linked[0] + " · 旧人物档案"
+                        r["label"] = linked[0] + " · 同号码档案"
                         r["name_source_id"] = r["lookup_id"]
             return rows
 
@@ -345,10 +345,295 @@ class Store:
 
         return import_snapshot(self, snapshot)
 
-    def scan_legacy(self, root, plugin_id, limit):
+    def scan_legacy(self, root, plugin_id, limit, adapters=()):
         from .migration import snapshot
+        from .identity import Resolver
 
-        return snapshot(root, plugin_id, limit)
+        with self.connect() as db:
+            entities = [
+                (r["id"], r["kind"]) for r in db.execute("SELECT id,kind FROM entities")
+            ]
+        return snapshot(root, plugin_id, limit, Resolver(entities, adapters))
+
+    def synthetic_identity(self):
+        """True while any row still carries a synthetic migration identifier."""
+        with self.connect() as db:
+            for table, column in (
+                ("entities", "id"),
+                ("records", "sid"),
+                ("facts", "sid"),
+                ("facts", "subject"),
+            ):
+                if db.execute(
+                    f"SELECT 1 FROM {table} WHERE {column} LIKE 'legacy:%' "
+                    f"OR {column} LIKE 'unresolved:%' LIMIT 1"
+                ).fetchone():
+                    return True
+            return False
+
+    def canonicalize_identity(self, adapters=(), bindings=None):
+        """Merge synthetic migration identifiers onto the live same-number entity.
+
+        Idempotent: rows that already carry a live identifier are untouched.
+        ``bindings`` forces a mapping, e.g. after an adapter lookup proved which
+        platform an ``unresolved:user:123`` placeholder belongs to.
+        """
+        from . import identity
+
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            entities = [
+                (r["id"], r["kind"])
+                for r in db.execute("SELECT id,kind FROM entities")
+            ]
+            resolver = identity.Resolver(entities, adapters)
+            mapping = {}
+
+            def note(value):
+                if identity.synthetic(value):
+                    mapping[value] = resolver.resolve(value)
+
+            for entity_id, _ in entities:
+                note(entity_id)
+            records = [dict(r) for r in db.execute("SELECT id,sid,users FROM records")]
+            for record in records:
+                note(record["sid"])
+                for user in json.loads(record["users"]):
+                    note(user)
+            facts = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT id,sid,subject,category,content,reason,scenario,"
+                    "tags,relations,sources,fingerprint FROM facts WHERE deleted=0"
+                )
+            ]
+            for fact in facts:
+                note(fact["sid"])
+                note(fact["subject"])
+                for relation in json.loads(fact["relations"]):
+                    note(relation.get("subject"))
+                    note(relation.get("object"))
+            if bindings:
+                for old, value in bindings.items():
+                    mapping[old] = value
+            record_sid = {record["id"]: record["sid"] for record in records}
+            overrides = {}
+            for row in db.execute(
+                "SELECT record_id,source_key FROM migration_items "
+                "WHERE record_id IS NOT NULL"
+            ):
+                shape = identity.source_shape(row["source_key"])
+                if not shape:
+                    continue
+                kind, adapter, number = shape
+                hint = ""
+                sid = record_sid.get(row["record_id"], "")
+                if sid and not identity.synthetic(sid) and sid != identity.UNSCOPED:
+                    name, _number, session = identity.split_adapter(sid)
+                    if name and session:
+                        hint = name
+                if kind == "global":
+                    overrides[row["record_id"]] = (
+                        identity.GLOBAL,
+                        identity.GLOBAL,
+                        "global",
+                    )
+                elif kind == "self":
+                    overrides[row["record_id"]] = (
+                        identity.SELF,
+                        identity.SELF,
+                        "self",
+                    )
+                elif kind == "user":
+                    overrides[row["record_id"]] = resolver.user(
+                        adapter or hint, number
+                    )
+                else:
+                    overrides[row["record_id"]] = resolver.group(
+                        adapter or hint, number
+                    )
+            report = {
+                "records": 0,
+                "facts": 0,
+                "entities": 0,
+                "merged_facts": 0,
+                "pending": [],
+                "ambiguous": [],
+            }
+            record_new_sid = {}
+            for record in records:
+                sid, users = record["sid"], json.loads(record["users"])
+                new_sid = mapping.get(sid, (sid, sid, ""))[1] or sid
+                new_users = [mapping.get(u, (u, "", ""))[0] for u in users]
+                override = overrides.get(record["id"])
+                if override:
+                    entity, entity_sid, kind = override
+                    if kind == "user":
+                        if entity_sid and entity_sid != identity.UNSCOPED:
+                            new_sid = entity_sid
+                        if entity and entity not in new_users:
+                            new_users.append(entity)
+                    else:
+                        new_sid = entity_sid
+                new_users = sorted(
+                    {
+                        user
+                        for user in new_users
+                        if user and not user.startswith(identity.PENDING)
+                    }
+                )
+                record_new_sid[record["id"]] = new_sid
+                if new_sid != sid or new_users != users:
+                    db.execute(
+                        "UPDATE records SET sid=?,users=? WHERE id=?",
+                        (new_sid, dump(new_users), record["id"]),
+                    )
+                    report["records"] += 1
+            for fact in facts:
+                sid, subject = fact["sid"], fact["subject"]
+                new_sid = mapping.get(sid, (sid, sid, ""))[1] or sid
+                if identity.synthetic(sid) or sid == identity.UNSCOPED:
+                    for source in json.loads(fact["sources"]):
+                        candidate = record_new_sid.get(source)
+                        if candidate and candidate != identity.UNSCOPED:
+                            new_sid = candidate
+                            break
+                new_subject = mapping.get(subject, (subject, "", ""))[0]
+                relations = json.loads(fact["relations"])
+                new_relations = [
+                    {
+                        **relation,
+                        "subject": mapping.get(
+                            relation.get("subject"),
+                            (relation.get("subject"), "", ""),
+                        )[0],
+                        "object": mapping.get(
+                            relation.get("object"), (relation.get("object"), "", "")
+                        )[0],
+                    }
+                    for relation in relations
+                ]
+                fingerprint = hashlib.sha256(
+                    dump(
+                        [
+                            fact["category"],
+                            new_subject,
+                            fact["content"],
+                            fact["reason"],
+                            fact["scenario"],
+                            new_relations,
+                        ]
+                    ).encode()
+                ).hexdigest()
+                if (
+                    new_sid != sid
+                    or new_subject != subject
+                    or new_relations != relations
+                    or fingerprint != fact["fingerprint"]
+                ):
+                    db.execute(
+                        "UPDATE facts SET sid=?,subject=?,relations=?,fingerprint=?,"
+                        "revision=revision+1 WHERE id=?",
+                        (
+                            new_sid,
+                            new_subject,
+                            dump(new_relations),
+                            fingerprint,
+                            fact["id"],
+                        ),
+                    )
+                    report["facts"] += 1
+            for old, (entity, _sid, kind) in mapping.items():
+                if old == entity:
+                    continue
+                db.execute(
+                    "INSERT OR IGNORE INTO entities(id,kind,name,updated) "
+                    "VALUES (?,?, '',0)",
+                    (entity, kind or "user"),
+                )
+                if kind:
+                    db.execute(
+                        "UPDATE entities SET kind=? WHERE id=?", (kind, entity)
+                    )
+                db.execute(
+                    "UPDATE entity_names SET entity_id=? WHERE entity_id=?",
+                    (entity, old),
+                )
+                db.execute("DELETE FROM entities WHERE id=?", (old,))
+                latest = db.execute(
+                    "SELECT name FROM entity_names WHERE entity_id=? "
+                    "ORDER BY observed DESC,id DESC LIMIT 1",
+                    (entity,),
+                ).fetchone()
+                if latest and latest[0]:
+                    db.execute(
+                        "UPDATE entities SET name=? WHERE id=? "
+                        "AND (name IS NULL OR name='')",
+                        (latest[0], entity),
+                    )
+                report["entities"] += 1
+            seen = {}
+            for row in db.execute(
+                "SELECT id,sid,subject,fingerprint,sources,tags FROM facts "
+                "WHERE deleted=0 ORDER BY rowid"
+            ):
+                key = (row["sid"], row["subject"], row["fingerprint"])
+                kept = seen.get(key)
+                if kept is None:
+                    seen[key] = {
+                        "id": row["id"],
+                        "sources": row["sources"],
+                        "tags": row["tags"],
+                    }
+                    continue
+                sources = sorted(
+                    set(json.loads(kept["sources"]) + json.loads(row["sources"]))
+                )
+                tags = sorted(set(json.loads(kept["tags"]) + json.loads(row["tags"])))
+                db.execute(
+                    "UPDATE facts SET sources=?,tags=?,revision=revision+1 WHERE id=?",
+                    (dump(sources), dump(tags), kept["id"]),
+                )
+                db.execute(
+                    "INSERT INTO versions(kind,target,snapshot,reason,created) "
+                    "VALUES ('fact',?,?,?,?)",
+                    (
+                        row["id"],
+                        dump(dict(row)),
+                        "identity merge: identical fact",
+                        time.time(),
+                    ),
+                )
+                db.execute(
+                    "UPDATE facts SET deleted=1,revision=revision+1 WHERE id=?",
+                    (row["id"],),
+                )
+                kept["sources"], kept["tags"] = dump(sources), dump(tags)
+                report["merged_facts"] += 1
+            pending = sorted(
+                {
+                    entity
+                    for _old, (entity, _sid, _kind) in mapping.items()
+                    if entity.startswith(identity.PENDING)
+                }
+            )
+            ambiguous = []
+            for old, (entity, _sid, _kind) in mapping.items():
+                if not entity.startswith(identity.PENDING):
+                    continue
+                shape = identity.legacy_shape(old) or identity.pending_shape(old)
+                if not shape:
+                    continue
+                pool = resolver.users if shape[0] == "user" else resolver.groups
+                if len(pool.get(shape[2], ())) > 1:
+                    ambiguous.append(entity)
+            report["pending"] = pending
+            report["ambiguous"] = sorted(set(ambiguous))
+            if any(
+                report[key] for key in ("records", "facts", "entities", "merged_facts")
+            ):
+                self.bump(db)
+            return report
 
     def migration_status(self):
         with self.connect() as db:

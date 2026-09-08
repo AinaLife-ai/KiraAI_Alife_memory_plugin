@@ -8,6 +8,7 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
+    <div class="ambient" aria-hidden="true"></div>
     <div class="shell">
       <aside>
         <div class="brand">
@@ -37,7 +38,25 @@
           </div>
           <div class="actions">
             <button id="theme" aria-label="切换主题">◐</button
-            ><button id="refresh">刷新</button
+            ><button id="refresh" aria-pressed="true">
+              <svg class="spin" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M20 12a8 8 0 1 1-2.34-5.66"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                />
+                <path
+                  d="M20 4v4h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+              <span id="refreshLabel">自动刷新</span></button
             ><button id="new" class="primary">＋ 永久记忆</button>
           </div>
         </header>
@@ -150,6 +169,19 @@
               当前筛选页的有据联结 · 点选节点聚焦，点连线查看证据 ·
               图形布局不代表亲密程度
             </p>
+            <div class="graph-tools">
+              <label for="graphZoom">缩放</label>
+              <input
+                id="graphZoom"
+                type="range"
+                min="50"
+                max="250"
+                step="1"
+                value="100"
+                aria-label="记忆星图缩放"
+              />
+              <output id="graphZoomValue" for="graphZoom">100%</output>
+            </div>
             <div id="relations"></div>
           </div>
           <div id="factCards" class="cards"></div>

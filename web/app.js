@@ -53,6 +53,8 @@ let ctx = null,
   total = 0,
   factOffset = 0,
   current = null,
+  autoRefresh = localStorage.getItem("alife-auto-refresh") !== "off",
+  refreshTimer = null,
   models = [];
 const esc = (s) =>
   String(s ?? "").replace(
@@ -272,7 +274,9 @@ async function poll() {
   try {
     const next = await api("/status");
     $("#connection").textContent = next.enabled
-      ? "已连接 · 实时同步"
+      ? autoRefresh
+        ? "已连接 · 实时同步"
+        : "已连接 · 手动同步"
       : "已连接 · 已暂停";
     if (asset && asset !== next.assets) {
       saveDraft();
@@ -806,11 +810,32 @@ $$("[data-tab]").forEach(
 );
 $("#refresh").onclick = () =>
   guard(async () => {
-    await poll();
-    if (tab === "archives") await loadArchives();
-    if (tab === "profiles") await loadFacts();
-    if (tab === "names") await loadNames();
+    await refreshNow();
+    autoRefresh = !autoRefresh;
+    localStorage.setItem("alife-auto-refresh", autoRefresh ? "on" : "off");
+    applyRefreshMode();
   });
+async function refreshNow() {
+  await poll();
+  if (tab === "archives") await loadArchives();
+  if (tab === "profiles") await loadFacts();
+  if (tab === "names") await loadNames();
+}
+function applyRefreshMode() {
+  const button = $("#refresh");
+  button.classList.toggle("auto", autoRefresh);
+  button.setAttribute("aria-pressed", String(autoRefresh));
+  $("#refreshLabel").textContent = autoRefresh ? "自动刷新" : "手动刷新";
+  button.title = autoRefresh
+    ? "自动刷新中 · 点击切换为手动"
+    : "手动刷新 · 点击刷新并恢复自动";
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = autoRefresh
+    ? setInterval(() => {
+        if (!document.hidden) poll();
+      }, 2500)
+    : null;
+}
 $("#theme").onclick = () =>
   (document.documentElement.dataset.theme =
     document.documentElement.dataset.theme === "dark" ? "light" : "dark");
@@ -827,6 +852,23 @@ $("#search").onclick = () =>
   });
 $("#keyword").onkeydown = (e) => {
   if (e.key === "Enter") $("#search").click();
+};
+for (const id of ["#session", "#level"])
+  $(id).onchange = () =>
+    guard(() => {
+      offset = 0;
+      return loadArchives();
+    });
+$("#category").onchange = () =>
+  guard(() => {
+    factOffset = 0;
+    return loadFacts();
+  });
+$("#subject").onkeydown = (e) => {
+  if (e.key === "Enter") $("#filterFacts").click();
+};
+$("#nameQuery").onkeydown = (e) => {
+  if (e.key === "Enter") $("#searchNames").click();
 };
 $("#prev").onclick = () =>
   guard(() => {
@@ -974,27 +1016,28 @@ async function boot() {
       if (e) e.value = v;
     });
   }
-  setInterval(() => {
-    if (!document.hidden) poll();
-  }, 2500);
+  applyRefreshMode();
 }
 let shownFacts = [],
   graphMode = "relations",
   nameOffset = 0,
   selectedName = null;
 const displayNames = {};
-const legacyLabel = (id) =>
-  id === "legacy:global"
-    ? "旧插件·全局记忆"
-    : id === "legacy:unscoped"
-      ? "旧插件·来源会话未确定"
-      : id.startsWith("legacy:user:")
-        ? "旧插件·人物档案"
-        : id.startsWith("legacy:")
-          ? "旧插件·历史实体"
-          : "";
+const fixedLabels = {
+  global: "全局记忆",
+  self: "机器人自身",
+  unscoped: "未分类 · 来源会话未确定",
+};
+const kindLabel = (kind) =>
+  kind === "user"
+    ? "人物"
+    : kind === "self"
+      ? "机器人自身"
+      : kind === "global"
+        ? "全局记忆"
+        : "会话 / 群";
 const displayLabel = (id) => {
-  const name = displayNames[id] || legacyLabel(id);
+  const name = displayNames[id] || fixedLabels[id];
   return name ? name + " · " + id : id;
 };
 function renderGraph() {
@@ -1026,7 +1069,7 @@ async function loadNames() {
     ? rows
         .map(
           (n, i) =>
-            `<article class="card"><span class="tag">${n.id.startsWith("legacy:") ? "旧插件迁移" : n.kind === "user" ? "人物" : "会话 / 群"}</span><h3>${esc(n.name || n.label || "名称待补全")}</h3><small>${esc(n.id)}</small><p class="muted">${esc(n.identity_note || "")}</p><p class="muted">曾用名：${esc([...new Set(n.history.map((h) => h.name))].filter((x) => x !== n.name).join("、") || "暂无")}</p><p class="muted">最近审校依据：${esc(n.history.find((h) => h.reason)?.reason || "尚无人工审校记录")}</p><footer><small>${n.updated ? date(n.updated) : "等待新消息或手动更新"}</small><button data-name="${i}">查看与审校</button></footer></article>`,
+            `<article class="card"><span class="tag">${esc(kindLabel(n.kind))}</span><h3>${esc(n.name || n.label || "名称待补全")}</h3><small>${esc(n.id)}</small><p class="muted">${esc(n.identity_note || "")}</p><p class="muted">曾用名：${esc([...new Set(n.history.map((h) => h.name))].filter((x) => x !== n.name).join("、") || "暂无")}</p><p class="muted">最近审校依据：${esc(n.history.find((h) => h.reason)?.reason || "尚无人工审校记录")}</p><footer><small>${n.updated ? date(n.updated) : "等待新消息或手动更新"}</small><button data-name="${i}">查看与审校</button></footer></article>`,
         )
         .join("")
     : empty("未找到名称");

@@ -7,37 +7,55 @@ from collections import OrderedDict
 
 
 def identity_info(entity_id):
-    """Migration buckets are not real group IDs. Never infer a platform for a bare ID."""
-    if entity_id == "legacy:global":
+    """Display labels; synthetic ids are pending/uncategorised, never a fake entity."""
+    from . import identity
+
+    if entity_id in (identity.GLOBAL, identity.GLOBAL_ID):
         return {
-            "label": "旧插件 · 全局记忆",
-            "identity_note": "这是迁移归档区，不是真实群聊。",
+            "label": "全局记忆",
+            "identity_note": "跨会话共享的全局记忆，不是群聊。",
             "lookup_id": "",
         }
-    if entity_id == "legacy:unscoped":
+    if entity_id in (identity.SELF, identity.SELF_ID):
         return {
-            "label": "旧插件 · 来源会话未确定",
+            "label": "机器人自身",
+            "identity_note": "机器人自己的认知与经历。",
+            "lookup_id": "",
+        }
+    if entity_id in (identity.UNSCOPED, identity.UNSCOPED_ID):
+        return {
+            "label": "未分类 · 来源会话未确定",
             "identity_note": "旧数据没有可靠会话标识；保留待核对，不猜群名或归属。",
             "lookup_id": "",
         }
-    if entity_id.startswith("legacy:user:"):
-        original = entity_id[len("legacy:user:") :]
-        qualified = re.fullmatch(r"[^:\s]+:[^:\s]+", original)
+    if entity_id.startswith(identity.PENDING):
+        shape = identity.pending_shape(entity_id)
+        kind = "群" if shape and shape[0] == "group" else "人物"
+        number = shape[2] if shape else ""
         return {
-            "label": "旧插件 · 人物档案 " + original,
-            "identity_note": "人物迁移归档区；"
-            + (
-                "称呼可参考原有账号，归档ID保持不变。"
-                if qualified
-                else "只有旧账号数字，平台未确定，不会自动绑定到QQ用户。"
-            ),
-            "lookup_id": original if qualified else "",
-        }
-    if entity_id.startswith("legacy:"):
-        return {
-            "label": "旧插件 · 历史实体",
-            "identity_note": "身份尚未确认，可补充显示名称；更名不等于绑定真实账号。",
+            "label": f"待绑定 · {kind} {number}",
+            "identity_note": "已按号码登记；出现同号码账号或在线适配器后会自动合并。",
             "lookup_id": "",
+        }
+    if entity_id.startswith(identity.LEGACY):
+        shape = identity.legacy_shape(entity_id)
+        if not shape:
+            return {
+                "label": "未分类",
+                "identity_note": "身份尚未确认。",
+                "lookup_id": "",
+            }
+        kind, adapter, number = shape
+        if kind == "user":
+            lookup = f"{adapter}:{number}" if adapter else ""
+        elif kind == "group":
+            lookup = f"{adapter}:gm:{number}" if adapter else ""
+        else:
+            lookup = ""
+        return {
+            "label": f"待绑定 · 号码 {number}" if number else "未分类",
+            "identity_note": "同号码账号出现后自动合并，不会单独保留为旧档案。",
+            "lookup_id": lookup,
         }
     return {
         "label": "名称待补全",
