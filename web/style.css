@@ -8,6 +8,7 @@
   --accent: #7960dc;
   --soft: #efebfc;
   --shadow: 0 12px 35px #24234308;
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 [data-theme="dark"] {
   color-scheme: dark;
@@ -771,5 +772,282 @@ button:active:not(:disabled) {
     scroll-behavior: auto !important;
     animation: none !important;
     transition: none !important;
+  }
+}
+
+/* ---- 动效系统：沿用原有配色，只增加呼吸感 ---- */
+.ambient {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+  background: var(--bg);
+}
+.ambient::before,
+.ambient::after {
+  content: "";
+  position: absolute;
+  width: 58vmax;
+  height: 58vmax;
+  border-radius: 50%;
+  filter: blur(70px);
+  background: radial-gradient(circle at 50% 50%, var(--accent), transparent 70%);
+  opacity: 0.1;
+  animation: drift 78s ease-in-out infinite alternate;
+}
+.ambient::before {
+  top: -22vmax;
+  left: -12vmax;
+}
+.ambient::after {
+  right: -18vmax;
+  bottom: -26vmax;
+  opacity: 0.08;
+  animation-duration: 96s;
+  animation-delay: -24s;
+}
+.shell {
+  position: relative;
+  z-index: 1;
+}
+body,
+aside {
+  transition:
+    background 0.24s var(--ease),
+    color 0.24s var(--ease);
+}
+.cards > .card {
+  animation: card-in 0.42s var(--ease) both;
+}
+.cards > .card:nth-child(2) {
+  animation-delay: 40ms;
+}
+.cards > .card:nth-child(3) {
+  animation-delay: 80ms;
+}
+.cards > .card:nth-child(4) {
+  animation-delay: 120ms;
+}
+.cards > .card:nth-child(5) {
+  animation-delay: 160ms;
+}
+.cards > .card:nth-child(6) {
+  animation-delay: 200ms;
+}
+.cards > .card:nth-child(7) {
+  animation-delay: 240ms;
+}
+.cards > .card:nth-child(8) {
+  animation-delay: 280ms;
+}
+.cards > .card:nth-child(n + 9) {
+  animation-delay: 320ms;
+}
+.card:hover,
+.stat:hover {
+  box-shadow: 0 18px 40px -20px var(--accent);
+}
+.stat:hover {
+  transform: translateY(-2px);
+}
+.nav button {
+  position: relative;
+  transition:
+    background 0.22s var(--ease),
+    color 0.22s var(--ease);
+}
+.nav button:hover {
+  background: var(--soft);
+  color: var(--accent);
+}
+.nav span {
+  transition: transform 0.22s var(--ease);
+}
+.nav button:hover span {
+  transform: translateX(2px);
+}
+.nav button[aria-current="page"]::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  width: 3px;
+  height: 56%;
+  border-radius: 3px;
+  background: var(--accent);
+  transform: translateY(-50%);
+  animation: nav-mark 0.28s var(--ease) both;
+}
+button.primary {
+  position: relative;
+  overflow: hidden;
+}
+button.primary::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -60%;
+  width: 40%;
+  height: 100%;
+  pointer-events: none;
+  background: linear-gradient(100deg, transparent, #ffffff59, transparent);
+  transform: skewX(-18deg);
+  transition: left 0.55s var(--ease);
+}
+button.primary:hover::after {
+  left: 120%;
+}
+#refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+#refresh .spin {
+  width: 15px;
+  height: 15px;
+  flex: none;
+}
+#refresh.auto .spin {
+  animation: spin 1.5s linear infinite;
+}
+#toast {
+  animation: toast-in 0.3s var(--ease) both;
+}
+#relations svg {
+  touch-action: none;
+}
+.graph-node {
+  animation: node-in 0.4s var(--ease) both;
+}
+.edge-line {
+  stroke-dasharray: 1400;
+  stroke-dashoffset: 1400;
+  animation: edge-draw 0.7s var(--ease) forwards;
+}
+.graph-tools {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 14px;
+}
+.graph-tools label {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.graph-tools input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 180px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.graph-tools input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: linear-gradient(90deg, var(--accent), var(--soft));
+}
+.graph-tools input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
+  border-radius: 50%;
+  background: var(--panel);
+  border: 2px solid var(--accent);
+  box-shadow: 0 2px 6px #7960dc33;
+  transition:
+    transform 0.18s var(--ease),
+    box-shadow 0.18s var(--ease);
+}
+.graph-tools input[type="range"]:hover::-webkit-slider-thumb {
+  transform: scale(1.15);
+}
+.graph-tools input[type="range"]:focus-visible {
+  outline: none;
+}
+.graph-tools input[type="range"]:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 4px var(--soft);
+}
+.graph-tools input[type="range"]::-moz-range-track {
+  height: 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--soft);
+}
+.graph-tools input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--panel);
+  border: 2px solid var(--accent);
+}
+.graph-tools output {
+  min-width: 44px;
+  text-align: right;
+  font-size: 12px;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+@keyframes drift {
+  from {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  to {
+    transform: translate3d(6vmax, -4vmax, 0) scale(1.12);
+  }
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes card-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes node-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes edge-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes nav-mark {
+  from {
+    opacity: 0;
+    transform: translateY(-50%) scaleY(0.4);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(-50%) scaleY(1);
+  }
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
   }
 }

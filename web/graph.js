@@ -1,4 +1,45 @@
 /* Page-local visualization: edges always open their supporting fact. */
+const graphView = { scale: 1, x: 0, y: 0 };
+const GRAPH_CENTER = { x: 450, y: 285 };
+const GRAPH_MIN = 0.5;
+const GRAPH_MAX = 2.5;
+let graphSliderBound = false;
+
+function graphTransform() {
+  return `translate(${graphView.x} ${graphView.y}) scale(${graphView.scale})`;
+}
+
+function graphZoomAt(px, py, factor) {
+  const scale = Math.min(GRAPH_MAX, Math.max(GRAPH_MIN, graphView.scale * factor));
+  const ratio = scale / graphView.scale;
+  graphView.x = px - ratio * (px - graphView.x);
+  graphView.y = py - ratio * (py - graphView.y);
+  graphView.scale = scale;
+}
+
+function graphSyncZoom() {
+  const slider = document.querySelector("#graphZoom"),
+    output = document.querySelector("#graphZoomValue");
+  if (slider) slider.value = String(Math.round(graphView.scale * 100));
+  if (output)
+    output.textContent =
+      (slider ? Number(slider.value) : Math.round(graphView.scale * 100)) + "%";
+}
+
+function bindGraphSlider(container) {
+  const slider = document.querySelector("#graphZoom");
+  if (!slider || graphSliderBound) return;
+  graphSliderBound = true;
+  slider.addEventListener("input", () => {
+    const target = Number(slider.value) / 100;
+    if (!target) return;
+    graphZoomAt(GRAPH_CENTER.x, GRAPH_CENTER.y, target / graphView.scale);
+    const viewport = container.querySelector("#memory-zoom");
+    if (viewport) viewport.setAttribute("transform", graphTransform());
+    graphSyncZoom();
+  });
+}
+
 function drawMemoryGraph(container, facts, mode, names, openFact) {
   container.replaceChildren();
   const nodes = new Map(),
@@ -39,6 +80,7 @@ function drawMemoryGraph(container, facts, mode, names, openFact) {
         ? "还没有可展示的具体关系。待审校的连线保留在下方事实卡片中；也可切换维度网络。"
         : "这个筛选范围内还没有事实。";
     container.append(p);
+    graphSyncZoom();
     return;
   }
   const ns = "http://www.w3.org/2000/svg";
@@ -69,6 +111,9 @@ function drawMemoryGraph(container, facts, mode, names, openFact) {
   );
   defs.append(marker);
   svg.append(defs);
+  const viewport = element("g", { id: "memory-zoom" });
+  viewport.setAttribute("transform", graphTransform());
+  svg.append(viewport);
   const ordered = [...nodes.values()];
   ordered.forEach((node, i) => {
     const angle = (Math.PI * 2 * i) / ordered.length - Math.PI / 2;
@@ -118,7 +163,7 @@ function drawMemoryGraph(container, facts, mode, names, openFact) {
         openFact(edge.fact);
       }
     };
-    svg.append(group);
+    viewport.append(group);
     edgeGroups.push({ group, edge });
   });
   for (const node of ordered) {
@@ -162,9 +207,27 @@ function drawMemoryGraph(container, facts, mode, names, openFact) {
         edgeGroup.classList.remove("dimmed"),
       );
     group.onblur = group.onmouseleave;
-    svg.append(group);
+    viewport.append(group);
   }
+  svg.addEventListener(
+    "wheel",
+    (event) => {
+      event.preventDefault();
+      const matrix = svg.getScreenCTM();
+      if (!matrix) return;
+      const point = svg.createSVGPoint();
+      point.x = event.clientX;
+      point.y = event.clientY;
+      const local = point.matrixTransform(matrix.inverse());
+      graphZoomAt(local.x, local.y, Math.exp(-event.deltaY * 0.0015));
+      viewport.setAttribute("transform", graphTransform());
+      graphSyncZoom();
+    },
+    { passive: false },
+  );
   container.append(svg);
+  bindGraphSlider(container);
+  graphSyncZoom();
   const caption = document.createElement("small");
   caption.textContent = `${nodes.size} 个节点 · ${Math.min(edges.length, 100)} 条联结。每页最多展示36个节点与100条连线；完整内容见下方卡片和翻页。`;
   container.append(caption);

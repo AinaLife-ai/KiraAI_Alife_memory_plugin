@@ -19,6 +19,7 @@ except ImportError:
     import tomli as tomllib
 
 from .contracts import Fact, dump
+from . import identity
 
 SIMPLE = "kira_plugin_simple_memory"
 KIRAOS = "kira_plugin_kiraos"
@@ -83,7 +84,8 @@ def timestamp(value, fallback):
     return fallback, "file_mtime_estimate"
 
 
-def location(relative, source):
+def raw_location(relative, source):
+    """Raw, source-faithful bucket; hashing and dedup depend on this shape."""
     parts = relative.parts
     if parts[0] == "global":
         return (
@@ -147,8 +149,13 @@ def profile_entries(data):
                 )
 
 
-def snapshot(root: Path, plugin_id: str, limit: int):
-    """Read only named memory sources; each rejected item has an auditable reason."""
+def snapshot(root: Path, plugin_id: str, limit: int, resolver=None):
+    """Read only named memory sources; each rejected item has an auditable reason.
+
+    ``resolver`` maps synthetic buckets onto live identifiers for new imports.
+    Without it the raw legacy identifiers are returned unchanged, and the
+    digest stays identical either way so an upgrade never re-imports data.
+    """
     root = root.resolve()
     paths = (
         [root / "core.txt"]
@@ -184,7 +191,7 @@ def snapshot(root: Path, plugin_id: str, limit: int):
                     (str(i), line, "fact", [])
                     for i, line in enumerate(text.splitlines(), 1)
                 ]
-                sid, visibility, subject, users = (
+                raw_sid, raw_visibility, raw_subject, raw_users = (
                     "legacy:global",
                     "global",
                     "legacy:global",
@@ -202,7 +209,9 @@ def snapshot(root: Path, plugin_id: str, limit: int):
                 source = data.get("source", {})
                 if not isinstance(source, dict):
                     raise ValueError("invalid_source_metadata")
-                sid, visibility, subject, users = location(relative, source)
+                raw_sid, raw_visibility, raw_subject, raw_users = raw_location(
+                    relative, source
+                )
                 ts, time_basis = timestamp(
                     source.get("time", data.get("last_interaction")), mtime
                 )
@@ -229,7 +238,7 @@ def snapshot(root: Path, plugin_id: str, limit: int):
                         "entity": "profile",
                         "task": "commitment",
                         "source": "resource",
-                        "reflection": "self" if subject == "legacy:self" else "profile",
+                        "reflection": "self" if raw_subject == "legacy:self" else "profile",
                     }.get(data.get("type"), data.get("type", "fact"))
                     if category not in (
                         "event",
@@ -245,6 +254,17 @@ def snapshot(root: Path, plugin_id: str, limit: int):
                     entries = [
                         (str(data.get("id", "text")), data.get("text"), category, [])
                     ]
+            if resolver is None:
+                sid, visibility, subject, users = (
+                    raw_sid,
+                    raw_visibility,
+                    raw_subject,
+                    raw_users,
+                )
+            else:
+                sid, visibility, subject, users = resolver.canonical_location(
+                    raw_sid, raw_visibility, raw_subject, raw_users
+                )
             for entry_key, value, category, relationships in entries:
                 item = {
                     "key": key + "#" + entry_key,
@@ -253,7 +273,15 @@ def snapshot(root: Path, plugin_id: str, limit: int):
                 }
                 item["hash"] = hashlib.sha256(
                     dump(
-                        [value, sid, subject, category, tags, relationships, metadata]
+                        [
+                            value,
+                            raw_sid,
+                            raw_subject,
+                            category,
+                            tags,
+                            relationships,
+                            metadata,
+                        ]
                     ).encode()
                 ).hexdigest()
                 try:
@@ -277,6 +305,8 @@ def snapshot(root: Path, plugin_id: str, limit: int):
                         visibility=visibility,
                         subject=subject,
                         users=users,
+                        raw_sid=raw_sid,
+                        raw_subject=raw_subject,
                         content=content,
                         fact=fact,
                         time=ts,
@@ -320,8 +350,8 @@ def import_snapshot(store, snapshot):
                 fingerprint = hashlib.sha256(
                     dump(
                         [
-                            item["sid"],
-                            item["subject"],
+                            item.get("raw_sid", item["sid"]),
+                            item.get("raw_subject", item["subject"]),
                             item["content"],
                             item["fact"]["category"],
                             item["fact"]["relations"],
@@ -330,6 +360,11 @@ def import_snapshot(store, snapshot):
                 ).hexdigest()
                 record_id = "legacy-" + fingerprint
                 store._ensure_entities(db, item["sid"], item["users"])
+                if item["sid"] in (identity.GLOBAL, identity.SELF):
+                    db.execute(
+                        "UPDATE entities SET kind=? WHERE id=?",
+                        (item["sid"], item["sid"]),
+                    )
                 existing = db.execute(
                     "SELECT id FROM records WHERE id=?", (record_id,)
                 ).fetchone()
