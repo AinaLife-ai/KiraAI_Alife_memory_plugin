@@ -52,9 +52,182 @@ def test_host_schema_matches_every_validated_setting():
     schema = json.loads((ROOT / "schema.json").read_text(encoding="utf-8"))
     fields = schema["alife"]["fields"]
     assert set(fields) == set(module.Settings.model_fields)
+    assert set(module.HELP) == set(module.Settings.model_fields)
     for key, spec in fields.items():
         field = create_field_from_schema(key, spec)
         assert field.default == module.Settings().model_dump()[key]
+
+
+@pytest.mark.asyncio
+async def test_global_recall_has_provenance_names_and_no_vector_calls(tmp_path):
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        plugin.store.capture(
+            "test:gm:elsewhere",
+            "seed",
+            [
+                {
+                    "role": "user",
+                    "content": "阿澄喜欢猫，计划周末去猫咖",
+                    "users": ["test:cheng"],
+                    "time": 10.0,
+                }
+            ],
+        )
+        plugin.store.capture(
+            "test:gm:noise",
+            "seed",
+            [
+                {
+                    "role": "user",
+                    "content": "火箭引擎测试完成",
+                    "users": ["test:other"],
+                    "time": 10.0,
+                }
+            ],
+        )
+        plugin.store.observe_name("test:cheng", "阿澄", observed=10.0)
+        event = make_event()
+        request = LLMRequest(user_prompt=[Prompt("问题", name="message")])
+        await plugin.on_request(event, request)
+        import json
+
+        memory = json.loads(
+            next(p.content for p in request.user_prompt if p.name == "alife_memory")
+        )
+        assert memory["scope"] == "global"
+        assert any(
+            r["sid"] == "test:gm:elsewhere" and r["users"] == ["test:cheng"]
+            for r in memory["related_archives"]
+        )
+        assert all(r["sid"] != "test:gm:noise" for r in memory["related_archives"])
+        assert any(n["name"] == "阿澄" for n in memory["names"])
+        assert "阿澄" not in "".join(p.content for p in request.system_prompt)
+        names = json.loads(await plugin.memory_names(event, "阿澄"))["entities"]
+        result = json.loads(
+            await plugin.correct_name(
+                event,
+                "test:cheng",
+                "阿澄的新名字",
+                names[0]["revision"],
+                "本人明确更名",
+            )
+        )
+        assert result["ok"]
+        assert (
+            json.loads(await plugin.memory_names(event, "阿澄"))["entities"][0][
+                "history"
+            ][1]["name"]
+            == "阿澄"
+        )
+        plugin.settings = plugin.settings.model_copy(update={"recall_scope": "session"})
+        assert not json.loads(await plugin.memory_names(event, "阿澄"))["entities"]
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_onebot_name_lookup_uses_adapter_instance_and_preserves_id(tmp_path):
+    calls = []
+
+    async def user_info(user_id):
+        calls.append(user_id)
+        return {"data": {"nickname": "平台新昵称"}}
+
+    manager = types.SimpleNamespace(
+        get_adapter=lambda name: (
+            types.SimpleNamespace(bot=types.SimpleNamespace(get_user_info=user_info))
+            if name == "instance"
+            else None
+        )
+    )
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+        adapter_mgr=manager,
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        plugin.store.observe_name("instance:123", "旧昵称", observed=1.0)
+        n = await plugin.refresh_name("instance:123")
+        assert (
+            n["id"] == "instance:123" and n["name"] == "平台新昵称" and calls == ["123"]
+        )
+        assert len(n["history"]) == 2
+        with pytest.raises(ValueError):
+            await plugin.refresh_name("user:123")
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_name", ["APITimeoutError", "APIConnectionError"])
+async def test_real_provider_sdk_failures_reach_compression_retry(tmp_path, error_name):
+    import openai
+    import httpx
+
+    calls = []
+
+    async def chat(request):
+        calls.append(request)
+        if len(calls) == 1:
+            raise getattr(openai, error_name)(
+                request=httpx.Request("POST", "https://model.invalid")
+            )
+        return LLMResponse(text_response='{"summary":"压缩成功","facts":[]}')
+
+    async def persona():
+        return types.SimpleNamespace(content="固定人格")
+
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+        get_default_fast_llm_client=lambda: types.SimpleNamespace(chat=chat),
+        persona_mgr=types.SimpleNamespace(get_persona=persona),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx,
+        {
+            "alife": {
+                "probability": 0.0,
+                "audit_enabled": False,
+                "threshold": 4,
+                "batch_size": 2,
+                "model_retries": 1,
+            }
+        },
+    )
+    await plugin.initialize()
+    try:
+        plugin.store.capture(
+            "test:gm:1",
+            "x",
+            [
+                {
+                    "role": "user",
+                    "content": "完整原文",
+                    "users": ["test:u"],
+                    "time": 1.0,
+                }
+                for _ in range(4)
+            ],
+        )
+        await plugin.engine.compress("test:gm:1")
+        assert len(calls) == 2 and any(
+            r["level"] == 1 for r in plugin.store.active("test:gm:1")
+        )
+    finally:
+        await plugin.terminate()
 
 
 @pytest.mark.asyncio
@@ -96,6 +269,8 @@ async def test_real_core_capture_inject_edit_reload(tmp_path, monkeypatch):
         assert json.loads(await plugin.read_archive(event, record_id))["ok"]
         other = make_event()
         other.session.session_id = "other"
+        assert json.loads(await plugin.read_archive(other, record_id))["ok"]
+        plugin.settings = plugin.settings.model_copy(update={"recall_scope": "session"})
         assert not json.loads(await plugin.read_archive(other, record_id))["ok"]
     finally:
         await plugin.terminate()
@@ -161,6 +336,29 @@ async def test_api_validation_conflict_and_atomic_config(tmp_path, monkeypatch):
             edit["revision"] = 2
             edit["patch"] = {"summary": 22}
             assert (await client.post("/edit", json=edit)).status_code == 422
+            fact = {
+                "category": "relationship",
+                "subject": "test:u",
+                "content": "需要审校的旧关系",
+                "reason": "",
+                "scenario": "",
+                "tags": [],
+                "relations": [
+                    {"subject": "Bot", "predicate": "认为", "object": "小明"}
+                ],
+                "source_ids": [record_id],
+            }
+            with plugin.store.connect() as db:
+                fact_id = plugin.store._add_fact(db, "test:dm:u", fact)
+            edit.update(
+                kind="fact",
+                target=fact_id,
+                revision=1,
+                patch={"deleted": True, "category": "drift"},
+            )
+            assert (await client.post("/edit", json=edit)).status_code == 422
+            edit["patch"] = {"deleted": True}
+            assert (await client.post("/edit", json=edit)).status_code == 200
     finally:
         await plugin.terminate()
 

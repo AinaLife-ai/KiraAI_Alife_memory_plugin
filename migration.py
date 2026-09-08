@@ -329,6 +329,7 @@ def import_snapshot(store, snapshot):
                     ).encode()
                 ).hexdigest()
                 record_id = "legacy-" + fingerprint
+                store._ensure_entities(db, item["sid"], item["users"])
                 existing = db.execute(
                     "SELECT id FROM records WHERE id=?", (record_id,)
                 ).fetchone()
