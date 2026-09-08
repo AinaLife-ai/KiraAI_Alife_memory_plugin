@@ -78,20 +78,22 @@ async def test_followup_recall_returns_new_records_and_tools_continue(tmp_path):
             next(p.content for p in req.user_prompt if p.name == "alife_memory")
         )
         first_ids = {r["id"] for r in first["related_archives"]}
-        event.messages[0].chain = MessageChain([Text("还有别的吗？")])
-        event.messages[0].message_str = "[小明] 还有别的吗？"
+        assert first_ids
         req2 = LLMRequest()
         await plugin.on_request(event, req2)
-        second = json.loads(
-            next(p.content for p in req2.user_prompt if p.name == "alife_memory")
-        )
-        second_ids = {r["id"] for r in second["related_archives"]}
-        assert first_ids and second_ids and not first_ids & second_ids
-        assert second["recall_continuation"]
-        tool = json.loads(await plugin.search_archive(event, next_batch=True, count=2))
-        assert tool["ok"] and len(tool["items"]) == 2
-        assert not {r["id"] for r in tool["items"]} & (first_ids | second_ids)
         assert req.system_prompt[0].content == req2.system_prompt[0].content
+        # 已经注入过的记忆不再重复返回
+        tool = json.loads(await plugin.search_archive(event, keyword="猫", count=2))
+        assert tool["ok"] and tool["items"]
+        tool_ids = {r["id"] for r in tool["items"]}
+        assert not tool_ids & first_ids
+        tool2 = json.loads(await plugin.search_archive(event, keyword="猫", count=2))
+        assert not {r["id"] for r in tool2["items"]} & (tool_ids | first_ids)
+        # 显式重看仍然可以
+        tool3 = json.loads(
+            await plugin.search_archive(event, keyword="猫", count=2, allow_seen=True)
+        )
+        assert {r["id"] for r in tool3["items"]} & (tool_ids | first_ids)
     finally:
         await plugin.terminate()
 
@@ -140,13 +142,13 @@ async def test_continuation_excludes_local_context_and_direct_reads(tmp_path):
         )
         request = LLMRequest()
         await plugin.on_request(event, request)
-        result = json.loads(await plugin.search_archive(event, next_batch=True))
+        result = json.loads(await plugin.search_archive(event, keyword="猫"))
         assert local not in {r["id"] for r in result["items"]}
         other = plugin.store.memorize(
             "test:gm:other", "我喜欢猫的别处记忆", ["test:v"], 2.0, 2.0
         )
         await plugin.read_archive(event, other)
-        result = json.loads(await plugin.search_archive(event, next_batch=True))
+        result = json.loads(await plugin.search_archive(event, keyword="猫"))
         assert other not in {r["id"] for r in result["items"]}
     finally:
         await plugin.terminate()
@@ -185,17 +187,10 @@ async def test_followup_facts_excluded_before_limit(tmp_path):
                     ),
                 )
         event = make_event()
-        seen = []
-        for _ in range(3):
-            req = LLMRequest()
-            await plugin.on_request(event, req)
-            perception = json.loads(
-                next(p.content for p in req.user_prompt if p.name == "alife_memory")
-            )
-            seen.append({f["id"] for f in perception["facts"]})
-            event.messages[0].chain = MessageChain([Text("还有别的吗？")])
-            event.messages[0].message_str = "[小明] 还有别的吗？"
-        assert [len(x) for x in seen] == [2, 2, 0] and not seen[0] & seen[1]
+        first = json.loads(await plugin.overview(event))
+        second = json.loads(await plugin.overview(event))
+        assert len(first["facts"]) == 2 and first["already_seen"] == 0
+        assert second["facts"] == [] and second["already_seen"] == 2
     finally:
         await plugin.terminate()
 

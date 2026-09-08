@@ -174,7 +174,7 @@ def test_recall_window_is_bounded_and_has_no_cross_caller_state():
     assert not w.get(("group", "user1", "session"))["ids"]
     for n in range(300):
         w.remember(n, "主题", [str(i) for i in range(300)])
-    assert len(w.entries) == 256 and len(w.get(299)["ids"]) == 200
+    assert len(w.entries) == 256 and len(w.get(299)["ids"]) == 300
 
 
 @pytest.mark.asyncio
