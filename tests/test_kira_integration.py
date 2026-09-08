@@ -1,0 +1,451 @@
+"""Run with KIRA_CORE pointing at a real checkout; no fake core modules."""
+
+import importlib
+import os
+import sys
+import types
+from pathlib import Path
+import pytest
+
+CORE = os.environ.get("KIRA_CORE")
+if not CORE:
+    pytest.skip("set KIRA_CORE for actual host integration", allow_module_level=True)
+sys.path.insert(0, str(Path(CORE).resolve()))
+ROOT = Path(__file__).resolve().parents[1]
+package = types.ModuleType("alife_host_test")
+package.__path__ = [str(ROOT)]
+sys.modules.setdefault("alife_host_test", package)
+module = importlib.import_module("alife_host_test.main")
+from core.provider import LLMRequest, LLMResponse
+from core.agent.message import OpenAIMessage
+from core.prompt_manager import Prompt
+from core.chat import MessageChain
+from core.chat.message_elements import Text
+from core.chat.message_utils import KiraIMMessage, KiraMessageBatchEvent
+from core.chat.session import User, Session
+
+
+@pytest.fixture(autouse=True)
+def isolated_legacy_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "get_data_path", lambda: tmp_path / "host-data")
+
+
+def make_event():
+    session = Session(adapter_name="test", session_type="dm", session_id="u")
+    msg = KiraIMMessage(
+        message_id="one",
+        self_id="bot",
+        chain=MessageChain([Text("我喜欢猫")]),
+        timestamp=100,
+        sender=User(user_id="u", nickname="小明"),
+    )
+    msg.message_str = "[小明] 我喜欢猫"
+    return KiraMessageBatchEvent(
+        messages=[msg], session=session, timestamp=100, message_types=[]
+    )
+
+
+def test_host_schema_matches_every_validated_setting():
+    import json
+    from core.config.config_field import create_field_from_schema
+
+    schema = json.loads((ROOT / "schema.json").read_text(encoding="utf-8"))
+    fields = schema["alife"]["fields"]
+    assert set(fields) == set(module.Settings.model_fields)
+    for key, spec in fields.items():
+        field = create_field_from_schema(key, spec)
+        assert field.default == module.Settings().model_dump()[key]
+
+
+@pytest.mark.asyncio
+async def test_real_core_capture_inject_edit_reload(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "get_config_path", lambda: tmp_path / "config")
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        event = make_event()
+        await plugin.on_response(
+            event, LLMResponse(text_response="我记住啦", agent_step_index=0)
+        )
+        await plugin.on_response(
+            event, LLMResponse(text_response="我记住啦", agent_step_index=0)
+        )
+        assert plugin.store.status()["records"] == 2
+        req = LLMRequest(
+            messages=[OpenAIMessage(role="assistant", content="core history")]
+        )
+        req.user_prompt = [Prompt("新一轮", name="message")]
+        await plugin.on_request(event, req)
+        assert [m.content for m in req.messages] == ["core history"]
+        injected = [p for p in req.user_prompt if p.name == "alife_memory"]
+        assert len(injected) == 1 and not injected[0].persist
+        assert "我喜欢猫" in injected[0].content
+        req.assemble_prompt()
+        assert req.messages[-1].role == "user"
+        result = await plugin.memorize(event, "一起看流星的约定")
+        import json
+
+        record_id = json.loads(result)["id"]
+        assert json.loads(await plugin.forget(event, record_id))["ok"]
+        assert json.loads(await plugin.read_archive(event, record_id))["ok"]
+        other = make_event()
+        other.session.session_id = "other"
+        assert not json.loads(await plugin.read_archive(other, record_id))["ok"]
+    finally:
+        await plugin.terminate()
+    plugin2 = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin2.initialize()
+    try:
+        assert plugin2.store.status()["records"] == 3
+    finally:
+        await plugin2.terminate()
+
+
+@pytest.mark.asyncio
+async def test_api_validation_conflict_and_atomic_config(tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from httpx import AsyncClient, ASGITransport
+
+    monkeypatch.setattr(module, "get_config_path", lambda: tmp_path / "config")
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    app = FastAPI()
+    app.post("/config")(plugin.api_save_config)
+    app.post("/memory")(plugin.api_new)
+    app.post("/edit")(plugin.api_edit)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            config = await plugin.api_config()
+            config["settings"]["compress_model"] = "provider:compress"
+            response = await client.post(
+                "/config",
+                json={"revision": config["revision"], "settings": config["settings"]},
+            )
+            assert response.status_code == 200
+            assert plugin.settings.compress_model == "provider:compress"
+            assert (tmp_path / "config/plugins/alife_memory_z.json").exists()
+            response = await client.post(
+                "/config",
+                json={"revision": config["revision"], "settings": config["settings"]},
+            )
+            assert response.status_code == 409
+            response = await client.post(
+                "/memory", json={"sid": "test:dm:u", "content": "人工记忆"}
+            )
+            record_id = response.json()["id"]
+            edit = {
+                "kind": "record",
+                "target": record_id,
+                "revision": 1,
+                "patch": {"summary": "修改后的记忆"},
+                "reason": "test",
+            }
+            assert (await client.post("/edit", json=edit)).status_code == 200
+            assert (await client.post("/edit", json=edit)).status_code == 409
+            edit["revision"] = 2
+            edit["patch"] = {"summary": 22}
+            assert (await client.post("/edit", json=edit)).status_code == 422
+    finally:
+        await plugin.terminate()
+
+
+class LegacyManager:
+    def __init__(self):
+        self.plugin_configs = {}
+        self.states = {pid: True for pid in module.SOURCES}
+        self.calls = []
+
+    def has_plugin(self, pid):
+        return pid in self.states
+
+    def is_plugin_enabled(self, pid):
+        return self.states.get(pid, False)
+
+    async def set_plugin_enabled(self, pid, enabled):
+        self.calls.append((pid, enabled))
+        self.states[pid] = enabled
+
+
+@pytest.mark.asyncio
+async def test_safe_migration_disables_after_commit_and_yields_to_user_switch(tmp_path):
+    import json
+
+    root = tmp_path / "host-data/memory"
+    root.mkdir(parents=True)
+    original = b"We agreed to walk on Sunday\n"
+    (root / "core.txt").write_bytes(original)
+    manager = LegacyManager()
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path / "plugin", plugin_mgr=manager
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    original_toggle = manager.set_plugin_enabled
+
+    async def toggle(pid, enabled):
+        if not enabled:
+            # The replacement must already be committed before disabling the source.
+            assert plugin.store.search(scope="global", keyword="Sunday")["total"] == 1
+        await original_toggle(pid, enabled)
+
+    manager.set_plugin_enabled = toggle
+    await plugin.initialize()
+    try:
+        assert not any(manager.states.values())
+        assert plugin.runtime_settings().enabled
+        event = make_event()
+        assert (
+            json.loads(await plugin.search_archive(event, keyword="Sunday"))["total"]
+            == 1
+        )
+        assert any(
+            "Sunday" in f["content"]
+            for f in json.loads(await plugin.overview(event))["facts"]
+        )
+        assert (root / "core.txt").read_bytes() == original
+        # Re-enabling a legacy plugin is a user choice, not a disable-loop trigger.
+        manager.states[module.SOURCES[0]] = True
+        assert not plugin.runtime_settings().enabled
+        req = LLMRequest(user_prompt=[Prompt("new", name="message")])
+        await plugin.on_request(event, req)
+        assert not req.system_prompt and len(req.user_prompt) == 1
+        assert (
+            json.loads(await plugin.memorize(event, "do not write"))["error"]
+            == "memory_paused"
+        )
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_malformed_migration_keeps_original_enabled_then_retry(tmp_path):
+    root = tmp_path / "host-data/memory/entities/user_test%3Au/facts"
+    root.mkdir(parents=True)
+    broken = root / "bad.toml"
+    broken.write_text('text = "broken', encoding="utf-8")
+    manager = LegacyManager()
+    plugin = module.AlifeMemoryPlugin(
+        types.SimpleNamespace(
+            get_plugin_data_dir=lambda: tmp_path / "plugin", plugin_mgr=manager
+        ),
+        {"alife": {"probability": 0.0, "audit_enabled": False}},
+    )
+    await plugin.initialize()
+    try:
+        assert all(manager.states.values()) and manager.calls == []
+        assert plugin.migration_blocked and not plugin.runtime_settings().enabled
+        assert (await plugin.api_status())["migration"]["reports"][
+            0 if module.SOURCES[1] < module.SOURCES[0] else 1
+        ]["errors"]
+        broken.write_text('text = "用户喜欢猫"', encoding="utf-8")
+        await plugin.api_migrate()
+        assert not plugin.migration_blocked and not any(manager.states.values())
+        assert "用户喜欢猫" in str(plugin.store.context("test:dm:u", ["test:u"]))
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_failed_final_snapshot_restores_disabled_plugins(tmp_path):
+    root = tmp_path / "host-data/memory"
+    root.mkdir(parents=True)
+    (root / "core.txt").write_text("an original fact", encoding="utf-8")
+    manager = LegacyManager()
+    original = manager.set_plugin_enabled
+
+    async def toggle(pid, enabled):
+        await original(pid, enabled)
+        if not enabled and pid == module.SOURCES[1]:
+            # Simulate a legacy writer flushing malformed data on terminate.
+            folder = root / "entities/user_test%3Au/facts"
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "bad.toml").write_text('text = "broken', encoding="utf-8")
+
+    manager.set_plugin_enabled = toggle
+    plugin = module.AlifeMemoryPlugin(
+        types.SimpleNamespace(
+            get_plugin_data_dir=lambda: tmp_path / "plugin", plugin_mgr=manager
+        ),
+        {"alife": {"probability": 0.0, "audit_enabled": False}},
+    )
+    await plugin.initialize()
+    try:
+        assert plugin.migration_blocked and all(manager.states.values())
+        assert plugin.store.search(scope="global", keyword="original")["total"] == 1
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_memory_keeps_system_and_history_stable(tmp_path):
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        event = make_event()
+        key = plugin.store.memorize(event.sid, "第一条永久记忆", ["test:u"], 1.0, 1.0)
+
+        def request():
+            return LLMRequest(
+                messages=[
+                    OpenAIMessage(role="user", content="原历史"),
+                    OpenAIMessage(role="assistant", content="原回复"),
+                ],
+                system_prompt=[Prompt("稳定人格与工具说明", name="stable")],
+                user_prompt=[Prompt("当轮问题", name="message")],
+            )
+
+        one = request()
+        await plugin.on_request(event, one)
+        one.assemble_prompt()
+        plugin.store.edit("record", key, 1, {"summary": "修改后的永久记忆"}, "test")
+        plugin.store.capture(
+            event.sid,
+            "new",
+            [
+                {
+                    "role": "assistant",
+                    "content": "新感知",
+                    "time": 2.0,
+                    "users": ["test:u"],
+                }
+            ],
+        )
+        two = request()
+        await plugin.on_request(event, two)
+        two.assemble_prompt()
+        assert one.messages[0].content == two.messages[0].content
+        assert (
+            "修改后的永久记忆" not in two.messages[0].content
+            and "新感知" not in two.messages[0].content
+        )
+        assert [(x.role, x.content) for x in one.messages[1:-1]] == [
+            (x.role, x.content) for x in two.messages[1:-1]
+        ]
+        assert "修改后的永久记忆" in two.messages[-1].content
+        assert two.messages[-1].content.index("新感知") < two.messages[
+            -1
+        ].content.index("当轮问题")
+        assert all(not p.persist for p in two.user_prompt if p.name.startswith("alife"))
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_optional_vectors_never_call_provider_when_disabled(tmp_path):
+    import asyncio
+    import json
+    from fastapi import HTTPException
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("embedding provider must not be resolved")
+
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+        get_default_embedding_client=forbidden,
+        get_embedding_client=forbidden,
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        event = make_event()
+        key = plugin.store.memorize(event.sid, "用户喜欢橘猫", ["test:u"], 1.0, 1.0)
+        assert (
+            json.loads(await plugin.search_archive(event, prompt="橘猫"))["total"] == 1
+        )
+        await plugin.engine.index(key, plugin.settings)
+        job = await plugin.engine.enqueue("reindex", event.sid)
+        for _ in range(100):
+            rows = plugin.store.status()["jobs"]
+            if any(j["id"] == job and j["state"] == "completed" for j in rows):
+                break
+            await asyncio.sleep(0.01)
+        assert any(j["id"] == job and "no model called" in j["detail"] for j in rows)
+        assert plugin.store.search(sid=event.sid, lexical="橘猫")["total"] == 1
+
+        async def body(*args):
+            return module.Job(kind="reindex", sid=event.sid)
+
+        plugin.body = body
+        with pytest.raises(HTTPException) as error:
+            await plugin.api_job(None)
+        assert error.value.status_code == 409
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_vector_opt_in_and_disable_discards_inflight_index(tmp_path):
+    calls = []
+    plugin = None
+
+    class Client:
+        model = types.SimpleNamespace(provider_id="p", model_id="v")
+
+        async def embed(self, texts):
+            calls.append(texts)
+            return [[1.0, 0.0]]
+
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+        get_default_embedding_client=lambda: Client(),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx,
+        {
+            "alife": {
+                "probability": 0.0,
+                "audit_enabled": False,
+                "semantic_enabled": True,
+            }
+        },
+    )
+    await plugin.initialize()
+    try:
+        key = plugin.store.memorize("s", "opt in", [], 1.0, 1.0)
+        await plugin.engine.index(key, plugin.settings)
+        with plugin.store.connect() as db:
+            assert db.execute("SELECT count(*) FROM vectors").fetchone()[0] == 1
+        assert len(calls) == 1
+        key2 = plugin.store.memorize("s", "disabled during request", [], 2.0, 2.0)
+
+        async def disabling_embed(*args):
+            plugin.settings = plugin.settings.model_copy(
+                update={"semantic_enabled": False}
+            )
+            return [1.0, 0.0], "p:v"
+
+        plugin.engine.embed = disabling_embed
+        await plugin.engine.index(key2, plugin.settings)
+        with plugin.store.connect() as db:
+            assert db.execute("SELECT count(*) FROM vectors").fetchone()[0] == 1
+        await plugin.engine.index(key2, plugin.settings)
+        assert len(calls) == 1
+    finally:
+        await plugin.terminate()
