@@ -23,7 +23,8 @@ def looks_like_memory_payload(text):
     head = (text or "")[:4000]
     if head.startswith(TOOL_RESULT_PREFIX):
         head = head[len(TOOL_RESULT_PREFIX) :].lstrip()
-    return head.startswith('{"ok":true') and any(
+    # Tolerate different serializers (with or without spaces after ':').
+    return head[:200].replace(" ", "").startswith('{"ok":true') and any(
         marker in head for marker in _MEMORY_PAYLOAD_MARKERS
     )
 
