@@ -47,6 +47,7 @@ const fields = {
   session_affinity: "全局召回优先当前会话",
   permanent_dedupe: "自动合并相似永久记忆",
   dedupe_threshold: "永久记忆相似度阈值",
+  search_active_only: "检索默认只搜常驻",
 };
 let ctx = null,
   tab = "home",

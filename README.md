@@ -6,7 +6,9 @@
 
 永久记忆不再重复堆积：`Memorize` 遇到完全相同的永久记忆直接返回已有条目（被 Forget 过的会恢复），不新增；新增后台任务 `dedupe` 用**审计模型**检查相似的永久记忆，确属同一件事的重复或更正时自动合并——保留最新一条、其余移出常驻上下文（原文与版本保留）。开关 `permanent_dedupe`（默认开）与阈值 `dedupe_threshold`（默认 0.25）可在设置页热更改；后台任务页可手动触发。
 
-详见[永久记忆去重与自动合并](docs/PERMANENT_DEDUPE_2_2_3.md)。
+**检索范围**：默认只搜常驻上下文，已归档的旧记忆需要显式 `include_archived=true` 才返回（结果带 `archived` 标记）；配置项 `search_active_only` 默认开启，关闭则恢复旧行为。对齐 Alife 原版"不翻旧账"的语义。
+
+详见[永久记忆去重与自动合并](docs/PERMANENT_DEDUPE_2_2_3.md) 与 [检索范围](docs/ARCHIVE_SCOPE_2_2_3.md)。
 
 ## 2.2.2 更新
 

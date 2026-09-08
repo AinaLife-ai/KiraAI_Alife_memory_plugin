@@ -145,6 +145,7 @@ class Settings(Strict):
     session_affinity: bool = False
     permanent_dedupe: bool = True
     dedupe_threshold: float = Field(default=0.25, ge=0.1, le=0.95)
+    search_active_only: bool = True
 
     @model_validator(mode="after")
     def valid_batch(self):

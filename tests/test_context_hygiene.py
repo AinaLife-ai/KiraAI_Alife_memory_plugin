@@ -1,5 +1,6 @@
 """Context hygiene: tool payloads never flood the injected memory block."""
 
+import asyncio
 import importlib
 import json
 import sys
@@ -12,6 +13,8 @@ package.__path__ = [str(ROOT)]
 sys.modules.setdefault("alife_hygiene_test", package)
 s = importlib.import_module("alife_hygiene_test.storage")
 r = importlib.import_module("alife_hygiene_test.retrieval")
+e = importlib.import_module("alife_hygiene_test.engine")
+c = importlib.import_module("alife_hygiene_test.contracts")
 
 PREFIX = r.TOOL_RESULT_PREFIX
 SID = "qq:gm:188395693"
@@ -167,6 +170,43 @@ def test_totals_and_top_users_respect_scope(tmp_path):
     assert session["sessions"] == 1 and session["groups"] == 1
     whole = store.totals(SID, ["qq:1"], "global")
     assert whole["records"] == 5 and whole["users"] == 3 and whole["sessions"] == 2
+
+
+def test_search_hides_archived_until_explicit(tmp_path):
+    store = s.Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    for i in range(4):
+        store.capture(
+            SID,
+            f"ev{i}",
+            [
+                {
+                    "role": "user",
+                    "content": f"绿岛酒吧 第{i}条经历",
+                    "time": float(i),
+                    "users": ["qq:1"],
+                }
+            ],
+        )
+    cfg = c.Settings(threshold=4, batch_size=2, model_retries=0)
+
+    async def model(*args):
+        return json.dumps(
+            {"summary": "两条经历的合并摘要：绿岛酒吧", "facts": []}, ensure_ascii=False
+        )
+
+    asyncio.run(e.Engine(store, lambda: cfg, model, None, None).compress(SID))
+    archived = [
+        row
+        for row in store.export()["records"]
+        if row["level"] == 0 and row["active"] == 0
+    ]
+    assert len(archived) == 2
+
+    live = store.search(keyword="绿岛酒吧", scope="global", limit=10, active=True)
+    assert live["total"] == 3 and all(item["active"] == 1 for item in live["items"])
+    everything = store.search(keyword="绿岛酒吧", scope="global", limit=10)
+    assert everything["total"] == 5
 
 
 def test_session_affinity_reorders_without_narrowing(tmp_path):

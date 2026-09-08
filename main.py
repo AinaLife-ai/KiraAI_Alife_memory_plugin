@@ -589,13 +589,25 @@ class AlifeMemoryPlugin(BasePlugin):
                 limit=cfg.top_k * 2,
                 exclude_sid="" if continuation else sid,
                 exclude_ids=previous["ids"] if continuation else (),
+                active=cfg.search_active_only,
                 **prefer,
             )
             local_ids = {r["id"] for r in rows}
             related = [
                 {
-                    k: r[k]
-                    for k in ("id", "sid", "users", "summary", "start", "end", "level")
+                    **{
+                        k: r[k]
+                        for k in (
+                            "id",
+                            "sid",
+                            "users",
+                            "summary",
+                            "start",
+                            "end",
+                            "level",
+                        )
+                    },
+                    "archived": not r["active"],
                 }
                 for r in matches["items"]
                 if continuation or r["id"] not in local_ids
@@ -911,7 +923,7 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @register.tool(
         name="SearchMemoryArchive",
-        description="按关键词、层级、时间范围搜索存档；prompt 默认本地词语匹配排序。可翻页，返回总数。",
+        description="按关键词、层级、时间范围搜索存档；默认只搜常驻上下文，需要翻已归档的旧记忆时传 include_archived=true。prompt 默认本地词语匹配排序，可翻页并返回总数。",
         params={
             "type": "object",
             "properties": {
@@ -931,6 +943,10 @@ class AlifeMemoryPlugin(BasePlugin):
                 "count": {"type": "integer", "minimum": 1, "maximum": 30},
                 "start": {"type": "number", "description": "Unix seconds"},
                 "end": {"type": "number", "description": "Unix seconds"},
+                "include_archived": {
+                    "type": "boolean",
+                    "description": "包含已归档的旧记忆；默认只搜常驻",
+                },
             },
             "additionalProperties": False,
         },
@@ -947,11 +963,12 @@ class AlifeMemoryPlugin(BasePlugin):
         end=None,
         exclude_ids=None,
         next_batch=False,
+        include_archived=False,
     ):
         if not self.runtime_settings().enabled:
             return self.recall_result(event, {"ok": False, "error": "memory_paused"})
         try:
-            if type(next_batch) is not bool or (
+            if type(next_batch) is not bool or type(include_archived) is not bool or (
                 exclude_ids is not None
                 and (
                     not isinstance(exclude_ids, list)
@@ -1000,22 +1017,27 @@ class AlifeMemoryPlugin(BasePlugin):
                 model=model,
                 lexical=q.prompt if not vector else "",
                 exclude_ids=excluded,
+                # Archived memories are hidden unless explicitly requested.
+                active=self.settings.search_active_only and not include_archived,
             )
             result["items"] = [
                 {
-                    k: r[k]
-                    for k in (
-                        "id",
-                        "sid",
-                        "role",
-                        "level",
-                        "start",
-                        "end",
-                        "summary",
-                        "users",
-                        "revision",
-                        "permanent",
-                    )
+                    **{
+                        k: r[k]
+                        for k in (
+                            "id",
+                            "sid",
+                            "role",
+                            "level",
+                            "start",
+                            "end",
+                            "summary",
+                            "users",
+                            "revision",
+                            "permanent",
+                        )
+                    },
+                    "archived": not r["active"],
                 }
                 for r in result["items"]
             ]

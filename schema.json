@@ -262,6 +262,12 @@
         "description": "相似度阈值：越高越保守。0.25 只把疑似重复的永久记忆交给模型判断，最终是否合并由模型决定。",
         "minimum": 0.1,
         "maximum": 0.95
+      },
+      "search_active_only": {
+        "type": "switch",
+        "name": "检索默认只搜常驻",
+        "default": true,
+        "description": "开启后，记忆检索默认只搜常驻上下文（近期原文、活跃摘要、永久记忆）；已归档的旧记忆需要显式 include_archived=true 才会返回。关闭则默认连归档一起搜。"
       }
     }
   }
