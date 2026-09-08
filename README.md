@@ -8,7 +8,9 @@
 
 **检索范围**：默认只搜常驻上下文，已归档的旧记忆需要显式 `include_archived=true` 才返回（结果带 `archived` 标记）；配置项 `search_active_only` 默认开启，关闭则恢复旧行为。对齐 Alife 原版"不翻旧账"的语义。
 
-详见[永久记忆去重与自动合并](docs/PERMANENT_DEDUPE_2_2_3.md) 与 [检索范围](docs/ARCHIVE_SCOPE_2_2_3.md)。
+**冷归档**：被 Forget 或被合并取代的记忆立即冷归档；归档满 `cold_after_days`（默认 180 天）后自动冷归档。冷归档**任何检索都搜不到，只能按存档 ID 读取**，原文与版本全部保留，WebUI 可一键恢复常驻。
+
+详见[永久记忆去重与自动合并](docs/PERMANENT_DEDUPE_2_2_3.md)、[检索范围](docs/ARCHIVE_SCOPE_2_2_3.md) 与 [冷归档](docs/COLD_ARCHIVE_2_2_3.md)。
 
 ## 2.2.2 更新
 

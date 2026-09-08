@@ -146,6 +146,7 @@ class Settings(Strict):
     permanent_dedupe: bool = True
     dedupe_threshold: float = Field(default=0.25, ge=0.1, le=0.95)
     search_active_only: bool = True
+    cold_after_days: int = Field(default=180, ge=0, le=3650)
 
     @model_validator(mode="after")
     def valid_batch(self):

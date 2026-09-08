@@ -67,6 +67,7 @@ def test_merge_records_keeps_newest_and_archives_rest(tmp_path):
     assert rows[newest]["content"] == TEXTS[-1]  # archive text untouched
     for old in ids[:-1]:
         assert rows[old]["active"] == 0 and rows[old]["content"] in TEXTS
+        assert rows[old]["cold"] == 1  # superseded memories go cold immediately
     assert [row["id"] for row in store.permanent_records(SID)] == [newest]
     history = store.edit_history("record", ids)
     assert all(history.get(rid) for rid in ids)

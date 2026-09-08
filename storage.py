@@ -120,16 +120,28 @@ class Store:
               observed REAL NOT NULL, reason TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS name_entity ON entity_names(entity_id,observed DESC);
             """)
-            if "visibility" not in {
-                r[1] for r in db.execute("PRAGMA table_info(records)")
-            }:
+            columns = {r[1] for r in db.execute("PRAGMA table_info(records)")}
+            if "visibility" not in columns:
                 db.execute(
                     "ALTER TABLE records ADD COLUMN visibility TEXT NOT NULL DEFAULT 'session'"
+                )
+            if "cold" not in columns:
+                db.execute(
+                    "ALTER TABLE records ADD COLUMN cold INTEGER NOT NULL DEFAULT 0"
+                )
+            if "archived_at" not in columns:
+                db.execute(
+                    "ALTER TABLE records ADD COLUMN archived_at REAL NOT NULL DEFAULT 0"
+                )
+                # Existing archives start their 180-day clock at upgrade time.
+                db.execute(
+                    "UPDATE records SET archived_at=? WHERE active=0 AND archived_at=0",
+                    (time.time(),),
                 )
             db.execute(
                 "UPDATE jobs SET state='queued',detail='resumed after restart' WHERE state='running'"
             )
-            db.execute("PRAGMA user_version=4")
+            db.execute("PRAGMA user_version=5")
             db.execute(
                 "INSERT OR IGNORE INTO entities(id,kind,name,updated) SELECT DISTINCT value,'user','',0 FROM records,json_each(records.users)"
             )
@@ -971,13 +983,16 @@ class Store:
                 "UPDATE records SET visibility=? WHERE id=?",
                 (visibility.pop(), archive_id),
             )
+            archived_at = time.time()
             for index, row in enumerate(candidates):
                 db.execute(
                     "INSERT INTO edges VALUES (?,?,?)", (archive_id, row["id"], index)
                 )
                 db.execute(
-                    "UPDATE records SET active=0,revision=revision+1 WHERE id=?",
-                    (row["id"],),
+                    "UPDATE records SET active=0,revision=revision+1,"
+                    "archived_at=CASE WHEN archived_at>0 THEN archived_at ELSE ? END "
+                    "WHERE id=?",
+                    (archived_at, row["id"]),
                 )
                 db.execute(
                     "UPDATE vectors SET revision=revision+1 WHERE id=?", (row["id"],)
@@ -1075,12 +1090,14 @@ class Store:
                 "UPDATE records SET summary=?,revision=revision+1 WHERE id=?",
                 (content, target_id),
             )
+            folded_at = time.time()
             for record_id in ids:
                 if record_id == target_id:
                     continue
                 db.execute(
-                    "UPDATE records SET active=0,revision=revision+1 WHERE id=?",
-                    (record_id,),
+                    "UPDATE records SET active=0,cold=1,archived_at=?,"
+                    "revision=revision+1 WHERE id=?",
+                    (folded_at, record_id),
                 )
                 db.execute("DELETE FROM vectors WHERE id=?", (record_id,))
             self.bump(db)
@@ -1119,9 +1136,18 @@ class Store:
                 "INSERT INTO versions(kind,target,snapshot,reason,created) VALUES (?,?,?,?,?)",
                 (kind, target, dump(dict(old)), reason, time.time()),
             )
-            values = [dump(v) if isinstance(v, list) else v for v in patch.values()]
+            updates = dict(patch)
+            if kind == "record" and "active" in patch:
+                # Forget means "keep the archive but stop surfacing it"; restore revives it.
+                if patch["active"]:
+                    updates.update(cold=0, archived_at=0.0)
+                else:
+                    updates.update(cold=1, archived_at=time.time())
+            values = [
+                dump(v) if isinstance(v, list) else v for v in updates.values()
+            ]
             db.execute(
-                f"UPDATE {table} SET {','.join(k + '=?' for k in patch)},revision=revision+1 WHERE id=?",
+                f"UPDATE {table} SET {','.join(k + '=?' for k in updates)},revision=revision+1 WHERE id=?",
                 (*values, target),
             )
             if kind == "fact":
@@ -1172,8 +1198,18 @@ class Store:
         exclude_ids=(),
         prefer_sid="",
         prefer_users=(),
+        cold_after_days=0,
+        include_cold=False,
     ):
         clauses, args = ["deleted=0"], []
+        if not include_cold:
+            clauses.append("cold=0")
+            if cold_after_days:
+                # Archives fade out of search after the configured storage age.
+                clauses.append(
+                    "NOT (active=0 AND archived_at>0 AND archived_at<=?)"
+                )
+                args.append(time.time() - cold_after_days * 86400)
         if exclude_ids:
             clauses.append("id NOT IN (SELECT value FROM json_each(?))")
             args.append(dump(list(exclude_ids)))

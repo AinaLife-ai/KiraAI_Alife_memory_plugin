@@ -590,6 +590,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 exclude_sid="" if continuation else sid,
                 exclude_ids=previous["ids"] if continuation else (),
                 active=cfg.search_active_only,
+                cold_after_days=cfg.cold_after_days,
                 **prefer,
             )
             local_ids = {r["id"] for r in rows}
@@ -1017,8 +1018,10 @@ class AlifeMemoryPlugin(BasePlugin):
                 model=model,
                 lexical=q.prompt if not vector else "",
                 exclude_ids=excluded,
-                # Archived memories are hidden unless explicitly requested.
+                # Archived memories are hidden unless explicitly requested;
+                # cold archives are never searchable.
                 active=self.settings.search_active_only and not include_archived,
+                cold_after_days=self.settings.cold_after_days,
             )
             result["items"] = [
                 {
@@ -1314,6 +1317,8 @@ class AlifeMemoryPlugin(BasePlugin):
             vector=vector,
             model=model,
             lexical=q.prompt if not vector else "",
+            # The admin UI browses everything, including cold archives.
+            include_cold=True,
         )
         ids = {u for r in result["items"] for u in r["users"]} | {
             r["sid"] for r in result["items"]

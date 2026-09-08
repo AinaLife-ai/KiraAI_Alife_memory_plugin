@@ -48,6 +48,7 @@ const fields = {
   permanent_dedupe: "自动合并相似永久记忆",
   dedupe_threshold: "永久记忆相似度阈值",
   search_active_only: "检索默认只搜常驻",
+  cold_after_days: "归档转入冷归档天数",
 };
 let ctx = null,
   tab = "home",
@@ -436,7 +437,11 @@ async function loadArchives() {
             "<br>" +
             esc(r.users.map(displayLabel).join(" · ")) +
             "</div><footer><small>" +
-            (r.active ? "常驻上下文" : "历史存档") +
+            (r.cold
+              ? "冷归档 · 仅按ID可读"
+              : r.active
+                ? "常驻上下文"
+                : "历史存档") +
             '</small><button data-open="' +
             esc(r.id) +
             '">查看与编辑 ↗</button></footer></article>',

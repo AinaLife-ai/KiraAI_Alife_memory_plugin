@@ -268,6 +268,14 @@
         "name": "检索默认只搜常驻",
         "default": true,
         "description": "开启后，记忆检索默认只搜常驻上下文（近期原文、活跃摘要、永久记忆）；已归档的旧记忆需要显式 include_archived=true 才会返回。关闭则默认连归档一起搜。"
+      },
+      "cold_after_days": {
+        "type": "integer",
+        "name": "归档转入冷归档天数",
+        "default": 180,
+        "description": "归档满这么多天后自动进入冷归档：任何检索都搜不到，只能按存档ID读取。默认180天；0=不按时间冷归档（被 Forget 或被合并取代的记忆仍会立即冷归档）。",
+        "minimum": 0,
+        "maximum": 3650
       }
     }
   }
