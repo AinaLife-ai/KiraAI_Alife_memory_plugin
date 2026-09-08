@@ -46,7 +46,7 @@ const fields = {
   boot_replay_seconds: "载入动画重播冷却（秒）",
   session_affinity: "全局召回优先当前会话",
   permanent_dedupe: "自动合并相似永久记忆",
-  dedupe_merge_first: "相似永久记忆优先合并",
+  dedupe_force_merge: "检测到相似就强制合并",
   dedupe_threshold: "永久记忆相似度阈值",
   search_active_only: "检索默认只搜常驻",
   cold_after_days: "归档转入冷归档天数",

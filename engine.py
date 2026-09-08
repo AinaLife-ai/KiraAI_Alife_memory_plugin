@@ -129,16 +129,15 @@ class Engine:
                 else (
                     (
                         "records 按时间从新到旧排列，records[0] 是最新的那条。"
-                        "只输出一个 action：keep 或 merge。"
-                        "默认选择 merge：只要这些记忆围绕同一个对象或同一主题"
-                        "（同一份名单、同一个约定、同一件事），就合并成一条，"
-                        "把每条独有的关键信息全部并入 content（可以比原来长），"
-                        "原样保留人名、群名、数字、QQ号与日期；content 必须自包含，"
-                        "不得写“同上”或引用其他记录ID。"
-                        "只有主体或对象明显不同（阿远 vs 小夏）、或确实是两件互不相干的事时才 keep。"
-                        "互相矛盾时以时间较晚的说法为准，并在 reason 说明是更正。"
+                        "只输出一个 action：merge（不允许 keep）。"
+                        "以 records[0]（最新）为基准：先保留它的内容与结论，"
+                        "再把其余记录里独有的人名、群名、数字、QQ号、日期、状态等全部补充进去；"
+                        "冲突之处以时间较晚的说法为准。"
+                        "如果这些记忆涉及不同主体（阿远 vs 小夏），"
+                        "必须在同一条 content 里分别写明，不得丢弃任何主体或任何独有信息。"
+                        "content 必须自包含，不得写“同上”或引用其他记录ID。"
                         "source_ids 至少两条，逐字复制 records[].id；禁止编造ID。"
-                        if cfg.dedupe_merge_first
+                        if cfg.dedupe_force_merge
                         else (
                             "records 按时间从新到旧排列，records[0] 是最新的那条。"
                             "只输出一个 action：keep 或 merge。"
@@ -362,21 +361,37 @@ class Engine:
                 ],
             }
             output = await self.structured(RecordMerge, "dedupe", payload, cfg)
-            if output["action"] != "merge":
+            if output["action"] == "merge":
+                if not set(output["source_ids"]) <= ids:
+                    raise ValueError("unknown source id")
+                sources = output["source_ids"]
+                content = output["content"]
+                reason = output["reason"]
+            elif cfg.dedupe_force_merge:
+                # Force mode never leaves near-duplicates behind: fall back to
+                # the union of the original texts, newest first.
+                sources = [item["id"] for item in group]
+                content = "\n".join(
+                    dict.fromkeys(
+                        item["summary"].strip()
+                        for item in group
+                        if item["summary"].strip()
+                    )
+                )[:16000]
+                reason = "强制合并：模型选择保留，改为按原文拼接合并"
+                logger.info(
+                    "[记忆·Z] 强制合并相似永久记忆（模型曾选择保留：%s）",
+                    output["reason"],
+                )
+            else:
                 logger.info(
                     "[记忆·Z] 相似永久记忆判定为保留：%s", output["reason"]
                 )
                 continue
-            if not set(output["source_ids"]) <= ids:
-                raise ValueError("unknown source id")
             if self.settings() != cfg:
                 return
             result = await self.store.call(
-                "merge_records",
-                group[0]["id"],
-                output["source_ids"],
-                output["content"],
-                output["reason"],
+                "merge_records", group[0]["id"], sources, content, reason
             )
             logger.info(
                 "[记忆·Z] 合并 %s 条相似永久记忆 → %s",
