@@ -1,7 +1,7 @@
 {
   "plugin_id": "alife_memory_z",
   "display_name": "Alife Memory Z",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "author": "znq19",
   "repo": "https://github.com/znq19/KiraAI_Alife_memory_plugin",
   "description": "忠实移植 Alife 持久记忆：分层归档、永久原文、主动回忆、严格结构化审计与实时编辑。",

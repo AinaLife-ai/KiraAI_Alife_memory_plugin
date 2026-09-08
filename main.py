@@ -310,7 +310,31 @@ class AlifeMemoryPlugin(BasePlugin):
         )
         return tuple(adapters.keys())
 
-    async def refresh_name(self, entity_id, adapter_hint="", reason="adapter lookup"):
+    async def _bind_name_identity(self, entity_id, target, group, adapter, number):
+        await self.store.call(
+            "canonicalize_identity",
+            self.adapter_names(),
+            {
+                entity_id: (
+                    target,
+                    target if group else f"{adapter}:dm:{number}",
+                    "session" if group else "user",
+                )
+            },
+        )
+
+    async def refresh_name(
+        self, entity_id, adapter_hint="", reason="adapter lookup", skip_named=False
+    ):
+        entity, _wrote = await self.refresh_name_detail(
+            entity_id, adapter_hint, reason, skip_named
+        )
+        return entity
+
+    async def refresh_name_detail(
+        self, entity_id, adapter_hint="", reason="adapter lookup", skip_named=False
+    ):
+        """Return ``(entity, wrote)``; ``wrote`` is True only when a name was stored."""
         # Prefer the session's adapter, then the id prefix, then every adapter.
         # A bare number kept from migration can still be looked up and bound.
         shape = identity.legacy_shape(entity_id) or identity.pending_shape(entity_id)
@@ -326,8 +350,12 @@ class AlifeMemoryPlugin(BasePlugin):
         if manager is None:
             raise ValueError("adapter does not support name lookup")
         synthetic = identity.synthetic(entity_id)
-        if not synthetic and not await self.store.call("entities", ids=[entity_id]):
-            raise ValueError("unknown entity")
+        if not synthetic:
+            rows = await self.store.call("entities", ids=[entity_id])
+            if not rows:
+                raise ValueError("unknown entity")
+            if skip_named and rows[0]["name"]:
+                return rows[0], False
         candidates = [adapter_hint, adapter, *self.adapter_names()]
         async with self.name_refresh_lock:
             for name in dict.fromkeys(n for n in candidates if n):
@@ -353,6 +381,15 @@ class AlifeMemoryPlugin(BasePlugin):
                     if synthetic
                     else entity_id
                 )
+                if skip_named:
+                    existing = await self.store.call("entities", ids=[target])
+                    if existing and existing[0]["name"]:
+                        # Never overwrite a filled name; only bind the placeholder.
+                        if synthetic:
+                            await self._bind_name_identity(
+                                entity_id, target, group, name, number
+                            )
+                        return existing[0], False
                 await self.store.call(
                     "observe_name",
                     target,
@@ -362,20 +399,12 @@ class AlifeMemoryPlugin(BasePlugin):
                     reason=reason,
                 )
                 if synthetic:
-                    await self.store.call(
-                        "canonicalize_identity",
-                        self.adapter_names(),
-                        {
-                            entity_id: (
-                                target,
-                                target if group else f"{name}:dm:{number}",
-                                "session" if group else "user",
-                            )
-                        },
+                    await self._bind_name_identity(
+                        entity_id, target, group, name, number
                     )
                 rows = await self.store.call("entities", ids=[target])
                 if rows:
-                    return rows[0]
+                    return rows[0], True
         raise ValueError("adapter does not support name lookup")
 
     @register.tool(
@@ -1312,18 +1341,25 @@ class AlifeMemoryPlugin(BasePlugin):
                 422, "当前适配器无法查询该ID的名称，请手工校正或等待新消息"
             ) from None
 
+    @register.api(method="GET", path="/names/pending", auth=True)
+    async def api_name_pending(self):
+        ids = await self.store.call("refreshable_names", 200)
+        return {"ids": ids, "total": len(ids)}
+
     @register.api(method="POST", path="/names/refresh-batch", auth=True)
     async def api_name_refresh_batch(self, request: Request):
         value = await self.body(request, NameBatch)
         ids = value.ids or await self.store.call("refreshable_names", 200)
-        updated, failed = [], []
+        updated, skipped, failed = [], [], []
         for entity_id in ids[:200]:
             try:
-                entity = await self.refresh_name(
-                    entity_id, reason=value.reason
+                entity, wrote = await self.refresh_name_detail(
+                    entity_id, reason=value.reason, skip_named=True
                 )
-                if entity.get("name"):
+                if wrote:
                     updated.append(entity_id)
+                elif entity.get("name"):
+                    skipped.append(entity_id)
                 else:
                     failed.append(entity_id)
             except Exception:
@@ -1333,6 +1369,7 @@ class AlifeMemoryPlugin(BasePlugin):
             "ok": True,
             "reason": value.reason,
             "updated": updated,
+            "skipped": skipped,
             "failed": failed,
             "remaining": len(await self.store.call("refreshable_names", 200)),
         }

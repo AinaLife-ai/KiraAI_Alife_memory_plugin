@@ -1118,7 +1118,6 @@ function focusGraphEntity(id) {
   renderFactCards(related);
   renderGraphFocus(id, related);
   renderGraph();
-  $("#factCards").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 function renderGraphFocus(id, facts) {
   const rows = [];
@@ -1246,31 +1245,66 @@ $("#nameBatchNever").onclick = () => {
   localStorage.setItem("alife-name-batch", "off");
   $("#nameBatch").close();
 };
+let nameBatchRunning = false;
 $("#nameBatchGo").onclick = () =>
   guard(async () => {
-    const button = $("#nameBatchGo");
-    button.disabled = true;
-    $("#nameBatchStatus").textContent = "正在逐个查询平台昵称…";
+    const go = $("#nameBatchGo"),
+      stop = $("#nameBatchStop");
+    go.disabled = true;
+    $("#nameBatchLater").disabled = true;
+    $("#nameBatchNever").disabled = true;
+    stop.classList.remove("hide");
+    nameBatchRunning = true;
+    let done = 0,
+      updated = 0,
+      skipped = 0,
+      failed = 0,
+      remaining = 0;
     try {
-      const result = await api("/names/refresh-batch", {
-        ids: [],
-        reason: "批量确认当前QQ昵称",
-      });
+      const pending = await api("/names/pending");
+      const ids = pending.ids || [];
+      if (!ids.length) {
+        $("#nameBatchStatus").textContent = "没有需要补全的号码。";
+        return;
+      }
+      for (let i = 0; i < ids.length && nameBatchRunning; i += 20) {
+        $("#nameBatchStatus").textContent =
+          "正在查询… 已处理 " + done + " / " + ids.length;
+        const result = await api("/names/refresh-batch", {
+          ids: ids.slice(i, i + 20),
+          reason: "批量确认当前QQ昵称",
+        });
+        done += Math.min(20, ids.length - i);
+        updated += result.updated.length;
+        skipped += (result.skipped || []).length;
+        failed += result.failed.length;
+        remaining = result.remaining;
+      }
       $("#nameBatchStatus").textContent =
         "完成：成功 " +
-        result.updated.length +
+        updated +
+        " · 跳过（已有名字）" +
+        skipped +
         " · 失败 " +
-        result.failed.length +
+        failed +
         " · 还有 " +
-        result.remaining +
+        remaining +
         " 个未填";
       await loadNames();
       if (tab === "profiles") await loadFacts();
-      toast("已更新 " + result.updated.length + " 个昵称");
+      toast("已更新 " + updated + " 个昵称");
     } finally {
-      button.disabled = false;
+      nameBatchRunning = false;
+      go.disabled = false;
+      $("#nameBatchLater").disabled = false;
+      $("#nameBatchNever").disabled = false;
+      stop.classList.add("hide");
     }
   });
+$("#nameBatchStop").onclick = () => {
+  nameBatchRunning = false;
+  $("#nameBatchStatus").textContent = "已停止；再次点击「一键拉取」可继续。";
+};
 $("#namePrev").onclick = () =>
   guard(() => {
     nameOffset = Math.max(0, nameOffset - 100);
