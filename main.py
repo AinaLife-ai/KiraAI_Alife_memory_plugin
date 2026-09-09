@@ -797,9 +797,16 @@ class AlifeMemoryPlugin(BasePlugin):
         # Keep complete records and give explicit IDs for anything outside the budget.
         budget = cfg.context_chars - len(dump(related)) - len(dump(names)) - 1000
         selected, omitted = [], []
+        # 原始对话（L0）默认不进常驻注入：KiraAI 的上下文里本来就有，
+        # 重复注入只会膨胀；需要时由模型主动检索，或按需开启 inject_recent_raw。
+        raw = (
+            list(reversed([r for r in rows if r["level"] == 0]))
+            if cfg.inject_recent_raw
+            else []
+        )
         priority = (
             [r for r in rows if r["permanent"]]
-            + list(reversed([r for r in rows if r["level"] == 0]))
+            + raw
             + [r for r in rows if r["level"] > 0 and not r["permanent"]]
         )
         chosen = {}

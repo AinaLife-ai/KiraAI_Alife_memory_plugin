@@ -110,6 +110,7 @@ class Settings(Strict):
     enabled: bool = True
     capture_enabled: bool = True
     bootstrap_seed: Literal["auto", "always", "off"] = "auto"
+    inject_recent_raw: bool = False
     auto_inject: bool = True
     threshold: int = Field(default=100, ge=4, le=10000)
     batch_size: int = Field(default=70, ge=2, le=9999)

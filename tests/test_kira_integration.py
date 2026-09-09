@@ -410,7 +410,20 @@ async def test_real_core_capture_inject_edit_reload(tmp_path, monkeypatch):
         assert [m.content for m in req.messages] == ["core history"]
         injected = [p for p in req.user_prompt if p.name == "alife_memory"]
         assert len(injected) == 1 and not injected[0].persist
-        assert "我喜欢猫" in injected[0].content
+        # 2.4.0 起原始对话默认不进常驻注入（KiraAI 上下文里本来就有）
+        assert "我喜欢猫" not in injected[0].content
+        plugin.settings = plugin.settings.model_copy(
+            update={"inject_recent_raw": True}
+        )
+        req_raw = LLMRequest(
+            messages=[OpenAIMessage(role="assistant", content="core history")]
+        )
+        req_raw.user_prompt = [Prompt("新一轮", name="message")]
+        await plugin.on_request(event, req_raw)
+        assert (
+            "我喜欢猫"
+            in next(p.content for p in req_raw.user_prompt if p.name == "alife_memory")
+        )
         req.assemble_prompt()
         assert req.messages[-1].role == "user"
         result = await plugin.memorize(event, "一起看流星的约定")
@@ -653,7 +666,14 @@ async def test_dynamic_memory_keeps_system_and_history_stable(tmp_path):
         plugin_mgr=types.SimpleNamespace(plugin_configs={}),
     )
     plugin = module.AlifeMemoryPlugin(
-        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+        ctx,
+        {
+            "alife": {
+                "probability": 0.0,
+                "audit_enabled": False,
+                "inject_recent_raw": True,
+            }
+        },
     )
     await plugin.initialize()
     try:
