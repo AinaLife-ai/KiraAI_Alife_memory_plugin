@@ -30,7 +30,7 @@
 
 ## 2.2.4 更新
 
-同一会话只给新情报：搜索默认排除本会话已经给过的记忆（含每轮注入的存档与事实、按 ID 读过的存档），只返回新内容；`already_seen` 报告跳过数量，`allow_seen=true` 可显式重搜，`ReadMemoryArchive(id)` 永远能重读。`MemoryOverview` 的事实同样去重。同时删除写死的「还有别的吗」启发式（`re.fullmatch` 只认 8 个固定短语），改由模型通过 `SearchMemoryArchive(next_batch=true)` 驱动。
+同一会话只给新情报：搜索默认排除本会话已经给过的记忆（含每轮注入的存档与事实、按 ID 读过的存档），只返回新内容；`already_seen` 报告跳过数量，`allow_seen=true` 可显式重搜，`ReadMemoryArchive(id)` 永远能重读。`MemoryOverview` 的事实同样去重，每次最多返回 50 条新事实。同时删除写死的「还有别的吗」启发式（`re.fullmatch` 只认 8 个固定短语），改由模型通过 `SearchMemoryArchive(next_batch=true)` 驱动。
 
 详见[同一会话只给新情报](docs/NEW_ONLY_RECALL_2_2_4.md)。
 
