@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import json
 import sys
 import tempfile
 import time
@@ -112,6 +113,64 @@ class PacingCase(unittest.TestCase):
         engine = e.Engine(self.store, lambda: cfg, model, None, None)
         asyncio.run(engine.audit("qq:gm:1"))
         self.assertEqual(calls, [])
+
+    def test_audit_can_correct_importance(self):
+        fact_id = self.add_fact()
+        cfg = c.Settings()
+        calls = []
+
+        async def model(*args):
+            calls.append(args)
+            payload = args[-1]
+            return json.dumps(
+                {
+                    "actions": [
+                        {
+                            "action": "keep",
+                            "target_id": payload["facts"][0]["id"],
+                            "source_ids": [payload["facts"][0]["id"]],
+                            "content": payload["facts"][0]["content"],
+                            "reason": "证据一致",
+                            "relations": None,
+                            "importance": 9,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+
+        engine = e.Engine(self.store, lambda: cfg, model, None, None)
+        asyncio.run(engine.audit("qq:gm:1"))
+        self.assertEqual(len(calls), 1)
+        rows = self.store.facts("qq:gm:1")
+        self.assertEqual(rows[0]["importance"], 9)
+
+    def test_audit_rejects_extra_fields(self):
+        self.add_fact()
+        cfg = c.Settings(model_retries=0)
+
+        async def model(*args):
+            payload = args[-1]
+            return json.dumps(
+                {
+                    "actions": [
+                        {
+                            "action": "keep",
+                            "target_id": payload["facts"][0]["id"],
+                            "source_ids": [payload["facts"][0]["id"]],
+                            "content": "x",
+                            "reason": "y",
+                            "relations": None,
+                            "unknown_field": 1,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+
+        engine = e.Engine(self.store, lambda: cfg, model, None, None)
+        with self.assertRaises(Exception):
+            asyncio.run(engine.audit("qq:gm:1"))
 
 
 if __name__ == "__main__":

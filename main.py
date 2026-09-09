@@ -593,6 +593,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 cfg.profile_summary_count,
                 event.sid,
                 cfg.recall_scope != "session",
+                cfg.merge_pending_hide,
             )
             if profile:
                 profiles.append(profile)
@@ -1382,6 +1383,8 @@ class AlifeMemoryPlugin(BasePlugin):
             users=user_ids(event),
             include_shared=True,
             exclude_ids=seen,
+            hide_pending=self.settings.merge_pending_hide,
+            importance_first=True,
         )
         self.seen_window.remember(key, "", [], [row["id"] for row in rows])
         context = await self.store.call("context", event.sid, user_ids(event))

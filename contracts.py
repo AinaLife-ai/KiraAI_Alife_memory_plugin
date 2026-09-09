@@ -99,6 +99,7 @@ class AuditAction(Strict):
     content: Text
     reason: Short
     relations: list[Relation] | None = Field(default=None, max_length=20)
+    importance: int | None = Field(default=None, ge=1, le=10)
 
 
 class Audit(Strict):

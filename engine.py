@@ -254,12 +254,15 @@ class Engine:
         # A job drains the cascade with a finite cap; the scheduler resumes backlog.
         started_at = time.time()
         try:
-            await self._compress_cascade(sid, started_at)
+            await self._compress_cascade(sid)
         finally:
             # Facts written by any path above still need the duplicate scan.
-            await self.queue_fact_merges(sid, started_at)
+            try:
+                await self.queue_fact_merges(sid, started_at)
+            except Exception:
+                logger.exception("[记忆·Z] 事实重复扫描失败，本次压缩结果不受影响")
 
-    async def _compress_cascade(self, sid, started_at):
+    async def _compress_cascade(self, sid):
         for _ in range(64):
             cfg = self.settings()
             if not cfg.enabled:

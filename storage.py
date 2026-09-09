@@ -1470,13 +1470,15 @@ class Store:
             self.bump(db)
             return {"kind": kind, "target": target, "restored_from": version_id}
 
-    def profile(self, entity_id, summary_count=3, sid="", global_scope=True):
+    def profile(self, entity_id, summary_count=3, sid="", global_scope=True, hide_pending=False):
         """Aggregated view of one entity: names, facts by category, relations, stats."""
         rows = self.entities(ids=[entity_id], limit=1)
         if not rows:
             return None
         entity = rows[0]
         where, args = ["deleted=0", "subject=?"], [entity_id]
+        if hide_pending:
+            where.append("merge_pending=0")
         if not global_scope and sid:
             where.append("sid=?")
             args.append(sid)
@@ -2002,6 +2004,11 @@ class Store:
                     "INSERT INTO versions(kind,target,snapshot,reason,created) VALUES ('fact',?,?,?,?)",
                     (old["id"], dump(old), a["reason"], time.time()),
                 )
+                if a.get("importance") is not None:
+                    db.execute(
+                        "UPDATE facts SET importance=?,revision=revision+1 WHERE id=?",
+                        (a["importance"], a["target_id"]),
+                    )
                 if a["action"] == "keep":
                     continue
                 sources = sorted({s for k in group for s in by_id[k]["sources"]})
