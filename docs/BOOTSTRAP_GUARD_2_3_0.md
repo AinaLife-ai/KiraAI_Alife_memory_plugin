@@ -1,0 +1,68 @@
+# 2.3.0：旧历史播种保护
+
+## 问题
+
+插件第一次遇到某个会话时，会把 KiraAI 里**已经存在的对话历史**抄进自己的记忆库（播种 / bootstrap），这样装上插件后 Bot 不会立刻失忆。
+
+但播种是把 `req.messages` 整段复制过来，并统一打上**当前会话 + 当前用户**的标签。而会话合并类插件（如 KSM `kira_session_merger`）会在同一轮把**其他会话**的对话合并进 `req.messages`：
+
+```
+--- 宿主 req.messages（KSM 已合并别的会话）
+    ['[B会话/阿强] 我下个月要去日本出差', '好的，我记下了', '你好']
+--- 播种结果
+    sid=test:dm:A  users=['test:u_A']  「[B会话/阿强] 我下个月要去日本出差」  ← 别人的经历被记成 A 会话/A 用户的
+```
+
+这些错误的归属会永久留在记忆库里，之后全局召回时 Bot 可能把别人的经历说成当前用户的。
+
+## 改动
+
+### 1. 新增配置 `bootstrap_seed`（默认 `auto`）
+
+| 值 | 行为 |
+| --- | --- |
+| `auto` | 没有检测到会话合并/压缩插件时照旧播种；检测到 **KSM / ADS / Context Condensation** 启用时**跳过** |
+| `always` | 始终播种（明确知道历史是干净的时使用） |
+| `off` | 从不播种，只记装插件之后的内容 |
+
+检测同时支持精确 id 与模糊匹配（目录名可能带 `-main` 等后缀），与 KSM 的冲突检测保持一致的容错。
+
+跳过时会打印一次日志（每个会话一次）：
+
+```
+[记忆·Z] 检测到 kira_session_merger 正在改写会话上下文，已跳过历史播种（避免把别的会话记成本会话）
+```
+
+### 2. 显式播种标记
+
+`meta.bootstrap:<sid>` 记录"这个会话已经处理过播种"。播种或跳过时都会写一次：
+
+- 清理播种记录后**不会重新播种**；
+- 会话记录被归档/清空后也不会重复播种（修掉了原来的隐式判断）。
+
+### 3. 后台任务页新增「清理历史播种记录」
+
+`POST /api/plugin/alife_memory_z/maintenance/bootstrap` → `Store.purge_bootstrap()`：
+
+- 只匹配 `event_key LIKE '%:bootstrap:%'` 的记录；
+- 与「清理历史工具记录」同一套**软删除**：写 `versions` 快照、`deleted=1`、清理只由这些记录支撑的事实；
+- 返回 `{removed, sessions, freed_chars}`，前端提示「已清理 N 条（涉及 M 个会话）· 原文保留可恢复」；
+- 清理后为该会话补写播种标记，避免复活。
+
+## 影响面
+
+- 记忆系统其余功能（捕获、注入、工具、压缩、审计、WebUI）不受影响；
+- 其他插件零影响：只读 `plugin_mgr` 的开关状态，不写它们的配置、不抢钩子、不改数据；
+- 唯一的功能差异：`auto` + 合并插件在场时，不继承装插件前的旧历史。想要旧历史用 `always`。
+
+## 验证
+
+```bash
+python -m pytest tests/test_bootstrap_guard.py -q          # 4 项：配置矩阵 + 检测
+KIRA_CORE=/path/to/KiraAI python -m pytest tests/test_kira_integration.py -q -k bootstrap
+```
+
+集成测试覆盖：
+
+- KSM 启用 → 不播种、写标记；随后关掉 KSM 也不会补播种；
+- 无合并插件 → 正常播种 2 条；`purge_bootstrap` 软删 2 条（1 个会话）后再请求不会复活。

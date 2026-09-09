@@ -63,6 +63,17 @@ MEMORY_RULES = (
 )
 
 
+# 会话合并/压缩类插件会改写 req.messages：播种时可能把别的会话的内容记成本会话。
+MERGE_PLUGINS = (
+    "kira_session_merger",
+    "auto_delete_session",
+    "KiraAI-ContextCondensation",
+    "KiraAI-ContextCondensation-main",
+    "context_condensation",
+    "ContextCondensation",
+)
+
+
 def user_ids(event):
     adapter = getattr(getattr(event, "session", None), "adapter_name", "")
     return sorted(
@@ -107,6 +118,7 @@ class AlifeMemoryPlugin(BasePlugin):
         self.seen_window = RecallWindow()
         self._recall_outputs = {}
         self._own_outputs = set()
+        self._bootstrap_notified = set()
 
     def conflicts(self):
         pm = getattr(self.ctx, "plugin_mgr", None)
@@ -548,6 +560,38 @@ class AlifeMemoryPlugin(BasePlugin):
         except (ValueError, TimeoutError):
             return dump({"ok": False, "error": "name_lookup_unavailable"})
 
+    def merge_plugin_active(self):
+        """返回正在改写会话上下文的插件 id（没有则为空字符串）。"""
+        pm = getattr(self.ctx, "plugin_mgr", None)
+        if not pm or not hasattr(pm, "has_plugin"):
+            return ""
+        try:
+            for pid in MERGE_PLUGINS:
+                if pm.has_plugin(pid) and pm.is_plugin_enabled(pid):
+                    return pid
+            for attr in ("plugin_instances", "plugins", "_plugins"):
+                registry = getattr(pm, attr, None)
+                if not isinstance(registry, dict):
+                    continue
+                for key in registry:
+                    normalized = str(key).lower().replace("-", "").replace("_", "")
+                    if "contextcondensation" in normalized and pm.is_plugin_enabled(
+                        str(key)
+                    ):
+                        return str(key)
+        except Exception:
+            return ""
+        return ""
+
+    def bootstrap_allowed(self):
+        """是否允许把宿主旧历史播种进本会话。"""
+        mode = self.settings.bootstrap_seed
+        if mode == "off":
+            return False
+        if mode == "always":
+            return True
+        return not self.merge_plugin_active()
+
     @on.llm_request(priority=Priority.LOW)
     async def on_request(self, event, req: LLMRequest, *_):
         cfg = self.runtime_settings()
@@ -563,19 +607,38 @@ class AlifeMemoryPlugin(BasePlugin):
         await self.observe_event_names(event)
         rows = await self.store.call("active", sid)
         # Seed pre-install history once; never erase the core's own history on disk.
-        if not rows and req.messages and cfg.capture_enabled:
-            messages = [
-                {
-                    "role": m.role if m.role in ("user", "assistant") else "assistant",
-                    "content": dump(m.to_dict()),
-                    "time": time.time(),
-                    "users": user_ids(event),
-                }
-                for m in req.messages
-                if m.role != "system"
-            ]
-            await self.store.call("capture", sid, "bootstrap", messages)
-            rows = await self.store.call("active", sid)
+        if (
+            not rows
+            and req.messages
+            and cfg.capture_enabled
+            and not await self.store.call("bootstrap_done", sid)
+        ):
+            if self.bootstrap_allowed():
+                messages = [
+                    {
+                        "role": m.role if m.role in ("user", "assistant") else "assistant",
+                        "content": dump(m.to_dict()),
+                        "time": time.time(),
+                        "users": user_ids(event),
+                    }
+                    for m in req.messages
+                    if m.role != "system"
+                ]
+                await self.store.call("capture", sid, "bootstrap", messages)
+                rows = await self.store.call("active", sid)
+            else:
+                blocker = self.merge_plugin_active() or "会话合并/压缩插件"
+                if sid not in self._bootstrap_notified:
+                    self._bootstrap_notified.add(sid)
+                    while len(self._bootstrap_notified) > 256:
+                        self._bootstrap_notified.pop()
+                    logger.info(
+                        "[记忆·Z] 检测到 %s 正在改写会话上下文，已跳过历史播种"
+                        "（避免把别的会话记成本会话）",
+                        blocker,
+                    )
+            # 无论播种还是跳过都记一次，清理后不会复活。
+            await self.store.call("mark_bootstrap", sid)
         if not cfg.auto_inject:
             return
         users = user_ids(event)
@@ -1513,6 +1576,10 @@ class AlifeMemoryPlugin(BasePlugin):
             "ok": True,
             "repaired": await self.store.call("repair_synthetic_names"),
         }
+
+    @register.api(method="POST", path="/maintenance/bootstrap", auth=True)
+    async def api_purge_bootstrap(self):
+        return {"ok": True, **await self.store.call("purge_bootstrap")}
 
     @register.api(method="POST", path="/maintenance/tools", auth=True)
     async def api_cleanup_tools(self):

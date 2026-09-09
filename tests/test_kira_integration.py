@@ -798,3 +798,76 @@ async def test_vector_opt_in_and_disable_discards_inflight_index(tmp_path):
         assert len(calls) == 1
     finally:
         await plugin.terminate()
+
+
+class _PluginManager:
+    """Minimal plugin manager stub for bootstrap-guard tests."""
+
+    def __init__(self, states=None):
+        self.states = states or {}
+        self.plugin_configs = {}
+
+    def has_plugin(self, pid):
+        return pid in self.states
+
+    def is_plugin_enabled(self, pid):
+        return self.states.get(pid, False)
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_skipped_when_history_is_rewritten(tmp_path):
+    manager = _PluginManager({"kira_session_merger": True})
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path, plugin_mgr=manager
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        event = make_event()
+        request = LLMRequest(
+            messages=[OpenAIMessage(role="user", content="[B会话/阿强] 我下个月去日本")],
+            user_prompt=[Prompt("你好", name="message")],
+        )
+        await plugin.on_request(event, request)
+        # 合并插件在改写上下文：不把别的会话的内容播种成本会话经历
+        assert plugin.store.active(event.sid) == []
+        assert plugin.store.bootstrap_done(event.sid)
+        # 之后再关掉合并插件，这个会话也不会补播种（标记已写）
+        manager.states["kira_session_merger"] = False
+        await plugin.on_request(event, request)
+        assert plugin.store.active(event.sid) == []
+        assert plugin.store.purge_bootstrap()["removed"] == 0
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_seeds_then_purge_removes_and_stays_gone(tmp_path):
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path, plugin_mgr=_PluginManager()
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        event = make_event()
+        request = LLMRequest(
+            messages=[
+                OpenAIMessage(role="user", content="上周约好周日看猫"),
+                OpenAIMessage(role="assistant", content="好呀"),
+            ],
+            user_prompt=[Prompt("你好", name="message")],
+        )
+        await plugin.on_request(event, request)
+        assert len(plugin.store.active(event.sid)) == 2
+        report = plugin.store.purge_bootstrap()
+        assert report["removed"] == 2 and report["sessions"] == 1
+        assert plugin.store.active(event.sid) == []
+        # 软删除后不会重新播种
+        await plugin.on_request(event, request)
+        assert plugin.store.active(event.sid) == []
+    finally:
+        await plugin.terminate()

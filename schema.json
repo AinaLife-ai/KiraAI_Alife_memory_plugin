@@ -16,6 +16,13 @@
         "default": true,
         "description": "把新对话、图片识别等感知结果写进记忆；关闭后仍可查旧记忆。"
       },
+      "bootstrap_seed": {
+        "type": "string",
+        "name": "旧历史播种",
+        "default": "auto",
+        "description": "首次遇到旧会话时，是否把 KiraAI 已有的对话历史抄进记忆库。auto：检测到会话合并/压缩插件时跳过，避免把别的会话记成本会话；always：始终播种；off：从不播种，只记装插件之后的内容。",
+        "options": ["auto", "always", "off"]
+      },
       "auto_inject": {
         "type": "switch",
         "name": "持续上下文注入",

@@ -1350,6 +1350,24 @@ $("#repairNames").onclick = () =>
       button.disabled = false;
     }
   });
+$("#purgeBootstrap").onclick = () =>
+  guard(async () => {
+    const button = $("#purgeBootstrap");
+    button.disabled = true;
+    try {
+      const report = await api("/maintenance/bootstrap", {});
+      $("#purgeBootstrapHint").textContent = report.removed
+        ? "已清理 " +
+          report.removed +
+          " 条（涉及 " +
+          report.sessions +
+          " 个会话）· 原文保留可恢复"
+        : "没有发现历史播种记录";
+      await poll();
+    } finally {
+      button.disabled = false;
+    }
+  });
 $("#cleanupTools").onclick = () =>
   guard(async () => {
     const button = $("#cleanupTools");
