@@ -1062,6 +1062,18 @@ class Store:
             ).fetchone()
         return {"live": row["live"] or 0, "archived": row["archived"] or 0}
 
+    def sessions_by_audit_age(self, limit):
+        """Sessions whose facts are the most stale, so audits stay paced."""
+        with self.connect() as db:
+            return [
+                row[0]
+                for row in db.execute(
+                    "SELECT sid FROM facts WHERE deleted=0 GROUP BY sid "
+                    "ORDER BY min(audited) ASC, sid LIMIT ?",
+                    (max(1, limit),),
+                )
+            ]
+
     def sessions_with_permanents(self):
         with self.connect() as db:
             return [

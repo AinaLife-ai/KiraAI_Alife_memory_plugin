@@ -30,3 +30,20 @@
 - `tests/test_permanent_dedupe.py`：无相似簇时报告 `clusters=0` 且提示「未发现相似簇」；合并后再跑提示「常驻 1 条、已归档 2 条」。
 - 端到端：第一次 `{permanent:3, clusters:1, merged:1}`，第二次 `{permanent:1, clusters:0, note:"常驻 1 条、已归档 2 条"}`。
 - 全量 `pytest tests/`：**76 passed, 1 skipped, 7 subtests passed**。
+
+---
+
+## 附：审计为什么看起来一直在跑
+
+初次导入 KiraOS 的 2000+ 条记忆后，事实表里会多出上千条待审计事实。原来的调度是**每个 `audit_interval` 给每一个会话都入队一个 audit 任务**：
+
+- 一次 audit 只处理 `audit_batch`（默认 20）条事实；
+- 如果会话多、模型慢（实测单次 107–113 秒），一轮入队的任务根本做不完，队列永远是满的 → 看起来"一直在审计"。
+
+现在改为**每个间隔只挑最久没审计的 `worker_count` 个会话**（按事实的 `min(audited)` 排序）：
+
+- 队列大小被限制在一轮工作量以内，不再堆积；
+- 大 backlog 会按轮次慢慢消化，而不是把后台占满；
+- 每个 audit 任务完成后，详情会写「本次审计 N 条事实」，可以看到进度。
+
+想更快消化 backlog，可以调大「后台并发数」或「每批审计事实数」，或缩短「审计间隔」。

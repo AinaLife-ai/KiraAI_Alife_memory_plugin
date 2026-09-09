@@ -308,3 +308,32 @@ def test_session_affinity_reorders_without_narrowing(tmp_path):
         "qq:gm:newbot",
     ]
     assert preferred["total"] == plain["total"]
+
+
+def test_audit_scheduler_picks_stalest_sessions(tmp_path):
+    store = s.Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    for sid, audited in (("a:dm:1", 0.0), ("a:dm:2", 100.0), ("a:dm:3", 200.0)):
+        store.capture(
+            sid,
+            "e",
+            [{"role": "user", "content": "x", "time": 1.0, "users": []}],
+        )
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            store._add_fact(
+                db,
+                sid,
+                {
+                    "category": "fact",
+                    "subject": "s",
+                    "content": "c",
+                    "reason": "",
+                    "scenario": "",
+                    "tags": [],
+                    "relations": [],
+                    "source_ids": [],
+                },
+            )
+            db.execute("UPDATE facts SET audited=? WHERE sid=?", (audited, sid))
+    assert store.sessions_by_audit_age(2) == ["a:dm:1", "a:dm:2"]

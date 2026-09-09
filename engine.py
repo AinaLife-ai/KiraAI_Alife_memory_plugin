@@ -337,6 +337,7 @@ class Engine:
         )
         if self.settings() == cfg:
             await self.store.call("audit", candidates, output)
+        return len(candidates)
 
     async def consolidate(self, sid):
         """Fold similar permanent memories with the audit model, newest wins."""
@@ -431,6 +432,7 @@ class Engine:
                 continue
             started = time.monotonic()
             logger.info("[记忆·Z] 开始后台任务 %s · %s", job["kind"], job["id"][:8])
+            detail = ""
             try:
                 if job["kind"] == "compress":
                     await self.compress(job["sid"])
@@ -438,7 +440,8 @@ class Engine:
                     if cfg.proactive_enabled and job["sid"] in cfg.proactive_sessions:
                         await self.notice(job["sid"])
                 elif job["kind"] == "audit":
-                    await self.audit(job["sid"])
+                    audited = await self.audit(job["sid"])
+                    detail = "本次审计 %s 条事实" % audited
                 elif job["kind"] == "dedupe":
                     await self.consolidate(job["sid"])
                 elif job["kind"] == "classify":
@@ -470,10 +473,11 @@ class Engine:
                         offset += len(rows["items"])
                 else:
                     raise ValueError("unknown job kind")
-                await self.store.call("finish", job["id"], "completed")
+                await self.store.call("finish", job["id"], "completed", detail)
                 logger.info(
-                    "[记忆·Z] 后台任务完成 %s，耗时 %.1f 秒",
+                    "[记忆·Z] 后台任务完成 %s（%s），耗时 %.1f 秒",
                     job["kind"],
+                    detail or "无",
                     time.monotonic() - started,
                 )
             except asyncio.CancelledError:
@@ -557,7 +561,11 @@ class Engine:
                             await self.enqueue("compress", sid, automatic=True)
             if cfg.audit_enabled and now - self.last_audit >= cfg.audit_interval:
                 self.last_audit = now
-                for sid in await self.store.call("sessions"):
+                # Audit only a few of the stalest sessions per interval, so a big
+                # imported backlog cannot keep the queue permanently busy.
+                for sid in await self.store.call(
+                    "sessions_by_audit_age", max(1, cfg.worker_count)
+                ):
                     await self.enqueue("audit", sid, automatic=True)
             if cfg.permanent_dedupe and now - self.last_dedupe >= cfg.audit_interval:
                 self.last_dedupe = now
