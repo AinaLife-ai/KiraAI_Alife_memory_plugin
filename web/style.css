@@ -1215,9 +1215,9 @@ button.primary:hover::after {
   gap: 16px;
   padding: 24px;
   background: radial-gradient(circle at 50% 40%, var(--soft), var(--bg) 64%);
-  animation:
-    boot-in 0.5s var(--ease) both,
-    boot-out 0.6s var(--ease) 3s forwards;
+  /* The backdrop must be opaque from the very first frame, otherwise the page
+     shows through while it fades in. Only the content animates. */
+  animation: boot-out 0.6s var(--ease) 3s forwards;
 }
 .boot::before {
   content: "";
@@ -1446,9 +1446,7 @@ button.primary:hover::after {
 }
 @media (prefers-reduced-motion: reduce) {
   html:not([data-motion="force"]) #boot {
-    animation:
-      boot-in 0.4s ease both,
-      boot-out 0.5s ease 2.6s forwards !important;
+    animation: boot-out 0.5s ease 2.6s forwards !important;
   }
   html:not([data-motion="force"]) #boot .boot-frame {
     animation: boot-in 0.5s ease 0.1s both !important;
