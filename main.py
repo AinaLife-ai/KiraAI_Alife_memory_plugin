@@ -166,6 +166,7 @@ class AlifeMemoryPlugin(BasePlugin):
                     return
             self.migration_blocked = True
             self.migration_note = "正在安全迁移；原文件只读保留。"
+            started_at = time.time()
             disabled = []
             try:
                 adapters = self.adapter_names()
@@ -204,6 +205,10 @@ class AlifeMemoryPlugin(BasePlugin):
                     await self.store.call("canonicalize_identity", adapters)
                 await self.store.call("set_legacy_migrated_at", time.time())
                 self.migration_blocked = False
+                if self.engine:
+                    # Imported facts never pass through compression, so scan them
+                    # once for duplicates now.
+                    await self.engine.queue_migration_merges(started_at)
                 self.migration_note = (
                     "迁移完成，原文件完整保留。切换回旧插件前请先停用长期记忆·Z。"
                 )

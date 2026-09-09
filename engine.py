@@ -445,6 +445,26 @@ class Engine:
             await self.enqueue("fact_merge", sid)
         return len(flagged)
 
+    async def queue_migration_merges(self, since):
+        """One-time duplicate scan for memories imported by the migration.
+
+        Legacy imports bypass compression, so nothing else would ever flag
+        duplicates inside a freshly imported library.
+        """
+        cfg = self.settings()
+        if not cfg.fact_merge_enabled:
+            return 0
+        rows = await self.store.call("facts_since", "", since)
+        if not rows:
+            return 0
+        total = 0
+        for sid in sorted({row["sid"] for row in rows}):
+            total += await self.queue_fact_merges(sid, since)
+        logger.info(
+            "[记忆·Z] 迁移后重复扫描：%d 条新事实，标记 %d 条待合并", len(rows), total
+        )
+        return total
+
     @staticmethod
     def _fact_clusters(rows, threshold):
         """Connected components of similar facts sharing subject+category."""

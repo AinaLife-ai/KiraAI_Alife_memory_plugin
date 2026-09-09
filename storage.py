@@ -1751,10 +1751,10 @@ class Store:
                     + " AND ".join(where)
                     + (
                         f" ORDER BY {tier_sql}fact_score(content) DESC,"
-                        f"{'importance DESC,' if importance_first else ''}audited,id LIMIT ? OFFSET ?"
+                        f"{'importance DESC,created DESC,' if importance_first else 'audited,'}id LIMIT ? OFFSET ?"
                         if lexical
                         else f" ORDER BY {tier_sql}"
-                        f"{'importance DESC,' if importance_first else ''}audited,id LIMIT ? OFFSET ?"
+                        f"{'importance DESC,created DESC,' if importance_first else 'audited,'}id LIMIT ? OFFSET ?"
                     ),
                     [*args, *tier_args, limit, offset],
                 )
@@ -1857,16 +1857,23 @@ class Store:
             ]
 
     def facts_since(self, sid, since):
-        """Facts written (or first seen) after a timestamp, newest first."""
+        """Facts written (or first seen) after a timestamp, newest first.
+
+        An empty ``sid`` scans every session (used once after legacy import).
+        """
+        where, args = ["f.deleted=0", "f.created>=?"], [since]
+        if sid:
+            where.append("f.sid=?")
+            args.append(sid)
         with self.connect() as db:
             return [
                 self.row(r)
                 for r in db.execute(
                     "SELECT f.*, coalesce((SELECT max(r.start) FROM records r,"
                     " json_each(f.sources) s WHERE r.id=s.value),0) AS time"
-                    " FROM facts f WHERE f.deleted=0 AND f.sid=? AND f.created>=?"
-                    " ORDER BY f.created DESC, f.id",
-                    (sid, since),
+                    " FROM facts f WHERE " + " AND ".join(where)
+                    + " ORDER BY f.created DESC, f.id",
+                    args,
                 )
             ]
 

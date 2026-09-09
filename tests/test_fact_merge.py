@@ -257,6 +257,73 @@ class MergeCase(unittest.TestCase):
         self.assertEqual([f["content"] for f in global_facts], ["萤火喜欢甜口蛋糕"])
         self.assertEqual(global_facts[0]["sid"], "global")
 
+    def test_fact_merge_lane_processes_queued_job(self):
+        self.seed()
+        cfg = c.Settings()
+
+        async def model(*args):
+            self.calls.append(args)
+            return self.merge_reply(args[-1])
+
+        engine = self.engine(cfg, model)
+
+        async def run():
+            # Only the merge lane: keeps the test independent of the other lanes.
+            task = asyncio.create_task(engine.fact_merge_worker())
+            try:
+                await engine.queue_fact_merges("qq:gm:1", 0)
+                for _ in range(200):
+                    await asyncio.sleep(0.05)
+                    with self.store.connect() as db:
+                        row = db.execute(
+                            "SELECT state FROM jobs WHERE kind='fact_merge'"
+                        ).fetchone()
+                    if row and row[0] in ("completed", "failed"):
+                        break
+            finally:
+                engine.stopping = True
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(run())
+        with self.store.connect() as db:
+            rows = db.execute(
+                "SELECT state,detail FROM jobs WHERE kind='fact_merge' ORDER BY created DESC"
+            ).fetchall()
+        self.assertEqual(len(self.store.facts("qq:gm:1")), 1, rows)
+        self.assertTrue(rows, "fact_merge 任务应存在")
+        self.assertEqual(rows[0][0], "completed", rows)
+
+    def test_startup_requeues_pending_facts(self):
+        self.seed()
+        cfg = c.Settings()
+
+        async def model(*args):
+            return self.merge_reply(args[-1])
+
+        rows = self.store.facts("qq:gm:1")
+        self.store.mark_merge_pending([rows[0]["id"]])
+        engine = self.engine(cfg, model)
+
+        async def run():
+            await engine.start()
+            try:
+                with self.store.connect() as db:
+                    job = db.execute(
+                        "SELECT sid,state FROM jobs WHERE kind='fact_merge'"
+                    ).fetchone()
+                self.assertIsNotNone(job, "启动时应把待合并事实重新入队")
+                self.assertEqual(job[0], "qq:gm:1")
+                for _ in range(200):
+                    await asyncio.sleep(0.05)
+                    if len(self.store.facts("qq:gm:1")) == 1:
+                        break
+            finally:
+                await engine.stop()
+
+        asyncio.run(run())
+        self.assertEqual(len(self.store.facts("qq:gm:1")), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

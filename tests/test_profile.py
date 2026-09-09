@@ -99,6 +99,23 @@ class ProfileCase(unittest.TestCase):
         self.assertEqual(rows[0]["stats"]["facts"], 1)
         self.assertEqual(rows[0]["stats"]["summary"], ["对花生过敏"])
 
+    def test_facts_importance_ordering(self):
+        self.add_fact("qq:gm:1", "qq:9", "低重要度", "fact", 2)
+        self.add_fact("qq:gm:1", "qq:9", "高重要度", "fact", 9)
+        self.add_fact("qq:gm:1", "qq:9", "中重要度", "fact", 5)
+        ordered = self.store.facts("qq:gm:1", importance_first=True)
+        self.assertEqual(
+            [f["content"] for f in ordered], ["高重要度", "中重要度", "低重要度"]
+        )
+
+    def test_facts_subject_preference_beats_importance(self):
+        self.add_fact("qq:gm:1", "qq:9", "提到的人的低重要度事实", "fact", 1)
+        self.add_fact("qq:gm:1", "qq:8", "别人的高重要度事实", "fact", 10)
+        ordered = self.store.facts(
+            "qq:gm:1", importance_first=True, prefer_subjects=("qq:9",)
+        )
+        self.assertEqual(ordered[0]["content"], "提到的人的低重要度事实")
+
 
 if __name__ == "__main__":
     unittest.main()

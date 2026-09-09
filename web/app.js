@@ -17,6 +17,8 @@ const fields = {
   mutual_exclusion: "迁移成功后互斥旧插件",
   migration_max_chars: "KiraOS 迁移字符上限",
   enabled: "启用记忆系统",
+  bootstrap_seed: "旧历史播种",
+  inject_recent_raw: "注入最近原文",
   capture_enabled: "记录对话与感知",
   auto_inject: "持续上下文与感知注入",
   threshold: "首层压缩阈值",
