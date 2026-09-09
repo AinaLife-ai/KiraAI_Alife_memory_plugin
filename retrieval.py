@@ -46,6 +46,21 @@ def tool_call_summary(tool_calls, limit=60):
     return "[调用工具：" + "、".join(parts) + "]" if parts else ""
 
 
+# Names written by third-party plugins for their own synthetic messages; they
+# must never become a user's remembered nickname.
+SYNTHETIC_NAMES = frozenset(
+    {
+        "提醒任务所有者",
+        "Kira",
+        "system",
+        "system:reminder_plugin",
+        "Web UI 用户",
+        "Web UI 管理员",
+        "自主意图循环",
+        "未知",
+    }
+)
+
 _NOISE = re.compile(r"[\s，。、；：！？,.!?;:'\"“”‘’()（）\[\]【】<>《》\-—~～/\\]+")
 
 

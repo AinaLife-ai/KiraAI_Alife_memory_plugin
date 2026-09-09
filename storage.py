@@ -1051,6 +1051,54 @@ class Store:
                 )
             ]
 
+    def repair_synthetic_names(self):
+        """Undo nicknames written by third-party synthetic messages.
+
+        A reminder plugin publishes messages whose sender nickname is
+        "提醒任务所有者"; observing those overwrote the real nickname. Restore
+        the most recent non-synthetic name from history and record the repair.
+        """
+        from .retrieval import SYNTHETIC_NAMES
+
+        synthetic = dump(sorted(SYNTHETIC_NAMES))
+        repaired = []
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT id,name FROM entities WHERE name IN "
+                "(SELECT value FROM json_each(?))",
+                (synthetic,),
+            ).fetchall()
+            for row in rows:
+                previous = db.execute(
+                    "SELECT name FROM entity_names WHERE entity_id=? AND name<>'' "
+                    "AND name NOT IN (SELECT value FROM json_each(?)) "
+                    "ORDER BY observed DESC,id DESC LIMIT 1",
+                    (row["id"], synthetic),
+                ).fetchone()
+                if not previous or not previous["name"]:
+                    continue
+                db.execute(
+                    "UPDATE entities SET name=?,updated=? WHERE id=?",
+                    (previous["name"], time.time(), row["id"]),
+                )
+                db.execute(
+                    "INSERT INTO entity_names(entity_id,name,source,context,"
+                    "observed,reason) VALUES (?,?,?,?,?,?)",
+                    (
+                        row["id"],
+                        previous["name"],
+                        "repair",
+                        "",
+                        time.time(),
+                        "忽略第三方插件的合成昵称",
+                    ),
+                )
+                repaired.append({"id": row["id"], "name": previous["name"]})
+            if repaired:
+                self.bump(db)
+        return repaired
+
     def permanent_stats(self, sid):
         """Active vs archived permanent memories, for diagnostics."""
         with self.connect() as db:

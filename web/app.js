@@ -1333,6 +1333,23 @@ $("#searchNames").onclick = () =>
     nameOffset = 0;
     return loadNames();
   });
+$("#repairNames").onclick = () =>
+  guard(async () => {
+    const button = $("#repairNames");
+    button.disabled = true;
+    try {
+      const report = await api("/maintenance/names", {});
+      $("#repairNamesHint").textContent = report.repaired.length
+        ? "已修复 " +
+          report.repaired.length +
+          " 个昵称：" +
+          report.repaired.map((item) => item.name).join("、")
+        : "没有发现被第三方插件改写的昵称";
+      await loadNames();
+    } finally {
+      button.disabled = false;
+    }
+  });
 $("#cleanupTools").onclick = () =>
   guard(async () => {
     const button = $("#cleanupTools");

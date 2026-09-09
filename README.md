@@ -2,6 +2,12 @@
 
 将 [Alife 持久记忆](https://github.com/BDFFZI/Alife/tree/0b9836a3a6cc38f9a63b5271768963d9eb970b03/sources/Alife.Function/Alife.Function.Memory) 的分层归档机制移植到 KiraAI。沿用 `alife_memory_z`、长期记忆·Z 名称和原图标；核心围绕原始经历与可回溯存档重建。
 
+## 2.2.8 更新
+
+不再被第三方插件的合成昵称污染：跳过 `is_notice` 消息与「提醒任务所有者」等占位昵称，不再用它们更新人物/会话称呼；启动时自动检测并恢复被污染的名称为上一个正常称呼（后台任务页可手动重跑）。`MemoryNames` 返回同时瘦身为 `id/kind/name/revision/aliases`。
+
+详见[不再被第三方插件的合成昵称污染](docs/SYNTHETIC_NAMES_2_2_8.md)。
+
 ## 2.2.7 更新
 
 开屏动画遮罩去掉淡入：背景从第一帧就不透明，页面不会再从底下透出来（2.2.6 只把它改成了静态标记，但遮罩自身仍从 `opacity:0` 淡入 0.5 秒）。
