@@ -167,7 +167,7 @@ async def test_followup_facts_excluded_before_limit(tmp_path):
     )
     await plugin.initialize()
     try:
-        for i in range(4):
+        for i in range(55):
             rid = plugin.store.memorize(
                 "test:gm:other", f"喜欢猫的证据{i}", ["test:v"], float(i), float(i)
             )
@@ -189,8 +189,11 @@ async def test_followup_facts_excluded_before_limit(tmp_path):
         event = make_event()
         first = json.loads(await plugin.overview(event))
         second = json.loads(await plugin.overview(event))
-        assert len(first["facts"]) == 2 and first["already_seen"] == 0
-        assert second["facts"] == [] and second["already_seen"] == 2
+        # MemoryOverview 每次最多返回 50 条新事实：先排除已送达的，再截断。
+        assert len(first["facts"]) == 50 and first["already_seen"] == 0
+        assert len(second["facts"]) == 5 and second["already_seen"] == 50
+        third = json.loads(await plugin.overview(event))
+        assert third["facts"] == [] and third["already_seen"] == 55
     finally:
         await plugin.terminate()
 
@@ -271,12 +274,10 @@ async def test_global_recall_has_provenance_names_and_no_vector_calls(tmp_path):
             )
         )
         assert result["ok"]
-        assert (
-            json.loads(await plugin.memory_names(event, "阿澄"))["entities"][0][
-                "history"
-            ][1]["name"]
-            == "阿澄"
-        )
+        # 2.2.8 起 MemoryNames 只返回 id/kind/name/revision/aliases，
+        # 旧称呼出现在 aliases 里。
+        renamed = json.loads(await plugin.memory_names(event, "阿澄"))["entities"][0]
+        assert renamed["name"] == "阿澄的新名字" and "阿澄" in renamed["aliases"]
         plugin.settings = plugin.settings.model_copy(update={"recall_scope": "session"})
         assert not json.loads(await plugin.memory_names(event, "阿澄"))["entities"]
     finally:
