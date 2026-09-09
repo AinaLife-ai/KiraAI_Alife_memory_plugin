@@ -1734,17 +1734,32 @@ class AlifeMemoryPlugin(BasePlugin):
     @register.api(method="GET", path="/names/pending", auth=True)
     async def api_name_pending(self):
         ids = await self.store.call("refreshable_names", 200)
-        return {"ids": ids, "total": len(ids)}
+        all_ids = await self.store.call("refreshable_names", 200, include_named=True)
+        return {
+            "ids": ids,
+            "total": len(ids),
+            "ids_all": all_ids,
+            "all_total": len(all_ids),
+        }
 
     @register.api(method="POST", path="/names/refresh-batch", auth=True)
     async def api_name_refresh_batch(self, request: Request):
         value = await self.body(request, NameBatch)
-        ids = value.ids or await self.store.call("refreshable_names", 200)
+        all_mode = value.mode == "all"
+        if value.ids:
+            ids = value.ids
+        else:
+            ids = await self.store.call(
+                "refreshable_names", 200, include_named=all_mode
+            )
         updated, skipped, failed = [], [], []
+        # missing 模式只补缺名（skip_named=True）；all 模式连已有名字一起更新，
+        # 旧名仍会保留在曾用名历史里，随时可恢复。
+        skip_named = not all_mode
         for entity_id in ids[:200]:
             try:
                 entity, wrote = await self.refresh_name_detail(
-                    entity_id, reason=value.reason, skip_named=True
+                    entity_id, reason=value.reason, skip_named=skip_named
                 )
                 if wrote:
                     updated.append(entity_id)
@@ -1758,10 +1773,13 @@ class AlifeMemoryPlugin(BasePlugin):
         return {
             "ok": True,
             "reason": value.reason,
+            "mode": value.mode,
             "updated": updated,
             "skipped": skipped,
             "failed": failed,
+            # 「还有几个没名字」永远是缺名的数量，与本次模式无关。
             "remaining": len(await self.store.call("refreshable_names", 200)),
+            "scanned": len(ids[:200]),
         }
 
     @register.api(method="POST", path="/maintenance/names", auth=True)

@@ -233,7 +233,8 @@
               id="nameQuery"
               aria-label="搜索名称"
               placeholder="昵称、曾用名或ID"
-            /><button id="searchNames">查找人物与群</button>
+            /><button id="searchNames">查找人物与群</button
+            ><button id="nameBatchManual">批量拉取姓名</button>
           </div>
           <div id="nameCards" class="cards"></div>
           <div class="pager">
@@ -377,6 +378,22 @@
         ><button id="nameBatchNever">不再提示</button
         ><button id="nameBatchStop" class="hide">停止</button
         ><button id="nameBatchGo" class="primary">一键拉取</button>
+      </div>
+    </dialog>
+    <dialog id="nameBatchAsk" class="dialog">
+      <div class="panel-title"><h2>批量拉取姓名</h2></div>
+      <p id="nameBatchAskText" class="muted"></p>
+      <ul class="muted">
+        <li>只更新显示名，稳定 ID 永不变；同名仍不会合并。</li>
+        <li>
+          「只补没有名字的」会<strong>跳过已有名字</strong>；「全更新」会连已有名字一起用平台当前昵称更新，旧名保留在曾用名里、可一键恢复。
+        </li>
+        <li>随时可以在本页人工修改，之后的新消息仍会自动记录昵称。</li>
+      </ul>
+      <div class="actions">
+        <button id="nameBatchCancel">取消</button
+        ><button id="nameBatchAll">全更新</button
+        ><button id="nameBatchMissing" class="primary">只补没有名字的</button>
       </div>
     </dialog>
     <dialog id="profileDialog" class="dialog">
