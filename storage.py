@@ -164,12 +164,46 @@ class Store:
             ).fetchone()
         return row is not None
 
-    def mark_bootstrap(self, sid):
-        """记下已处理：清理播种记录后也不会重新播种。"""
+    def mark_bootstrap(self, sid, clean=False):
+        """记下已处理：清理播种记录后也不会重新播种。
+
+        ``clean=True`` 表示播种当时没有任何会话合并/压缩插件在场，
+        这批记录可以确认来源，不需要事后核对。
+        """
         with self.connect() as db:
             db.execute(
                 "INSERT OR REPLACE INTO meta VALUES (?,1)", (f"bootstrap:{sid}",)
             )
+            if clean:
+                db.execute(
+                    "INSERT OR REPLACE INTO meta VALUES (?,1)",
+                    (f"bootstrap_clean:{sid}",),
+                )
+            self.bump(db)
+
+    def bootstrap_review(self):
+        """有播种记录、但来源无法确认（没有 clean 标记）的会话。"""
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT DISTINCT r.sid FROM records r WHERE r.deleted=0 "
+                "AND r.event_key LIKE ? AND NOT EXISTS "
+                "(SELECT 1 FROM meta WHERE key='bootstrap_clean:'||r.sid)",
+                ("%:bootstrap:%",),
+            ).fetchall()
+        return [row["sid"] for row in rows]
+
+    def bootstrap_reviewed(self):
+        with self.connect() as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM meta WHERE key='bootstrap_review_done'"
+                ).fetchone()
+                is not None
+            )
+
+    def mark_bootstrap_reviewed(self):
+        with self.connect() as db:
+            db.execute("INSERT OR REPLACE INTO meta VALUES ('bootstrap_review_done',1)")
             self.bump(db)
 
     def purge_bootstrap(self):

@@ -863,11 +863,45 @@ async def test_bootstrap_seeds_then_purge_removes_and_stays_gone(tmp_path):
         )
         await plugin.on_request(event, request)
         assert len(plugin.store.active(event.sid)) == 2
+        # 无合并插件时的播种来源可确认，不进入核对列表
+        assert plugin.store.bootstrap_review() == []
         report = plugin.store.purge_bootstrap()
         assert report["removed"] == 2 and report["sessions"] == 1
         assert plugin.store.active(event.sid) == []
         # 软删除后不会重新播种
         await plugin.on_request(event, request)
         assert plugin.store.active(event.sid) == []
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_review_hint_only_for_legacy_records(tmp_path):
+    manager = _PluginManager({"kira_session_merger": True})
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path, plugin_mgr=manager
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        # 模拟老版本遗留：有播种记录、没有 clean 标记
+        plugin.store.capture(
+            "test:dm:old",
+            "bootstrap",
+            [{"role": "user", "content": "旧对话", "time": 1.0, "users": ["test:u"]}],
+        )
+        info = await plugin.refresh_bootstrap_review()
+        assert info["count"] == 1
+        assert info["merge_plugin"] == "kira_session_merger"
+        assert info["reviewed"] is False
+        assert info["sessions"] == ["test:dm:old"]
+        # 点「保留，不再提醒」
+        result = await plugin.api_bootstrap_review()
+        assert result["ok"] and result["reviewed"] is True and result["count"] == 1
+        # 没有合并插件时不提示
+        manager.states["kira_session_merger"] = False
+        assert (await plugin.refresh_bootstrap_review())["merge_plugin"] == ""
     finally:
         await plugin.terminate()

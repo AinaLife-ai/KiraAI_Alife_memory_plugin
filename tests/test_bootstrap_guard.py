@@ -149,3 +149,32 @@ def test_merge_plugin_active_reports_the_blocker():
     plugin = build({"auto_delete_session": True})
     assert plugin.merge_plugin_active() == "auto_delete_session"
     assert build().merge_plugin_active() == ""
+
+
+def _store(tmp_path):
+    storage = importlib.import_module("alife_bootstrap_test.storage")
+    store = storage.Store(tmp_path / "bootstrap.sqlite3")
+    store.initialize()
+    return store
+
+
+def test_clean_marker_excludes_records_from_review(tmp_path):
+    store = _store(tmp_path)
+    seed = [{"role": "user", "content": "旧对话", "time": 1.0, "users": ["u"]}]
+    store.capture("s1", "bootstrap", seed)
+    assert store.bootstrap_review() == ["s1"]
+    store.mark_bootstrap("s1", clean=True)
+    assert store.bootstrap_review() == []
+
+
+def test_legacy_records_need_review_until_purged(tmp_path):
+    store = _store(tmp_path)
+    seed = [{"role": "user", "content": "旧对话", "time": 1.0, "users": ["u"]}]
+    store.capture("s2", "bootstrap", seed)
+    store.mark_bootstrap("s2")  # 老版本：没有 clean 标记
+    assert store.bootstrap_review() == ["s2"]
+    assert store.bootstrap_reviewed() is False
+    store.mark_bootstrap_reviewed()
+    assert store.bootstrap_reviewed() is True
+    assert store.purge_bootstrap()["removed"] == 1
+    assert store.bootstrap_review() == []
