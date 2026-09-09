@@ -79,7 +79,8 @@ class Store:
               summary TEXT NOT NULL, content TEXT NOT NULL, users TEXT NOT NULL,
               active INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0,
               revision INTEGER NOT NULL DEFAULT 1, permanent INTEGER NOT NULL DEFAULT 0,
-              position INTEGER NOT NULL, event_key TEXT UNIQUE, created REAL NOT NULL);
+              position INTEGER NOT NULL, event_key TEXT UNIQUE, created REAL NOT NULL,
+              importance INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS record_context ON records(sid,active,deleted,level DESC,position);
             CREATE INDEX IF NOT EXISTS record_time ON records(level,start,end);
             CREATE TABLE IF NOT EXISTS edges (
@@ -90,7 +91,8 @@ class Store:
               content TEXT NOT NULL, reason TEXT NOT NULL, scenario TEXT NOT NULL, tags TEXT NOT NULL,
               relations TEXT NOT NULL, sources TEXT NOT NULL, fingerprint TEXT NOT NULL,
               deleted INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1,
-              audited REAL NOT NULL DEFAULT 0);
+              audited REAL NOT NULL DEFAULT 0, importance INTEGER NOT NULL DEFAULT 5,
+              merge_pending INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS fact_identity ON facts(sid,subject,fingerprint,deleted);
             CREATE INDEX IF NOT EXISTS fact_subject ON facts(sid,subject,category,deleted);
             CREATE TABLE IF NOT EXISTS versions (
@@ -137,6 +139,27 @@ class Store:
                 db.execute(
                     "UPDATE records SET archived_at=? WHERE active=0 AND archived_at=0",
                     (time.time(),),
+                )
+            if "importance" not in columns:
+                db.execute(
+                    "ALTER TABLE records ADD COLUMN importance INTEGER NOT NULL DEFAULT 0"
+                )
+            fact_columns = {r[1] for r in db.execute("PRAGMA table_info(facts)")}
+            if "importance" not in fact_columns:
+                db.execute(
+                    "ALTER TABLE facts ADD COLUMN importance INTEGER NOT NULL DEFAULT 5"
+                )
+            if "merge_pending" not in fact_columns:
+                db.execute(
+                    "ALTER TABLE facts ADD COLUMN merge_pending INTEGER NOT NULL DEFAULT 0"
+                )
+            if "created" not in fact_columns:
+                db.execute(
+                    "ALTER TABLE facts ADD COLUMN created REAL NOT NULL DEFAULT 0"
+                )
+                db.execute(
+                    "UPDATE facts SET created=coalesce((SELECT max(r.start) FROM records r,"
+                    " json_each(facts.sources) s WHERE r.id=s.value),0)"
                 )
             db.execute(
                 "UPDATE jobs SET state='queued',detail='resumed after restart' WHERE state='running'"
@@ -302,7 +325,7 @@ class Store:
             self.bump(db)
             return True
 
-    def entities(self, query="", ids=None, limit=100, offset=0):
+    def entities(self, query="", ids=None, limit=100, offset=0, summaries=0):
         clauses, args = [], []
         if ids is not None:
             clauses.append("e.id IN (SELECT value FROM json_each(?))")
@@ -322,8 +345,42 @@ class Store:
                     [*args, limit, offset],
                 )
             ]
+            stats = {}
+            if summaries and rows:
+                ids_ = [r["id"] for r in rows]
+                for row in db.execute(
+                    "SELECT subject, count(*) AS facts, max(audited) AS seen,"
+                    " coalesce((SELECT group_concat(content, char(1)) FROM"
+                    " (SELECT content FROM facts x WHERE x.subject=facts.subject"
+                    " AND x.deleted=0 ORDER BY x.importance DESC,x.audited DESC"
+                    " LIMIT ?)),'') AS top"
+                    " FROM facts WHERE deleted=0 AND subject IN"
+                    " (SELECT value FROM json_each(?)) GROUP BY subject",
+                    (max(1, int(summaries)), dump(ids_)),
+                ):
+                    stats[row["subject"]] = {
+                        "facts": row["facts"],
+                        "seen": row["seen"] or 0,
+                        "summary": [
+                            item[:24] for item in row["top"].split(chr(1)) if item
+                        ],
+                        "relations": 0,
+                    }
+                for row in db.execute(
+                    "SELECT f.subject, count(*) AS n FROM facts f,"
+                    " json_each(f.relations) rel WHERE f.deleted=0 AND"
+                    " json_extract(rel.value,'$.subject')=f.subject AND f.subject IN"
+                    " (SELECT value FROM json_each(?)) GROUP BY f.subject",
+                    (dump(ids_),),
+                ):
+                    if row["subject"] in stats:
+                        stats[row["subject"]]["relations"] = row["n"]
             for r in rows:
                 r.update(identity_info(r["id"]))
+                if summaries:
+                    r["stats"] = stats.get(
+                        r["id"], {"facts": 0, "seen": 0, "summary": [], "relations": 0}
+                    )
                 r["history"] = [
                     dict(n)
                     for n in db.execute(
@@ -359,6 +416,34 @@ class Store:
                 ids.update(row["users"])
                 ids.add(row["sid"])
             return sorted(ids)
+
+    def entity_ids_for_query(self, query, sid="", users=(), scope="session"):
+        """Entities whose current or former name (or id) appears in the query text.
+
+        Used to give facts about the people being talked about a ranking boost,
+        instead of hoping their names appear in the matched text.
+        """
+        query = (query or "").strip()
+        if len(query) < 2 or len(query) > 500:
+            return []
+        visible = None
+        if scope != "global":
+            visible = set(self.entity_ids(sid, users, scope))
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT DISTINCT e.id, e.name FROM entities e "
+                "LEFT JOIN entity_names n ON n.entity_id=e.id WHERE "
+                "(length(n.name)>=2 AND instr(?,n.name)>0) OR "
+                "(length(e.name)>=2 AND instr(?,e.name)>0) OR "
+                "(length(e.id)>=4 AND instr(?,e.id)>0) LIMIT 100",
+                (query, query, query),
+            ).fetchall()
+        ids = []
+        for row in rows:
+            if visible is not None and row[0] not in visible:
+                continue
+            ids.append(row[0])
+        return ids[:20]
 
     def can_schedule(self, kind, sid):
         with self.connect() as db:
@@ -1006,14 +1091,16 @@ class Store:
             sources = sorted(set(json.loads(old["sources"]) + fact["source_ids"]))
             tags = sorted(set(json.loads(old["tags"]) + fact["tags"]))
             db.execute(
-                "UPDATE facts SET sources=?,tags=?,revision=revision+1 WHERE id=?",
-                (dump(sources), dump(tags), old["id"]),
+                "UPDATE facts SET sources=?,tags=?,importance=MAX(importance,?),"
+                "revision=revision+1 WHERE id=?",
+                (dump(sources), dump(tags), int(fact.get("importance", 5)), old["id"]),
             )
             return old["id"]
         new_id = uid()
         db.execute(
-            """INSERT INTO facts(id,sid,category,subject,content,reason,scenario,tags,relations,sources,fingerprint)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO facts(id,sid,category,subject,content,reason,scenario,tags,
+           relations,sources,fingerprint,importance,created)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 new_id,
                 sid,
@@ -1026,6 +1113,8 @@ class Store:
                 dump(fact["relations"]),
                 dump(fact["source_ids"]),
                 fingerprint,
+                int(fact.get("importance", 5)),
+                time.time(),
             ),
         )
         return new_id
@@ -1102,14 +1191,15 @@ class Store:
             self.bump(db)
             return archive_id
 
-    def memorize(self, sid, content, users, start, end):
+    def memorize(self, sid, content, users, start, end, importance=8):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self._ensure_entities(db, sid, users)
             record_id = f"100-{int(start * 1000)}-{int(end * 1000)}-{uid()[:12]}"
             db.execute(
-                """INSERT INTO records(id,sid,role,level,start,end,summary,content,users,permanent,position,created)
-              VALUES (?,?,'assistant',100,?,?,?,?,?,1,0,?)""",
+                """INSERT INTO records(id,sid,role,level,start,end,summary,content,users,
+              permanent,position,created,importance)
+              VALUES (?,?,'assistant',100,?,?,?,?,?,1,0,?,?)""",
                 (
                     record_id,
                     sid,
@@ -1119,6 +1209,7 @@ class Store:
                     content,
                     dump(users),
                     time.time(),
+                    int(importance),
                 ),
             )
             self.bump(db)
@@ -1210,15 +1301,20 @@ class Store:
             ).fetchone()
         return {"live": row["live"] or 0, "archived": row["archived"] or 0}
 
-    def sessions_by_audit_age(self, limit):
-        """Sessions whose facts are the most stale, so audits stay paced."""
+    def sessions_by_audit_age(self, limit, recheck_seconds=0):
+        """Sessions with audit-eligible facts, most stale first."""
+        where = ["deleted=0", "merge_pending=0"]
+        args = []
+        if recheck_seconds > 0:
+            where.append("(audited=0 OR audited < ?)")
+            args.append(time.time() - recheck_seconds)
         with self.connect() as db:
             return [
                 row[0]
                 for row in db.execute(
-                    "SELECT sid FROM facts WHERE deleted=0 GROUP BY sid "
+                    "SELECT sid FROM facts WHERE " + " AND ".join(where) + " GROUP BY sid "
                     "ORDER BY min(audited) ASC, sid LIMIT ?",
-                    (max(1, limit),),
+                    [*args, max(1, limit)],
                 )
             ]
 
@@ -1328,6 +1424,119 @@ class Store:
                 if patch.get("deleted"):
                     self._orphan_facts(db, target)
             self.bump(db)
+
+    def restore(self, kind, target, version_id, revision):
+        """Roll a record/fact back to a stored snapshot (itself versioned)."""
+        table = "records" if kind == "record" else "facts"
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                f"SELECT * FROM {table} WHERE id=?", (target,)
+            ).fetchone()
+            if not current or current["revision"] != revision:
+                raise Conflict("target changed; reload before restoring")
+            snapshot = db.execute(
+                "SELECT snapshot FROM versions WHERE id=? AND kind=? AND target=?",
+                (version_id, kind, target),
+            ).fetchone()
+            if not snapshot:
+                raise ValueError("version not found")
+            data = json.loads(snapshot["snapshot"])
+            columns = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+            updates = {
+                k: v
+                for k, v in data.items()
+                if k in columns and k not in ("id", "revision")
+            }
+            if not updates:
+                raise ValueError("nothing to restore")
+            db.execute(
+                "INSERT INTO versions(kind,target,snapshot,reason,created) VALUES (?,?,?,?,?)",
+                (kind, target, dump(dict(current)), "恢复前存档", time.time()),
+            )
+            values = [dump(v) if isinstance(v, (list, dict)) else v for v in updates.values()]
+            db.execute(
+                f"UPDATE {table} SET {','.join(k + '=?' for k in updates)},"
+                "revision=revision+1 WHERE id=?",
+                (*values, target),
+            )
+            if kind == "fact":
+                db.execute(
+                    "UPDATE facts SET fingerprint=?,merge_pending=0 WHERE id=?",
+                    (uid(), target),
+                )
+            else:
+                db.execute("DELETE FROM vectors WHERE id=?", (target,))
+            self.bump(db)
+            return {"kind": kind, "target": target, "restored_from": version_id}
+
+    def profile(self, entity_id, summary_count=3, sid="", global_scope=True, hide_pending=False):
+        """Aggregated view of one entity: names, facts by category, relations, stats."""
+        rows = self.entities(ids=[entity_id], limit=1)
+        if not rows:
+            return None
+        entity = rows[0]
+        where, args = ["deleted=0", "subject=?"], [entity_id]
+        if hide_pending:
+            where.append("merge_pending=0")
+        if not global_scope and sid:
+            where.append("sid=?")
+            args.append(sid)
+        with self.connect() as db:
+            facts = [
+                self.row(r)
+                for r in db.execute(
+                    "SELECT * FROM facts WHERE " + " AND ".join(where)
+                    + " ORDER BY importance DESC,audited DESC,id",
+                    args,
+                )
+            ]
+            relations = []
+            for fact in facts:
+                for rel in fact["relations"]:
+                    if rel.get("subject") == entity_id or rel.get("object") == entity_id:
+                        relations.append({**rel, "fact_id": fact["id"]})
+            sessions = {
+                r[0]
+                for r in db.execute(
+                    "SELECT DISTINCT sid FROM facts WHERE "
+                    + " AND ".join(where),
+                    args,
+                )
+            }
+            last_active = db.execute(
+                "SELECT max(start) FROM records WHERE deleted=0 AND users LIKE ?",
+                ("%" + entity_id + "%",),
+            ).fetchone()[0]
+        groups = {}
+        for fact in facts:
+            groups.setdefault(fact["category"], []).append(fact)
+        summary = [f["content"] for f in facts[:summary_count]]
+        return {
+            "entity": {
+                "id": entity["id"],
+                "kind": entity["kind"],
+                "name": entity["name"],
+                "revision": entity["revision"],
+                "lookup_id": entity.get("lookup_id", ""),
+                "label": entity.get("label", ""),
+                "aliases": list(
+                    dict.fromkeys(
+                        h["name"] for h in entity["history"] if h["name"] != entity["name"]
+                    )
+                )[:10],
+                "history": entity["history"][:20],
+            },
+            "summary": summary,
+            "categories": groups,
+            "relations": relations,
+            "stats": {
+                "facts": len(facts),
+                "relations": len(relations),
+                "sessions": len(sessions),
+                "last_active": last_active or 0,
+            },
+        }
 
     @staticmethod
     def _orphan_facts(db, record_id):
@@ -1487,14 +1696,21 @@ class Store:
         exclude_ids=(),
         prefer_sid="",
         prefer_users=(),
+        prefer_subjects=(),
+        hide_pending=False,
+        importance_first=False,
     ):
         where, args = ["deleted=0"], []
+        if hide_pending:
+            where.append("merge_pending=0")
         if exclude_ids:
             where.append("id NOT IN (SELECT value FROM json_each(?))")
             args.append(dump(list(exclude_ids)))
         if not global_scope:
             if include_shared:
-                where.append("""(sid=? OR EXISTS (SELECT 1 FROM records,json_each(facts.sources) AS src WHERE records.id=src.value
+                # Facts explicitly parked in the global bucket (cross-session
+                # merges) are shared knowledge, so they are visible everywhere.
+                where.append("""(sid=? OR sid='global' OR EXISTS (SELECT 1 FROM records,json_each(facts.sources) AS src WHERE records.id=src.value
                   AND records.deleted=0 AND (records.visibility='global' OR (records.visibility='user' AND EXISTS
                   (SELECT 1 FROM json_each(records.users) WHERE value IN (SELECT value FROM json_each(?)))))))""")
                 args.extend([sid, dump(list(users))])
@@ -1505,14 +1721,21 @@ class Store:
             if value:
                 where.append(key + "=?")
                 args.append(value)
-        tier_sql, tier_args = "", []
+        tier_parts, tier_args = [], []
         if prefer_sid or prefer_users:
             # Same session first, then facts about the current participants.
-            tier_sql = (
+            tier_parts.append(
                 "CASE WHEN sid=? THEN 0 WHEN subject IN "
-                "(SELECT value FROM json_each(?)) THEN 1 ELSE 2 END, "
+                "(SELECT value FROM json_each(?)) THEN 1 ELSE 2 END"
             )
-            tier_args = [prefer_sid, dump(list(prefer_users))]
+            tier_args += [prefer_sid, dump(list(prefer_users))]
+        if prefer_subjects:
+            # Then facts about entities named in the current message.
+            tier_parts.append(
+                "CASE WHEN subject IN (SELECT value FROM json_each(?)) THEN 0 ELSE 1 END"
+            )
+            tier_args.append(dump(list(prefer_subjects)))
+        tier_sql = (", ".join(tier_parts) + ", ") if tier_parts else ""
         with self.connect() as db:
             if lexical:
                 from .retrieval import relevance
@@ -1527,13 +1750,220 @@ class Store:
                     "SELECT * FROM facts WHERE "
                     + " AND ".join(where)
                     + (
-                        f" ORDER BY {tier_sql}fact_score(content) DESC,audited,id LIMIT ? OFFSET ?"
+                        f" ORDER BY {tier_sql}fact_score(content) DESC,"
+                        f"{'importance DESC,created DESC,' if importance_first else 'audited,'}id LIMIT ? OFFSET ?"
                         if lexical
-                        else f" ORDER BY {tier_sql}audited,id LIMIT ? OFFSET ?"
+                        else f" ORDER BY {tier_sql}"
+                        f"{'importance DESC,created DESC,' if importance_first else 'audited,'}id LIMIT ? OFFSET ?"
                     ),
                     [*args, *tier_args, limit, offset],
                 )
             ]
+
+    def audit_candidates(self, sid, limit=20, recheck_seconds=0):
+        """Facts eligible for audit: never audited, or stale beyond the cooldown."""
+        where = ["deleted=0", "merge_pending=0", "sid=?"]
+        args = [sid]
+        if recheck_seconds > 0:
+            where.append("(audited=0 OR audited < ?)")
+            args.append(time.time() - recheck_seconds)
+        with self.connect() as db:
+            return [
+                self.row(r)
+                for r in db.execute(
+                    "SELECT * FROM facts WHERE "
+                    + " AND ".join(where)
+                    + " ORDER BY audited,id LIMIT ?",
+                    [*args, limit],
+                )
+            ]
+
+    def similar_facts(
+        self, sid, subject, category, content, limit=3, min_score=0.25,
+        cross_session=False, exclude_ids=(),
+    ):
+        """Local near-duplicate candidates for a fact about to be stored."""
+        from .retrieval import similarity
+
+        where = ["f.deleted=0", "f.merge_pending=0", "f.subject=?", "f.category=?"]
+        args = [subject, category]
+        if not cross_session:
+            where.append("f.sid=?")
+            args.append(sid)
+        if exclude_ids:
+            where.append("f.id NOT IN (SELECT value FROM json_each(?))")
+            args.append(dump(list(exclude_ids)))
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT f.*, coalesce((SELECT max(r.start) FROM records r,"
+                " json_each(f.sources) s WHERE r.id=s.value),0) AS time"
+                " FROM facts f WHERE " + " AND ".join(where),
+                args,
+            ).fetchall()
+        scored = []
+        for row in rows:
+            score = similarity(content, row["content"], min_overlap=2)
+            if score >= min_score:
+                scored.append((score, self.row(row)))
+        scored.sort(key=lambda item: -item[0])
+        return scored[:limit]
+
+    def facts_for_merge(self, sid="", ids=None, pending_only=False):
+        """Fact rows with their newest evidence time, for merge decisions."""
+        where, args = ["f.deleted=0"], []
+        if pending_only:
+            where.append("f.merge_pending=1")
+        if sid:
+            where.append("f.sid=?")
+            args.append(sid)
+        if ids:
+            where.append("f.id IN (SELECT value FROM json_each(?))")
+            args.append(dump(list(ids)))
+        with self.connect() as db:
+            return [
+                self.row(r)
+                for r in db.execute(
+                    "SELECT f.*, coalesce((SELECT max(r.start) FROM records r,"
+                    " json_each(f.sources) s WHERE r.id=s.value),0) AS time"
+                    " FROM facts f WHERE " + " AND ".join(where) + " ORDER BY time,id",
+                    args,
+                )
+            ]
+
+    def facts_by_ids(self, ids):
+        if not ids:
+            return []
+        with self.connect() as db:
+            return [
+                self.row(r)
+                for r in db.execute(
+                    "SELECT f.*, coalesce((SELECT max(r.start) FROM records r,"
+                    " json_each(f.sources) s WHERE r.id=s.value),0) AS time"
+                    " FROM facts f WHERE f.id IN (SELECT value FROM json_each(?))"
+                    " AND f.deleted=0",
+                    (dump(list(ids)),),
+                )
+            ]
+
+    def versions_of(self, kind, target, limit=20):
+        with self.connect() as db:
+            return [
+                {"id": r["id"], "reason": r["reason"], "created": r["created"]}
+                for r in db.execute(
+                    "SELECT id,reason,created FROM versions WHERE kind=? AND target=?"
+                    " ORDER BY id DESC LIMIT ?",
+                    (kind, target, limit),
+                )
+            ]
+
+    def facts_since(self, sid, since):
+        """Facts written (or first seen) after a timestamp, newest first.
+
+        An empty ``sid`` scans every session (used once after legacy import).
+        """
+        where, args = ["f.deleted=0", "f.created>=?"], [since]
+        if sid:
+            where.append("f.sid=?")
+            args.append(sid)
+        with self.connect() as db:
+            return [
+                self.row(r)
+                for r in db.execute(
+                    "SELECT f.*, coalesce((SELECT max(r.start) FROM records r,"
+                    " json_each(f.sources) s WHERE r.id=s.value),0) AS time"
+                    " FROM facts f WHERE " + " AND ".join(where)
+                    + " ORDER BY f.created DESC, f.id",
+                    args,
+                )
+            ]
+
+    def mark_merge_pending(self, ids, pending=1):
+        if not ids:
+            return 0
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            changed = 0
+            for fact_id in ids:
+                changed += db.execute(
+                    "UPDATE facts SET merge_pending=? WHERE id=? AND deleted=0",
+                    (1 if pending else 0, fact_id),
+                ).rowcount
+            self.bump(db)
+            return changed
+
+    def pending_facts(self, limit=500):
+        with self.connect() as db:
+            return [
+                {"id": r["id"], "sid": r["sid"]}
+                for r in db.execute(
+                    "SELECT id,sid FROM facts WHERE merge_pending=1 AND deleted=0 LIMIT ?",
+                    (limit,),
+                )
+            ]
+
+    def merge_facts(self, target_id, source_ids, content, reason, new_sid=""):
+        """Fold near-duplicate facts into ``target_id``; the rest are soft-deleted.
+
+        The target keeps its identity (and usually its session); tags, relations
+        and sources are unioned and importance takes the maximum.
+        """
+        group = list(dict.fromkeys([target_id, *source_ids]))
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = {}
+            for fact_id in group:
+                row = db.execute(
+                    "SELECT * FROM facts WHERE id=?", (fact_id,)
+                ).fetchone()
+                if not row or row["deleted"]:
+                    raise Conflict("merge source changed")
+                rows[fact_id] = row
+            target = rows[target_id]
+            if any(
+                (rows[k]["subject"], rows[k]["category"])
+                != (target["subject"], target["category"])
+                for k in group
+            ):
+                raise ValueError("cross-scope merge is forbidden")
+            if new_sid and len({rows[k]["sid"] for k in group}) > 1:
+                target_sid = new_sid
+            else:
+                target_sid = target["sid"]
+            sources = sorted({s for k in group for s in json.loads(rows[k]["sources"])})
+            tags = sorted({t for k in group for t in json.loads(rows[k]["tags"])})
+            relations = {
+                dump(rel): rel for k in group for rel in json.loads(rows[k]["relations"])
+            }
+            importance = max(rows[k]["importance"] for k in group)
+            for k in group:
+                db.execute(
+                    "INSERT INTO versions(kind,target,snapshot,reason,created) "
+                    "VALUES ('fact',?,?,?,?)",
+                    (k, dump(dict(rows[k])), reason, time.time()),
+                )
+            db.execute(
+                "UPDATE facts SET sid=?,content=?,sources=?,tags=?,relations=?,"
+                "importance=?,merge_pending=0,fingerprint=?,revision=revision+1 WHERE id=?",
+                (
+                    target_sid,
+                    content,
+                    dump(sources),
+                    dump(tags),
+                    dump(list(relations.values())),
+                    importance,
+                    uid(),
+                    target_id,
+                ),
+            )
+            for k in group:
+                if k != target_id:
+                    db.execute(
+                        "UPDATE facts SET deleted=1,merge_pending=0,"
+                        "revision=revision+1 WHERE id=?",
+                        (k,),
+                    )
+            self.bump(db)
+            return target_id
 
     def edit_history(self, kind, targets):
         with self.connect() as db:
@@ -1581,6 +2011,11 @@ class Store:
                     "INSERT INTO versions(kind,target,snapshot,reason,created) VALUES ('fact',?,?,?,?)",
                     (old["id"], dump(old), a["reason"], time.time()),
                 )
+                if a.get("importance") is not None:
+                    db.execute(
+                        "UPDATE facts SET importance=?,revision=revision+1 WHERE id=?",
+                        (a["importance"], a["target_id"]),
+                    )
                 if a["action"] == "keep":
                     continue
                 sources = sorted({s for k in group for s in by_id[k]["sources"]})

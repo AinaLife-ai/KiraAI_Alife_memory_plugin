@@ -966,3 +966,254 @@ async def test_migration_background_and_skips_unchanged_sources(tmp_path):
         assert plugin.migration_note.startswith("迁移完成")
     finally:
         await plugin.terminate()
+
+@pytest.mark.asyncio
+async def test_config_migration_rewrites_only_untouched_defaults(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setattr(module, "get_config_path", lambda: tmp_path)
+    (tmp_path / "plugins").mkdir()
+    path = tmp_path / "plugins" / "alife_memory_z.json"
+    path.write_text(
+        json.dumps(
+            {
+                "alife": {"audit_interval": 1800, "top_k": 9},
+                "alife_meta": {"config_version": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(ctx, {"alife": {}})
+    changed = await plugin.apply_config_migrations()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert changed == ["audit_interval"]
+    assert saved["alife"]["audit_interval"] == 7200
+    assert saved["alife"]["top_k"] == 9
+    assert saved["alife_meta"]["config_version"] >= 2
+    assert plugin.settings.audit_interval == 7200
+    # Second run is a no-op even though audit_interval differs from the old default.
+    assert await plugin.apply_config_migrations() == []
+
+def json_request(payload):
+    import json as _json
+    from starlette.requests import Request
+
+    body = _json.dumps(payload, ensure_ascii=False).encode()
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request({"type": "http", "method": "POST", "path": "/", "headers": []}, receive)
+
+
+@pytest.mark.asyncio
+async def test_profile_tool_and_restore_api(tmp_path):
+    import json
+
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        plugin.store.capture(
+            "test:gm:1",
+            "t",
+            [
+                {
+                    "role": "user",
+                    "content": "萤火对花生过敏",
+                    "users": ["test:firefly"],
+                    "time": 1.0,
+                }
+            ],
+        )
+        record = plugin.store.active("test:gm:1")[0]
+        with plugin.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            fact_id = plugin.store._add_fact(
+                db,
+                "test:gm:1",
+                {
+                    "category": "preference",
+                    "subject": "test:firefly",
+                    "content": "萤火对花生过敏",
+                    "reason": "",
+                    "scenario": "",
+                    "tags": [],
+                    "relations": [],
+                    "source_ids": [record["id"]],
+                    "importance": 8,
+                },
+            )
+        plugin.store.observe_name("test:firefly", "萤火", source="admin")
+        event = make_event()
+
+        tool = json.loads(await plugin.get_profile(event, "萤火"))
+        assert tool["ok"] is True
+        assert tool["profiles"][0]["summary"] == ["萤火对花生过敏"]
+
+        profile = await plugin.api_profile(entity_id="test:firefly")
+        assert profile["entity"]["name"] == "萤火"
+        assert profile["categories"]["preference"][0]["content"] == "萤火对花生过敏"
+
+        detail = await plugin.api_fact(fact_id)
+        assert detail["content"] == "萤火对花生过敏"
+        assert detail["versions"] == []
+
+        await plugin.api_edit(
+            json_request(
+                {
+                    "kind": "fact",
+                    "target": fact_id,
+                    "revision": detail["revision"],
+                    "patch": {"content": "改过的内容"},
+                    "reason": "集成测试",
+                }
+            )
+        )
+        edited = await plugin.api_fact(fact_id)
+        assert edited["content"] == "改过的内容"
+        version_id = edited["versions"][0]["id"]
+
+        await plugin.api_restore(
+            json_request(
+                {
+                    "kind": "fact",
+                    "target": fact_id,
+                    "version_id": version_id,
+                    "revision": edited["revision"],
+                }
+            )
+        )
+        restored = await plugin.api_fact(fact_id)
+        assert restored["content"] == "萤火对花生过敏"
+        assert restored["versions"][0]["reason"] == "恢复前存档"
+
+        # 记录（永久记忆）走同一条恢复链路
+        record_id = plugin.store.memorize(
+            "test:gm:1", "记住这件事", ["test:firefly"], 1.0, 1.0
+        )
+        record = plugin.store.get(record_id)
+        await plugin.api_edit(
+            json_request(
+                {
+                    "kind": "record",
+                    "target": record_id,
+                    "revision": record["revision"],
+                    "patch": {"summary": "改过的摘要"},
+                    "reason": "集成测试",
+                }
+            )
+        )
+        edited_record = plugin.store.get(record_id)
+        assert edited_record["summary"] == "改过的摘要"
+        await plugin.api_restore(
+            json_request(
+                {
+                    "kind": "record",
+                    "target": record_id,
+                    "version_id": edited_record["versions"][0]["id"],
+                    "revision": edited_record["revision"],
+                }
+            )
+        )
+        assert plugin.store.get(record_id)["summary"] == "记住这件事"
+    finally:
+        await plugin.terminate()
+
+def make_text_event(text):
+    session = Session(adapter_name="test", session_type="gm", session_id="1")
+    msg = KiraIMMessage(
+        message_id="one",
+        self_id="bot",
+        chain=MessageChain([Text(text)]),
+        timestamp=100,
+        sender=User(user_id="u", nickname="小明"),
+    )
+    msg.message_str = "[小明] " + text
+    return KiraMessageBatchEvent(
+        messages=[msg], session=session, timestamp=100, message_types=[]
+    )
+
+
+@pytest.mark.asyncio
+async def test_injection_hides_pending_and_prefers_important_subjects(tmp_path):
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx,
+        {
+            "alife": {
+                "probability": 0.0,
+                "audit_enabled": False,
+                "recall_scope": "global",
+            }
+        },
+    )
+    await plugin.initialize()
+    try:
+        event = make_text_event("萤火最近怎么样")
+        plugin.store.capture(
+            event.sid,
+            "t",
+            [
+                {"role": "user", "content": "来源", "users": ["test:firefly"], "time": 1.0}
+            ],
+        )
+        record = plugin.store.active(event.sid)[0]
+
+        def add(subject, content, importance):
+            with plugin.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                return plugin.store._add_fact(
+                    db,
+                    event.sid,
+                    {
+                        "category": "preference",
+                        "subject": subject,
+                        "content": content,
+                        "reason": "",
+                        "scenario": "",
+                        "tags": [],
+                        "relations": [],
+                        "source_ids": [record["id"]],
+                        "importance": importance,
+                    },
+                )
+
+        plugin.store.observe_name("test:firefly", "萤火", source="admin")
+        high = add("test:firefly", "萤火对花生过敏", 9)
+        mid = add("test:firefly", "萤火喜欢甜口蛋糕", 4)
+        low = add("test:other", "另一个人喜欢甜食", 2)
+        pending = add("test:firefly", "萤火对坚果也过敏", 8)
+        plugin.store.mark_merge_pending([pending])
+
+        request = LLMRequest(
+            messages=[OpenAIMessage(role="user", content="原历史")],
+            system_prompt=[Prompt("人格", name="stable")],
+            user_prompt=[Prompt("问题", name="message")],
+        )
+        await plugin.on_request(event, request)
+        request.assemble_prompt()
+        block = request.messages[-1].content
+
+        assert "萤火对花生过敏" in block
+        assert "另一个人喜欢甜食" in block
+        assert "萤火对坚果也过敏" not in block, "待合并的事实不能出现在注入块里"
+        assert block.index("萤火对花生过敏") < block.index("另一个人喜欢甜食"), (
+            "消息里提到的人（萤火）应排在前面"
+        )
+        # 关键词命中（extra 层）会排在重要度排序之前，这是注入的既定分层；
+        # 重要度排序本身由 storage.facts(importance_first=True) 的单测覆盖。
+    finally:
+        await plugin.terminate()

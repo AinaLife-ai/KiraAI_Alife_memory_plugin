@@ -17,19 +17,23 @@ const fields = {
   mutual_exclusion: "迁移成功后互斥旧插件",
   migration_max_chars: "KiraOS 迁移字符上限",
   enabled: "启用记忆系统",
+  bootstrap_seed: "旧历史播种",
+  inject_recent_raw: "注入最近原文",
   capture_enabled: "记录对话与感知",
   auto_inject: "持续上下文与感知注入",
   threshold: "首层压缩阈值",
   batch_size: "首层每批条数",
   probability: "自动压缩概率",
   max_level: "最大压缩层级",
-  compress_model: "压缩模型",
+  compress_model: "压缩与合并模型",
   audit_model: "审计模型",
   embedding_model: "可选向量模型（启用后可能计费）",
   semantic_enabled: "启用向量检索（默认关闭）",
   audit_enabled: "后台审计",
   audit_interval: "审计间隔（秒）",
   audit_batch: "每批审计事实数",
+  audit_recheck_days: "审计冷却（天）",
+  audit_daily_calls: "审计每日调用上限",
   model_timeout: "模型超时（秒）",
   model_retries: "模型失败重试次数",
   worker_count: "后台并发数",
@@ -42,12 +46,28 @@ const fields = {
   proactive_interval: "主动感知间隔（秒）",
   proactive_sessions: "主动感知会话（每行一个）",
   compress_instruction: "压缩补充要求",
+  fact_merge_enabled: "写入时自动合并事实",
+  fact_merge_threshold: "事实合并触发阈值",
+  fact_merge_soft_chars: "事实合并字数（提示词）",
+  fact_merge_max_chars: "事实合并字数（硬上限）",
+  fact_merge_soft_reason_chars: "事实合并理由（提示词）",
+  fact_merge_reason_chars: "事实合并理由（硬上限）",
+  fact_merge_batch_clusters: "事实合并每批簇数",
+  fact_merge_prompt: "事实合并提示词",
+  cross_session_merge: "跨会话合并（身份类）",
+  merge_pending_hide: "合并前不参与检索",
   boot_enabled: "打开面板时播放载入动画",
   boot_replay_seconds: "载入动画重播冷却（秒）",
   session_affinity: "全局召回优先当前会话",
   permanent_dedupe: "自动合并相似永久记忆",
   dedupe_force_merge: "检测到相似就强制合并",
   dedupe_threshold: "永久记忆相似度阈值",
+  record_merge_soft_chars: "永久记忆合并字数（提示词）",
+  record_merge_max_chars: "永久记忆合并字数（硬上限）",
+  record_merge_soft_reason_chars: "永久记忆合并理由（提示词）",
+  record_merge_reason_chars: "永久记忆合并理由（硬上限）",
+  record_merge_prompt: "永久记忆合并提示词",
+  profile_summary_count: "画像摘要条数",
   search_active_only: "检索默认只搜常驻",
   cold_after_days: "归档转入冷归档天数",
 };
@@ -487,7 +507,8 @@ function renderFactCards(list) {
         .join("")
     : empty("画像还在形成");
   $$("[data-fact]").forEach(
-    (e) => (e.onclick = () => openFact(list[Number(e.dataset.fact)])),
+    (e) =>
+      (e.onclick = () => guard(() => openFact(list[Number(e.dataset.fact)]))),
   );
 }
 function showEditor() {
@@ -523,9 +544,8 @@ function renderRecord() {
   $("#sourceText").textContent =
     r.content +
     "\n\n旧插件来源\n" +
-    JSON.stringify(r.legacy_sources || [], null, 2) +
-    "\n\n修改历史\n" +
-    JSON.stringify(r.versions, null, 2);
+    JSON.stringify(r.legacy_sources || [], null, 2);
+  renderVersions("record", r.id, r.revision, r.versions || []);
   $("#sourceLinks").innerHTML = r.children
     .map(
       (id) =>
@@ -543,7 +563,11 @@ function renderRecord() {
   $("#forget").textContent = r.active ? "移出常驻上下文" : "恢复到常驻上下文";
   $("#delete").classList.remove("hide");
 }
-function openFact(row) {
+async function openFact(row) {
+  const detail = row.versions
+    ? row
+    : await api("/fact/" + encodeURIComponent(row.id));
+  row = detail;
   current = { kind: "fact", row };
   $("#editorTitle").textContent = "编辑画像事实";
   $("#editorMeta").textContent = row.subject + " · " + row.sid;
@@ -625,6 +649,7 @@ function openFact(row) {
   $$("[data-child]").forEach(
     (e) => (e.onclick = () => guard(() => openRecord(e.dataset.child))),
   );
+  renderVersions("fact", row.id, row.revision, row.versions || []);
   $("#forget").classList.add("hide");
   $("#delete").classList.remove("hide");
   showEditor();
@@ -771,7 +796,11 @@ function renderConfig(values) {
             )
             .join("") +
           "</select>";
-      else if (type === "array" || key === "compress_instruction")
+      else if (
+        type === "array" ||
+        key === "compress_instruction" ||
+        key.endsWith("_prompt")
+      )
         input =
           "<textarea>" +
           esc(Array.isArray(value) ? value.join("\n") : value) +
@@ -795,7 +824,9 @@ function renderConfig(values) {
       );
       return (
         '<label class="field ' +
-        (key === "compress_instruction" ? "wide" : "") +
+        (key === "compress_instruction" || key.endsWith("_prompt")
+          ? "wide"
+          : "") +
         '"><span>' +
         esc(fields[key] || key) +
         "</span>" +
@@ -1272,7 +1303,7 @@ function renderGraphFocus(id, facts) {
   $$("[data-focus-fact]").forEach(
     (button) =>
       (button.onclick = () =>
-        openFact(rows[Number(button.dataset.focusFact)].fact)),
+        guard(() => openFact(rows[Number(button.dataset.focusFact)].fact))),
   );
 }
 $("#graphRelations").onclick = () => {
@@ -1297,14 +1328,24 @@ async function loadNames() {
   });
   $("#nameCards").innerHTML = rows.length
     ? rows
-        .map(
-          (n, i) =>
-            `<article class="card"><span class="tag">${esc(kindLabel(n.kind))}</span><h3>${esc(n.name || n.label || "名称待补全")}</h3><small>${esc(n.id)}</small><p class="muted">${esc(n.identity_note || "")}</p><p class="muted">曾用名：${esc([...new Set(n.history.map((h) => h.name))].filter((x) => x !== n.name).join("、") || "暂无")}</p><p class="muted">最近审校依据：${esc(n.history.find((h) => h.reason)?.reason || "尚无人工审校记录")}</p><footer><small>${n.updated ? date(n.updated) : "等待新消息或手动更新"}</small><button data-name="${i}">查看与审校</button></footer></article>`,
-        )
+        .map((n, i) => {
+          const stats = n.stats || {};
+          const summary = (stats.summary || []).join(" · ") || n.identity_note || "";
+          const aliases =
+            [...new Set(n.history.map((h) => h.name))]
+              .filter((x) => x !== n.name)
+              .join("、") || "暂无";
+          return `<article class="card"><span class="tag">${esc(kindLabel(n.kind))}</span><h3>${esc(n.name || n.label || "名称待补全")}</h3><small>${esc(n.id)}</small><p class="muted">${esc(summary)}</p><p class="muted">事实 ${stats.facts ?? 0} · 关系 ${stats.relations ?? 0} · 曾用名：${esc(aliases)}</p><footer><small>${n.updated ? date(n.updated) : "等待新消息或手动更新"}</small><button data-profile="${i}">查看画像</button><button data-name="${i}">查看与审校</button></footer></article>`;
+        })
         .join("")
     : empty("未找到名称");
   $$("[data-name]").forEach(
     (b) => (b.onclick = () => openName(rows[Number(b.dataset.name)])),
+  );
+  $$("[data-profile]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        guard(() => openProfile(rows[Number(b.dataset.profile)].id))),
   );
   $("#namePage").textContent = "第 " + (nameOffset / 100 + 1) + " 页";
   $("#namePrev").disabled = nameOffset === 0;
@@ -1324,9 +1365,24 @@ function openName(n) {
     n.history
       .map(
         (h) =>
-          `<div class="task"><strong>${esc(h.name)}</strong><small>${date(h.observed)} · ${esc(h.source)}<br>${esc(h.context)} ${esc(h.reason)}</small></div>`,
+          `<div class="task"><strong>${esc(h.name)}</strong><small>${date(h.observed)} · ${esc(h.source)}<br>${esc(h.context)} ${esc(h.reason)}</small>${h.name === n.name ? "" : `<button data-setname="${esc(h.name)}">设为当前名</button>`}</div>`,
       )
       .join("") || '<p class="muted">尚无名称记录</p>';
+  $$("#nameHistory [data-setname]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        guard(async () => {
+          await api("/names", {
+            entity_id: n.id,
+            name: b.dataset.setname,
+            revision: n.revision,
+            reason: "恢复到曾用名",
+          });
+          toast("已切换当前称呼");
+          $("#nameEditor").close();
+          await loadNames();
+        })),
+  );
   if (!$("#nameEditor").open) $("#nameEditor").showModal();
 }
 $("#searchNames").onclick = () =>
@@ -1544,3 +1600,114 @@ $("#lookupName").onclick = () =>
     }
   });
 guard(boot);
+
+function renderVersions(kind, target, revision, versions) {
+  const box = $("#versionList");
+  if (!box) return;
+  box.innerHTML = versions.length
+    ? versions
+        .map(
+          (v) =>
+            `<div class="task"><strong>${esc(v.reason || "修改")}</strong><small>${date(v.created)}</small><button data-version="${v.id}" data-vtarget="${esc(target)}" data-vrevision="${revision}" data-vkind="${kind}">恢复此版本</button></div>`,
+        )
+        .join("")
+    : '<p class="muted">还没有历史版本</p>';
+  $$("#versionList [data-version]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        guard(async () => {
+          await api("/restore", {
+            kind: b.dataset.vkind,
+            target: b.dataset.vtarget,
+            version_id: Number(b.dataset.version),
+            revision: Number(b.dataset.vrevision),
+          });
+          toast("已恢复该版本");
+          if (b.dataset.vkind === "record") await openRecord(b.dataset.vtarget);
+          else await openFact({ id: b.dataset.vtarget });
+        })),
+  );
+}
+
+let profileData = null;
+
+async function openProfile(entityId) {
+  const p = await api("/profile?entity_id=" + encodeURIComponent(entityId));
+  profileData = p;
+  const stats = p.stats || {};
+  $("#profileTitle").textContent =
+    (p.entity.name || p.entity.label || "实体") + " 的画像";
+  $("#profileMeta").textContent =
+    p.entity.id +
+    " · " +
+    kindLabel(p.entity.kind) +
+    " · 事实 " + (stats.facts || 0) +
+    " · 关系 " + (stats.relations || 0) +
+    " · 会话 " + (stats.sessions || 0) +
+    (stats.last_active ? " · 最近活跃 " + date(stats.last_active) : "");
+  $("#profileSummary").textContent =
+    (p.summary || []).join(" · ") || "还没有画像要点";
+  const groups = Object.entries(p.categories || {})
+    .map(
+      ([category, facts]) =>
+        "<h3>" + esc(labels[category] || category) + "</h3>" +
+        facts
+          .map(
+            (f) =>
+              `<div class="task"><strong>${esc(f.content)}</strong><small>重要度 ${esc(String(f.importance))} · ${esc(f.sid)}${f.reason ? " · " + esc(f.reason) : ""}</small><button data-pf="${esc(f.id)}">编辑 / 恢复</button></div>`,
+          )
+          .join(""),
+    )
+    .join("");
+  const relations = (p.relations || [])
+    .map(
+      (r) =>
+        `<div class="task"><strong>${esc(r.subject)} —${esc(r.predicate)}→ ${esc(r.object)}</strong></div>`,
+    )
+    .join("");
+  const names = (p.entity.history || [])
+    .map(
+      (h) =>
+        `<div class="task"><strong>${esc(h.name)}</strong><small>${date(h.observed)} · ${esc(h.source)}</small>${h.name === p.entity.name ? "" : `<button data-pn="${esc(h.name)}">设为当前名</button>`}</div>`,
+    )
+    .join("");
+  $("#profileBody").innerHTML =
+    groups +
+    "<h3>关系</h3>" +
+    (relations || '<p class="muted">暂无关系连线</p>') +
+    "<h3>名字历史</h3>" +
+    (names || '<p class="muted">暂无名字记录</p>');
+  $$("#profileBody [data-pf]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        guard(async () => {
+          const fact = Object.values(p.categories || {})
+            .flat()
+            .find((f) => f.id === b.dataset.pf);
+          $("#profileDialog").close();
+          if (fact) await openFact(fact);
+        })),
+  );
+  $$("#profileBody [data-pn]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        guard(async () => {
+          await api("/names", {
+            entity_id: p.entity.id,
+            name: b.dataset.pn,
+            revision: p.entity.revision,
+            reason: "恢复到曾用名",
+          });
+          toast("已切换当前称呼");
+          await openProfile(p.entity.id);
+        })),
+  );
+  if (!$("#profileDialog").open) $("#profileDialog").showModal();
+}
+$("#closeProfile").onclick = () => $("#profileDialog").close();
+$("#profileEditName").onclick = () =>
+  guard(() => {
+    if (!profileData) return;
+    $("#profileDialog").close();
+    openName({ ...profileData.entity, identity_note: "" });
+  });

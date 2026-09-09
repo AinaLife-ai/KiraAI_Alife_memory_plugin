@@ -33,6 +33,7 @@ from .contracts import (
     NameEdit,
     EntityRefresh,
     NameBatch,
+    Restore,
 )
 from . import identity
 from .engine import Engine, compression_plan
@@ -49,6 +50,7 @@ from .retrieval import (
     RecallWindow,
 )
 from .setting_help import HELP
+from .config_migrate import migrate as migrate_config
 
 PLUGIN_ID = "alife_memory_z"
 logger = get_logger(PLUGIN_ID, "light_purple")
@@ -164,6 +166,7 @@ class AlifeMemoryPlugin(BasePlugin):
                     return
             self.migration_blocked = True
             self.migration_note = "正在安全迁移；原文件只读保留。"
+            started_at = time.time()
             disabled = []
             try:
                 adapters = self.adapter_names()
@@ -202,6 +205,10 @@ class AlifeMemoryPlugin(BasePlugin):
                     await self.store.call("canonicalize_identity", adapters)
                 await self.store.call("set_legacy_migrated_at", time.time())
                 self.migration_blocked = False
+                if self.engine:
+                    # Imported facts never pass through compression, so scan them
+                    # once for duplicates now.
+                    await self.engine.queue_migration_merges(started_at)
                 self.migration_note = (
                     "迁移完成，原文件完整保留。切换回旧插件前请先停用长期记忆·Z。"
                 )
@@ -217,7 +224,40 @@ class AlifeMemoryPlugin(BasePlugin):
                 if self.engine:
                     self.engine.wake.set()
 
+    async def apply_config_migrations(self):
+        """Upgrade untouched defaults once; never touch user-customised values."""
+        path = get_config_path() / "plugins" / f"{PLUGIN_ID}.json"
+        if not path.exists():
+            return []
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("[记忆·Z] 配置迁移：配置文件无法解析，已跳过")
+            return []
+        changed, updated = migrate_config(raw)
+        if updated == raw:
+            return []
+        # Persist the version marker even when no value changed, so a later
+        # manual edit back to an old default is never silently rewritten.
+        if not changed and updated.get("alife_meta") == raw.get("alife_meta"):
+            return []
+        def save():
+            temporary = path.with_suffix(".alife.tmp")
+            temporary.write_text(dump(updated), encoding="utf-8")
+            temporary.replace(path)
+        await asyncio.to_thread(save)
+        self.plugin_cfg = updated
+        self.ctx.plugin_mgr.plugin_configs[PLUGIN_ID] = updated
+        self.settings = Settings.model_validate(updated.get("alife", {}))
+        logger.info("[记忆·Z] 配置已迁移到新默认值：%s", "、".join(changed))
+        return changed
+
     async def initialize(self):
+        try:
+            await self.apply_config_migrations()
+        except Exception:
+            # A failed config migration must never stop the plugin from loading.
+            logger.exception("[记忆·Z] 配置迁移失败，本次启动继续使用现有配置")
         data_dir = self.ctx.get_plugin_data_dir()
         if data_dir is None:
             raise RuntimeError("KiraAI did not associate plugin data directory")
@@ -531,6 +571,40 @@ class AlifeMemoryPlugin(BasePlugin):
         return self.recall_result(event, {"ok": True, "entities": entities})
 
     @register.tool(
+        name="GetProfile",
+        description="按名字、曾用名或实体ID查看某人的聚合画像：基本信息、名字历史、按类别分组的事实（身份/偏好/关系/约定/事件）、关系与统计。想继续翻更多原文记忆再用 SearchMemoryArchive 或 MemoryOverview。",
+        params={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    )
+    async def get_profile(self, event, query):
+        if not self.runtime_settings().enabled:
+            return self.recall_result(event, {"ok": False, "error": "memory_paused"})
+        cfg = self.runtime_settings()
+        ids = await self.store.call(
+            "entity_ids", event.sid, user_ids(event), cfg.recall_scope
+        )
+        rows = await self.store.call("entities", query, ids=ids, limit=5)
+        if not rows:
+            return self.recall_result(event, {"ok": False, "error": "entity_not_found"})
+        profiles = []
+        for row in rows[:3]:
+            profile = await self.store.call(
+                "profile",
+                row["id"],
+                cfg.profile_summary_count,
+                event.sid,
+                cfg.recall_scope != "session",
+                cfg.merge_pending_hide,
+            )
+            if profile:
+                profiles.append(profile)
+        return self.recall_result(event, {"ok": True, "profiles": profiles})
+
+    @register.tool(
         name="CorrectMemoryName",
         description="有明确证据时修正已知ID的当前称呼，保留曾用名、来源与时间。不能更改ID或合并同名用户。",
         params={
@@ -708,12 +782,18 @@ class AlifeMemoryPlugin(BasePlugin):
             if cfg.session_affinity
             else {}
         )
+        subjects = await self.store.call(
+            "entity_ids_for_query", query, sid, users, cfg.recall_scope
+        )
         facts = await self.store.call(
             "facts",
             sid,
             limit=cfg.top_k * 10,
             users=users,
             include_shared=True,
+            hide_pending=cfg.merge_pending_hide,
+            importance_first=True,
+            prefer_subjects=tuple(subjects),
             **prefer,
         )
         related = []
@@ -758,6 +838,8 @@ class AlifeMemoryPlugin(BasePlugin):
                 include_shared=True,
                 lexical=query,
                 limit=cfg.top_k,
+                hide_pending=cfg.merge_pending_hide,
+                prefer_subjects=tuple(subjects),
                 **prefer,
             )
             facts = list({f["id"]: f for f in [*extra, *facts]}.values())
@@ -1244,7 +1326,7 @@ class AlifeMemoryPlugin(BasePlugin):
             )
         now = time.time()
         record_id = await self.store.call(
-            "memorize", value.sid, value.content, value.users, now, now
+            "memorize", value.sid, value.content, value.users, now, now, 8
         )
         await self.engine.enqueue("classify", record_id)
         if self.settings.permanent_dedupe:
@@ -1306,6 +1388,8 @@ class AlifeMemoryPlugin(BasePlugin):
             users=user_ids(event),
             include_shared=True,
             exclude_ids=seen,
+            hide_pending=self.settings.merge_pending_hide,
+            importance_first=True,
         )
         self.seen_window.remember(key, "", [], [row["id"] for row in rows])
         context = await self.store.call("context", event.sid, user_ids(event))
@@ -1491,6 +1575,14 @@ class AlifeMemoryPlugin(BasePlugin):
             raise HTTPException(404, "archive not found")
         return result
 
+    @register.api(method="GET", path="/fact/{fact_id}", auth=True)
+    async def api_fact(self, fact_id: str):
+        rows = await self.store.call("facts_by_ids", [fact_id])
+        if not rows:
+            raise HTTPException(404, "fact not found")
+        versions = await self.store.call("versions_of", "fact", fact_id)
+        return {**rows[0], "versions": versions}
+
     @register.api(method="GET", path="/facts", auth=True)
     async def api_facts(
         self, sid: str = "", subject: str = "", category: str = "", offset: int = 0
@@ -1559,10 +1651,40 @@ class AlifeMemoryPlugin(BasePlugin):
         if start > end:
             raise HTTPException(422, "invalid time range")
         record_id = await self.store.call(
-            "memorize", value.sid, value.content, value.users, start, end
+            "memorize",
+            value.sid,
+            value.content,
+            value.users,
+            start,
+            end,
+            value.importance if value.importance is not None else 8,
         )
         await self.engine.enqueue("classify", record_id)
         return {"id": record_id}
+
+    @register.api(method="POST", path="/restore", auth=True)
+    async def api_restore(self, request: Request):
+        value = await self.body(request, Restore)
+        try:
+            return await self.store.call(
+                "restore", value.kind, value.target, value.version_id, value.revision
+            )
+        except Conflict:
+            raise HTTPException(409, "target changed; reload before restoring") from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    @register.api(method="GET", path="/profile", auth=True)
+    async def api_profile(self, entity_id: str, summary: int = 0):
+        if not entity_id or len(entity_id) > 500:
+            raise HTTPException(422, "invalid entity")
+        count = summary if summary else self.settings.profile_summary_count
+        result = await self.store.call(
+            "profile", entity_id, max(1, min(10, count))
+        )
+        if result is None:
+            raise HTTPException(404, "entity not found")
+        return result
 
     @register.api(method="POST", path="/jobs", auth=True)
     async def api_job(self, request: Request):
@@ -1582,7 +1704,12 @@ class AlifeMemoryPlugin(BasePlugin):
     async def api_names(self, query: str = "", offset: int = 0):
         if offset < 0 or len(query) > 500:
             raise HTTPException(422, "invalid name query")
-        return await self.store.call("entities", query=query, offset=offset)
+        return await self.store.call(
+            "entities",
+            query=query,
+            offset=offset,
+            summaries=self.settings.profile_summary_count,
+        )
 
     @register.api(method="POST", path="/names", auth=True)
     async def api_name_edit(self, request: Request):

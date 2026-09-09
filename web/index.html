@@ -304,6 +304,8 @@
         <summary>原文、溯源与修改历史</summary>
         <pre id="sourceText"></pre>
         <div id="sourceLinks" class="row"></div>
+        <h3 class="muted">修改历史</h3>
+        <div id="versionList"></div>
       </details>
       <div id="deleteConfirm" class="notice hide" role="alert">
         <p>
@@ -373,6 +375,18 @@
         ><button id="nameBatchNever">不再提示</button
         ><button id="nameBatchStop" class="hide">停止</button
         ><button id="nameBatchGo" class="primary">一键拉取</button>
+      </div>
+    </dialog>
+    <dialog id="profileDialog" class="dialog">
+      <div class="panel-title">
+        <h2 id="profileTitle">画像</h2>
+        <button id="closeProfile" aria-label="关闭画像">×</button>
+      </div>
+      <p id="profileMeta" class="muted"></p>
+      <p id="profileSummary" class="notice"></p>
+      <div id="profileBody"></div>
+      <div class="actions">
+        <button id="profileEditName">审校称呼</button>
       </div>
     </dialog>
     <div id="toast" class="hide" role="status"></div>

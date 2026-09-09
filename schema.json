@@ -21,7 +21,11 @@
         "name": "旧历史播种",
         "default": "auto",
         "description": "首次遇到旧会话时，是否把 KiraAI 已有的对话历史抄进记忆库。auto：检测到会话合并/压缩插件时跳过，避免把别的会话记成本会话；always：始终播种；off：从不播种，只记装插件之后的内容。",
-        "options": ["auto", "always", "off"]
+        "options": [
+          "auto",
+          "always",
+          "off"
+        ]
       },
       "inject_recent_raw": {
         "type": "switch",
@@ -69,16 +73,16 @@
       },
       "compress_model": {
         "type": "model_select",
-        "name": "压缩模型",
+        "name": "压缩与合并模型",
         "default": "",
-        "description": "负责把经历整理成摘要。默认用KiraAI快速模型；经常超时就换较快的模型。会产生正常语言模型费用。",
+        "description": "负责压缩归档和事实合并（新旧事实去重）。留空用 KiraAI 默认快速模型。会产生正常语言模型费用。",
         "model_type": "llm"
       },
       "audit_model": {
         "type": "model_select",
         "name": "审计模型",
         "default": "",
-        "description": "负责核对事实、修正与合并重复内容。默认用KiraAI主模型，建议选择理解准确的模型。",
+        "description": "负责审计纠错和永久记忆合并。留空用 KiraAI 主模型，建议选择理解准确的模型。",
         "model_type": "llm"
       },
       "embedding_model": {
@@ -103,8 +107,8 @@
       "audit_interval": {
         "type": "integer",
         "name": "审计间隔（秒）",
-        "default": 1800,
-        "description": "多久自动审计一次。1800秒=30分钟；调大可减少模型调用。",
+        "default": 7200,
+        "description": "多久自动审计一次。默认7200秒=2小时；调大更省，调小更勤。",
         "minimum": 30,
         "maximum": 604800
       },
@@ -115,6 +119,22 @@
         "description": "每次最多核对多少条事实。默认20；审计慢时可调到5～10。",
         "minimum": 1,
         "maximum": 50
+      },
+      "audit_recheck_days": {
+        "type": "integer",
+        "name": "审计冷却（天）",
+        "default": 7,
+        "description": "同一条事实距上次审计超过这么多天才再审；0=每次都可能再审（会一直消耗）。默认7天。",
+        "minimum": 0,
+        "maximum": 3650
+      },
+      "audit_daily_calls": {
+        "type": "integer",
+        "name": "审计每日调用上限",
+        "default": 24,
+        "description": "每天最多调用审计模型多少次，用完停到第二天。0=不限制。",
+        "minimum": 0,
+        "maximum": 1000
       },
       "model_timeout": {
         "type": "integer",
@@ -214,6 +234,158 @@
         "default": "以自身视角保留事件、感情、人物、关键事实和生活轨迹。精简但不要按珍贵程度丢弃线索；只依据输入，保留时间、否定、条件和不确定性。",
         "description": "补充你希望保留的内容。例如：保留约定的日期和参与者。无需再要求JSON，程序会严格检查格式。"
       },
+      "fact_merge_enabled": {
+        "type": "boolean",
+        "name": "写入时自动合并事实",
+        "default": true,
+        "description": "新事实入库时先和相似的旧事实比对，触发即合并，避免重复记忆堆积。默认开启。"
+      },
+      "fact_merge_threshold": {
+        "type": "float",
+        "name": "事实合并触发阈值",
+        "default": 0.25,
+        "description": "相似度达到这个值就触发合并。越低越容易合并（更激进），默认0.25。",
+        "minimum": 0.1,
+        "maximum": 0.95
+      },
+      "fact_merge_soft_chars": {
+        "type": "integer",
+        "name": "事实合并字数（提示词）",
+        "default": 100,
+        "description": "提示词里要求模型写多长；修改会同步替换提示词里的数字。",
+        "minimum": 10,
+        "maximum": 2000
+      },
+      "fact_merge_max_chars": {
+        "type": "integer",
+        "name": "事实合并字数（硬上限）",
+        "default": 150,
+        "description": "超过这个字数直接判定失败并重试。必须≥提示词字数。",
+        "minimum": 10,
+        "maximum": 4000
+      },
+      "fact_merge_soft_reason_chars": {
+        "type": "integer",
+        "name": "事实合并理由（提示词）",
+        "default": 15,
+        "description": "提示词里要求理由写多长。",
+        "minimum": 2,
+        "maximum": 200
+      },
+      "fact_merge_reason_chars": {
+        "type": "integer",
+        "name": "事实合并理由（硬上限）",
+        "default": 40,
+        "description": "理由超过这个字数判定失败。留余量可避免模型反复重试。",
+        "minimum": 2,
+        "maximum": 500
+      },
+      "fact_merge_batch_clusters": {
+        "type": "integer",
+        "name": "事实合并每批簇数",
+        "default": 5,
+        "description": "一次模型调用最多处理几组待合并事实。",
+        "minimum": 1,
+        "maximum": 50
+      },
+      "fact_merge_prompt": {
+        "type": "string",
+        "name": "事实合并提示词",
+        "default": "输入是若干组待合并的事实（groups[]）：每组 subject 与 category 相同，组内 facts 按时间从新到旧排列，facts[0] 是最新的。\n为每一组输出一条结果，数量与顺序与输入完全一致，只做 merge（不允许 keep）。\n以该组 facts[0] 为基准：先保留它的结论，再把其余事实里独有的人名、数字、日期、否定、条件、状态补充进去。\n冲突之处以时间较晚的说法为准，不保留已被推翻的旧结论。\n涉及不同对象时必须在同一条 content 里分别写明，不得丢弃任何主体或任何独有信息。\ncontent 必须自包含：不写“同上”，不引用任何 ID，不写“以上”“根据记录”之类的元话，不重复原文措辞。\n不得编造原文没有的信息。\n硬性字数：每条 content ≤ {content_max} 字，reason ≤ {reason_max} 字；超出即判定失败。\n只输出 JSON：{\"groups\":[{\"target_id\":\"…\",\"source_ids\":[\"…\"],\"content\":\"…\",\"reason\":\"…\"}]}\ntarget_id 取该组最新那条的 id；source_ids 为该组全部 id（至少两条），逐字复制。",
+        "description": "可用 {content_max} 与 {reason_max} 占位符，保存后替换成上面的字数设置。"
+      },
+      "cross_session_merge": {
+        "type": "boolean",
+        "name": "跨会话合并（身份类）",
+        "default": true,
+        "description": "仅对身份/偏好/关系类事实生效：同一个人的跨会话重复事实合并成一条全局记忆。事件与约定不跨会话合并。"
+      },
+      "merge_pending_hide": {
+        "type": "boolean",
+        "name": "合并前不参与检索",
+        "default": true,
+        "description": "检测到重复的新事实在合并完成前不进入检索与注入，避免对话中同时看到重复记忆。默认开启。"
+      },
+      "permanent_dedupe": {
+        "type": "switch",
+        "name": "自动合并相似永久记忆",
+        "default": true,
+        "description": "开启后，后台用审计模型检查相似的永久记忆，确属同一件事的重复或更正时自动合并（保留最新一条，其余移出常驻上下文，原文保留）。默认开启。"
+      },
+      "dedupe_force_merge": {
+        "type": "switch",
+        "name": "检测到相似就强制合并",
+        "default": true,
+        "description": "开启后，检测到的相似永久记忆一律合并成一条（不允许保留）：以最新那条为基准，把其余各条独有的信息全部并入；模型若仍想保留，程序也会用原文拼接强制合并。关闭则恢复保守策略（只在确属重复或更正时才合并）。默认开启。"
+      },
+      "dedupe_threshold": {
+        "type": "float",
+        "name": "永久记忆相似度阈值",
+        "default": 0.25,
+        "description": "相似度阈值：越高越保守。0.25 只把疑似重复的永久记忆交给模型判断，最终是否合并由模型决定。",
+        "minimum": 0.1,
+        "maximum": 0.95
+      },
+      "record_merge_soft_chars": {
+        "type": "integer",
+        "name": "永久记忆合并字数（提示词）",
+        "default": 500,
+        "description": "提示词里要求合并后的永久记忆写多长。",
+        "minimum": 50,
+        "maximum": 16000
+      },
+      "record_merge_max_chars": {
+        "type": "integer",
+        "name": "永久记忆合并字数（硬上限）",
+        "default": 16000,
+        "description": "超过这个字数判定失败并重试；默认保持宽松，按需收紧。",
+        "minimum": 100,
+        "maximum": 16000
+      },
+      "record_merge_soft_reason_chars": {
+        "type": "integer",
+        "name": "永久记忆合并理由（提示词）",
+        "default": 15,
+        "description": "提示词里要求理由写多长。",
+        "minimum": 2,
+        "maximum": 200
+      },
+      "record_merge_reason_chars": {
+        "type": "integer",
+        "name": "永久记忆合并理由（硬上限）",
+        "default": 60,
+        "description": "理由超过这个字数判定失败。",
+        "minimum": 2,
+        "maximum": 500
+      },
+      "record_merge_prompt": {
+        "type": "string",
+        "name": "永久记忆合并提示词",
+        "default": "records 按时间从新到旧排列，records[0] 是最新的那条。\n只输出一个 action：merge（不允许 keep）。\n以 records[0] 为基准：保留它的内容与结论，再把其余记录里独有的人名、群名、数字、QQ号、日期、状态补充进去。\n冲突之处以时间较晚的说法为准，不保留已被推翻的旧结论。\n涉及不同主体时必须在同一条 content 里分别写明，不得丢弃任何主体或任何独有信息。\ncontent 必须自包含：不写“同上”，不引用其他记录 ID，不写元话，不复述重复内容。\n不得编造原文没有的信息。\n硬性字数：content ≤ {content_max} 字，reason ≤ {reason_max} 字；超出即判定失败。\n只输出 JSON：{\"action\":\"merge\",\"content\":\"…\",\"reason\":\"…\",\"source_ids\":[\"…\"]}\nsource_ids 至少两条，逐字复制 records[].id；禁止编造 ID。",
+        "description": "可用 {content_max} 与 {reason_max} 占位符，保存后替换成上面的字数设置。"
+      },
+      "profile_summary_count": {
+        "type": "integer",
+        "name": "画像摘要条数",
+        "default": 3,
+        "description": "人物列表卡片上直接显示的画像要点条数（按重要度取）。",
+        "minimum": 1,
+        "maximum": 10
+      },
+      "search_active_only": {
+        "type": "switch",
+        "name": "检索默认只搜常驻",
+        "default": true,
+        "description": "开启后，记忆检索默认只搜常驻上下文（近期原文、活跃摘要、永久记忆）；已归档的旧记忆需要显式 include_archived=true 才会返回。关闭则默认连归档一起搜。"
+      },
+      "cold_after_days": {
+        "type": "integer",
+        "name": "归档转入冷归档天数",
+        "default": 180,
+        "description": "归档满这么多天后自动进入冷归档：任何检索都搜不到，只能按存档ID读取。默认180天；0=不按时间冷归档（被 Forget 或被合并取代的记忆仍会立即冷归档）。",
+        "minimum": 0,
+        "maximum": 3650
+      },
       "auto_migrate": {
         "type": "switch",
         "name": "自动安全迁移旧记忆",
@@ -261,40 +433,6 @@
         "name": "全局召回优先当前会话",
         "default": false,
         "description": "开启后，全局召回优先当前会话的记忆，其次同参与者，最后其他会话；只调整顺序，不缩小召回范围。默认关闭。"
-      },
-      "permanent_dedupe": {
-        "type": "switch",
-        "name": "自动合并相似永久记忆",
-        "default": true,
-        "description": "开启后，后台用审计模型检查相似的永久记忆，确属同一件事的重复或更正时自动合并（保留最新一条，其余移出常驻上下文，原文保留）。默认开启。"
-      },
-      "dedupe_force_merge": {
-        "type": "switch",
-        "name": "检测到相似就强制合并",
-        "default": true,
-        "description": "开启后，检测到的相似永久记忆一律合并成一条（不允许保留）：以最新那条为基准，把其余各条独有的信息全部并入；模型若仍想保留，程序也会用原文拼接强制合并。关闭则恢复保守策略（只在确属重复或更正时才合并）。默认开启。"
-      },
-      "dedupe_threshold": {
-        "type": "float",
-        "name": "永久记忆相似度阈值",
-        "default": 0.25,
-        "description": "相似度阈值：越高越保守。0.25 只把疑似重复的永久记忆交给模型判断，最终是否合并由模型决定。",
-        "minimum": 0.1,
-        "maximum": 0.95
-      },
-      "search_active_only": {
-        "type": "switch",
-        "name": "检索默认只搜常驻",
-        "default": true,
-        "description": "开启后，记忆检索默认只搜常驻上下文（近期原文、活跃摘要、永久记忆）；已归档的旧记忆需要显式 include_archived=true 才会返回。关闭则默认连归档一起搜。"
-      },
-      "cold_after_days": {
-        "type": "integer",
-        "name": "归档转入冷归档天数",
-        "default": 180,
-        "description": "归档满这么多天后自动进入冷归档：任何检索都搜不到，只能按存档ID读取。默认180天；0=不按时间冷归档（被 Forget 或被合并取代的记忆仍会立即冷归档）。",
-        "minimum": 0,
-        "maximum": 3650
       }
     }
   }

@@ -76,17 +76,18 @@ def _bigrams(text):
     return {flat[i : i + 2] for i in range(len(flat) - 1)}
 
 
-def similarity(left, right):
+def similarity(left, right, min_overlap=4):
     """Bigram containment: "does one memory largely cover the other".
 
     Jaccard over long texts is too diluted for near-duplicate detection, so we
     score the overlap against the smaller side and require a real overlap.
+    Short facts need a lower overlap floor; callers can pass ``min_overlap``.
     """
     a, b = _bigrams(left), _bigrams(right)
     if not a or not b:
         return 0.0
     overlap = len(a & b)
-    if overlap < 4:
+    if overlap < min_overlap:
         return 0.0
     return overlap / min(len(a), len(b))
 
