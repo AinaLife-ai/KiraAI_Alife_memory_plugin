@@ -1580,6 +1580,7 @@ class Store:
         prefer_users=(),
         cold_after_days=0,
         include_cold=False,
+        strict_session=False,
     ):
         clauses, args = ["deleted=0"], []
         if not include_cold:
@@ -1596,7 +1597,11 @@ class Store:
         if exclude_sid:
             clauses.append("sid<>?")
             args.append(exclude_sid)
-        if scope == "session":
+        if strict_session and sid:
+            # Admin browsing: show exactly this session, not the global recall view.
+            clauses.append("sid=?")
+            args.append(sid)
+        elif scope == "session":
             clauses.append(
                 "(sid=? OR visibility='global' OR (visibility='user' AND EXISTS (SELECT 1 FROM json_each(records.users) WHERE value IN (SELECT value FROM json_each(?)))) )"
             )

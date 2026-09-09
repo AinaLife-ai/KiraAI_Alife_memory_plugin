@@ -3,7 +3,14 @@
 from __future__ import annotations
 import json
 from typing import Annotated, Literal
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 Text = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=16000)
@@ -62,8 +69,56 @@ class Relation(Strict):
         return self
 
 
+# Deterministic aliases for a well-known model slip (Chinese or generic labels).
+CATEGORY_ALIASES = {
+    "事件": "event",
+    "事实": "fact",
+    "偏好": "preference",
+    "喜好": "preference",
+    "习惯": "preference",
+    "约定": "commitment",
+    "承诺": "commitment",
+    "关系": "relationship",
+    "画像": "profile",
+    "档案": "profile",
+    "资料": "profile",
+    "资源": "resource",
+    "自我": "self",
+    "自身": "self",
+    "general": "fact",
+    "other": "fact",
+    "misc": "fact",
+    "note": "fact",
+    "info": "fact",
+    "personal": "profile",
+    "identity": "profile",
+}
+
+
 class Fact(Strict):
     category: Category
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def canonical_category(cls, value):
+        if isinstance(value, str):
+            cleaned = value.strip().lower()
+            if cleaned in CATEGORY_ALIASES:
+                return CATEGORY_ALIASES[cleaned]
+            if cleaned in {
+                "event",
+                "fact",
+                "preference",
+                "commitment",
+                "relationship",
+                "profile",
+                "resource",
+                "self",
+            }:
+                return cleaned
+            return value.strip()
+        return value
+
     subject: Short
     content: Text
     reason: str = Field(max_length=2000)
@@ -278,6 +333,8 @@ def dump(value):
 
 class Search(Strict):
     sid: str = ""
+    # The admin UI browses one session at a time; global memories are opt-in there.
+    include_global: bool = True
     keyword: str = Field(default="", max_length=500)
     prompt: str = Field(default="", max_length=2000)
     level: int | None = Field(default=None, ge=0, le=100)

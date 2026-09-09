@@ -232,7 +232,7 @@
         "type": "string",
         "name": "压缩补充要求",
         "default": "以自身视角保留事件、感情、人物、关键事实和生活轨迹。精简但不要按珍贵程度丢弃线索；只依据输入，保留时间、否定、条件和不确定性。",
-        "description": "补充你希望保留的内容。例如：保留约定的日期和参与者。无需再要求JSON，程序会严格检查格式。"
+        "description": "补充你希望保留的内容。例如：保留约定的日期和参与者。无需再要求JSON，程序会严格检查格式。；改乱了可点旁边的「恢复默认」"
       },
       "fact_merge_enabled": {
         "type": "boolean",
@@ -292,7 +292,7 @@
         "type": "string",
         "name": "事实合并提示词",
         "default": "输入是若干组待合并的事实（groups[]）：每组 subject 与 category 相同，组内 facts 按时间从新到旧排列，facts[0] 是最新的。\n为每一组输出一条结果，数量与顺序与输入完全一致，只做 merge（不允许 keep）。\n以该组 facts[0] 为基准：先保留它的结论，再把其余事实里独有的人名、数字、日期、否定、条件、状态补充进去。\n冲突之处以时间较晚的说法为准，不保留已被推翻的旧结论。\n涉及不同对象时必须在同一条 content 里分别写明，不得丢弃任何主体或任何独有信息。\ncontent 必须自包含：不写“同上”，不引用任何 ID，不写“以上”“根据记录”之类的元话，不重复原文措辞。\n不得编造原文没有的信息。\n硬性字数：每条 content ≤ {content_max} 字，reason ≤ {reason_max} 字；超出即判定失败。\n只输出 JSON：{\"groups\":[{\"target_id\":\"…\",\"source_ids\":[\"…\"],\"content\":\"…\",\"reason\":\"…\"}]}\ntarget_id 取该组最新那条的 id；source_ids 为该组全部 id（至少两条），逐字复制。",
-        "description": "可用 {content_max} 与 {reason_max} 占位符，保存后替换成上面的字数设置。"
+        "description": "可用 {content_max} 与 {reason_max} 占位符，保存后替换成上面的字数设置。；改乱了可点旁边的「恢复默认」"
       },
       "cross_session_merge": {
         "type": "boolean",
@@ -362,7 +362,7 @@
         "type": "string",
         "name": "永久记忆合并提示词",
         "default": "records 按时间从新到旧排列，records[0] 是最新的那条。\n只输出一个 action：merge（不允许 keep）。\n以 records[0] 为基准：保留它的内容与结论，再把其余记录里独有的人名、群名、数字、QQ号、日期、状态补充进去。\n冲突之处以时间较晚的说法为准，不保留已被推翻的旧结论。\n涉及不同主体时必须在同一条 content 里分别写明，不得丢弃任何主体或任何独有信息。\ncontent 必须自包含：不写“同上”，不引用其他记录 ID，不写元话，不复述重复内容。\n不得编造原文没有的信息。\n硬性字数：content ≤ {content_max} 字，reason ≤ {reason_max} 字；超出即判定失败。\n只输出 JSON：{\"action\":\"merge\",\"content\":\"…\",\"reason\":\"…\",\"source_ids\":[\"…\"]}\nsource_ids 至少两条，逐字复制 records[].id；禁止编造 ID。",
-        "description": "可用 {content_max} 与 {reason_max} 占位符，保存后替换成上面的字数设置。"
+        "description": "可用 {content_max} 与 {reason_max} 占位符，保存后替换成上面的字数设置。；改乱了可点旁边的「恢复默认」"
       },
       "profile_summary_count": {
         "type": "integer",

@@ -226,3 +226,76 @@ async def test_audit_bounds_complete_evidence_and_keeps_review_reason(tmp_path):
         len(history) == 1
         and next(iter(history.values()))[0]["reason"] == "原文证据充分，保留"
     )
+
+def test_diagnostics_hint_allowed_enum_and_relation_nesting():
+    from alife_test_plugin.output_validation import diagnostic
+
+    payload = c.dump(
+        {
+            "summary": "正常摘要",
+            "facts": [
+                {
+                    "category": "乱写的分类",
+                    "subject": "qq:1",
+                    "content": "事实",
+                    "reason": "",
+                    "scenario": "",
+                    "tags": [],
+                    "relations": [],
+                    "predicate": "朋友",
+                    "object": "qq:2",
+                    "source_ids": ["r1"],
+                },
+                {
+                    "category": "event",
+                    "subject": "qq:1",
+                    "content": "另一条",
+                    "reason": "",
+                    "scenario": "",
+                    "tags": [],
+                    "relations": [
+                        {"subject": "qq:1", "predicate": "认为", "object": "qq:2"}
+                    ],
+                    "source_ids": ["r1"],
+                },
+            ],
+        }
+    )
+    with pytest.raises(ValueError) as caught:
+        c.parse_output(payload, c.Compression)
+    text = diagnostic(caught.value)
+    assert "event/fact/preference/commitment" in text, text
+    assert "relations:[{subject,predicate,object}]" in text, text
+    assert "谓词没有表达具体关系" in text, text
+    assert "乱写的分类" not in text, "不能回显模型输出的非法值"
+
+
+def test_category_aliases_are_canonicalised():
+    base = dict(
+        subject="qq:1",
+        content="内容",
+        reason="",
+        scenario="",
+        tags=[],
+        relations=[],
+        source_ids=["r1"],
+    )
+    for given, expected in [
+        ("偏好", "preference"),
+        ("Preference", "preference"),
+        ("PREFERENCE", "preference"),
+        ("general", "fact"),
+        ("关系", "relationship"),
+        ("event", "event"),
+    ]:
+        assert c.Fact(category=given, **base).category == expected
+    with pytest.raises(ValueError):
+        c.Fact(category="乱写的分类", **base)
+
+
+def test_compress_instruction_lists_categories_and_relation_shape():
+    instruction = e.build_instruction("compress", c.Settings())
+    assert "event/fact/preference/commitment/relationship/profile/resource/self" in instruction
+    assert "relations:[{subject,predicate,object}]" in instruction or (
+        "relations 必须是数组" in instruction and "predicate/object" in instruction
+    )

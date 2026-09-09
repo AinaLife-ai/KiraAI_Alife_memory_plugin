@@ -432,8 +432,10 @@ async function selectTab(name) {
   saveDraft();
 }
 async function loadArchives() {
+  const selectedSid = $("#session").value;
   const q = {
-    sid: $("#session").value,
+    sid: selectedSid,
+    include_global: $("#includeGlobal").checked,
     keyword: $("#keyword").value,
     prompt: $("#semantic").value,
     offset,
@@ -451,7 +453,11 @@ async function loadArchives() {
           (r) =>
             '<article class="card"><div class="row"><span class="tag">' +
             (r.permanent ? "永久记忆" : "L" + r.level) +
-            "</span><small>" +
+            "</span>" +
+            (selectedSid && r.sid !== selectedSid
+              ? '<span class="tag">跨会话</span>'
+              : "") +
+            "<small>" +
             date(r.end) +
             "</small></div><p>" +
             esc(r.summary) +
@@ -822,13 +828,18 @@ function renderConfig(values) {
         /<(input|select|textarea)/,
         '<$1 data-key="' + key + '" data-kind="' + type + '"',
       );
+      const wide = key === "compress_instruction" || key.endsWith("_prompt");
+      const restorable =
+        p.default !== undefined &&
+        (wide || type === "array" || type === "string" || type === "markdown");
       return (
         '<label class="field ' +
-        (key === "compress_instruction" || key.endsWith("_prompt")
-          ? "wide"
-          : "") +
+        (wide ? "wide" : "") +
         '"><span>' +
         esc(fields[key] || key) +
+        (restorable
+          ? '<button type="button" class="quiet" data-default="' + key + '">恢复默认</button>'
+          : "") +
         "</span>" +
         input +
         "<small>" +
@@ -844,6 +855,23 @@ function renderConfig(values) {
         configDirty = true;
         $("#dirty").textContent = "有未保存的修改";
         saveDraft();
+      }),
+  );
+  $$("#configForm [data-default]").forEach(
+    (b) =>
+      (b.onclick = (event) => {
+        event.preventDefault();
+        const key = b.dataset.default;
+        const fallback = config.schema.properties[key]?.default;
+        const input = document.querySelector(
+          '#configForm [data-key="' + key + '"]',
+        );
+        if (fallback === undefined || !input) return;
+        if (Array.isArray(fallback)) input.value = fallback.join("\n");
+        else if (input.type === "checkbox") input.checked = !!fallback;
+        else input.value = fallback;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        toast("已填入内置默认文案，记得点「保存并生效」");
       }),
   );
   vectorControls();
@@ -1030,7 +1058,7 @@ $("#search").onclick = () =>
 $("#keyword").onkeydown = (e) => {
   if (e.key === "Enter") $("#search").click();
 };
-for (const id of ["#session", "#level"])
+for (const id of ["#session", "#level", "#includeGlobal"])
   $(id).onchange = () =>
     guard(() => {
       offset = 0;
