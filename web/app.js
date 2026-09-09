@@ -1523,64 +1523,104 @@ $("#nameBatchNever").onclick = () => {
   $("#nameBatch").close();
 };
 let nameBatchRunning = false;
-$("#nameBatchGo").onclick = () =>
-  guard(async () => {
-    const go = $("#nameBatchGo"),
-      stop = $("#nameBatchStop");
-    go.disabled = true;
-    $("#nameBatchLater").disabled = true;
-    $("#nameBatchNever").disabled = true;
-    stop.classList.remove("hide");
-    nameBatchRunning = true;
-    let done = 0,
-      updated = 0,
-      skipped = 0,
-      failed = 0,
-      remaining = 0;
-    try {
-      const pending = await api("/names/pending");
-      const ids = pending.ids || [];
-      if (!ids.length) {
-        $("#nameBatchStatus").textContent = "没有需要补全的号码。";
-        return;
-      }
-      for (let i = 0; i < ids.length && nameBatchRunning; i += 20) {
-        $("#nameBatchStatus").textContent =
-          "正在查询… 已处理 " + done + " / " + ids.length;
-        const result = await api("/names/refresh-batch", {
-          ids: ids.slice(i, i + 20),
-          reason: "批量确认当前QQ昵称",
-        });
-        done += Math.min(20, ids.length - i);
-        updated += result.updated.length;
-        skipped += (result.skipped || []).length;
-        failed += result.failed.length;
-        remaining = result.remaining;
-      }
+let nameBatchMode = "missing";
+async function runNameBatch(mode) {
+  nameBatchMode = mode === "all" ? "all" : "missing";
+  const go = $("#nameBatchGo"),
+    stop = $("#nameBatchStop");
+  go.disabled = true;
+  $("#nameBatchLater").disabled = true;
+  $("#nameBatchNever").disabled = true;
+  stop.classList.remove("hide");
+  nameBatchRunning = true;
+  let done = 0,
+    updated = 0,
+    skipped = 0,
+    failed = 0,
+    remaining = 0;
+  const scope = nameBatchMode === "all" ? "全量" : "只补缺失";
+  try {
+    const pending = await api("/names/pending");
+    const ids = (nameBatchMode === "all" ? pending.ids_all : pending.ids) || [];
+    if (!ids.length) {
       $("#nameBatchStatus").textContent =
-        "完成：成功 " +
-        updated +
-        " · 跳过（已有名字）" +
-        skipped +
-        " · 失败 " +
-        failed +
-        " · 还有 " +
-        remaining +
-        " 个未填";
-      await loadNames();
-      if (tab === "profiles") await loadFacts();
-      toast("已更新 " + updated + " 个昵称");
-    } finally {
-      nameBatchRunning = false;
-      go.disabled = false;
-      $("#nameBatchLater").disabled = false;
-      $("#nameBatchNever").disabled = false;
-      stop.classList.add("hide");
+        nameBatchMode === "all" ? "没有可查询的号码。" : "没有需要补全的号码。";
+      return;
     }
+    for (let i = 0; i < ids.length && nameBatchRunning; i += 20) {
+      $("#nameBatchStatus").textContent =
+        "正在查询（" + scope + "）… 已处理 " + done + " / " + ids.length;
+      const result = await api("/names/refresh-batch", {
+        ids: ids.slice(i, i + 20),
+        reason:
+          nameBatchMode === "all"
+            ? "批量确认当前QQ昵称（全量）"
+            : "批量确认当前QQ昵称",
+        mode: nameBatchMode,
+      });
+      done += Math.min(20, ids.length - i);
+      updated += result.updated.length;
+      skipped += (result.skipped || []).length;
+      failed += result.failed.length;
+      remaining = result.remaining;
+    }
+    $("#nameBatchStatus").textContent =
+      "完成（" +
+      scope +
+      "）：补全 " +
+      updated +
+      " · 跳过（已有名字）" +
+      skipped +
+      " · 失败 " +
+      failed +
+      " · 还有 " +
+      remaining +
+      " 个未填";
+    await loadNames();
+    if (tab === "profiles") await loadFacts();
+    toast("已更新 " + updated + " 个昵称");
+  } finally {
+    nameBatchRunning = false;
+    go.disabled = false;
+    $("#nameBatchLater").disabled = false;
+    $("#nameBatchNever").disabled = false;
+    stop.classList.add("hide");
+  }
+}
+$("#nameBatchGo").onclick = () =>
+  guard(() => {
+    $("#nameBatchIntro").textContent = "正在从聊天平台批量确认当前称呼。";
+    return runNameBatch("missing");
   });
+$("#nameBatchManual").onclick = () =>
+  guard(async () => {
+    const pending = await api("/names/pending");
+    $("#nameBatchAskText").textContent =
+      "当前有 " +
+      (pending.total || 0) +
+      " 个号码还没有称呼；全库共 " +
+      (pending.all_total || 0) +
+      " 个可查询的号码。要拉取哪一批？";
+    $("#nameBatchAsk").showModal();
+  });
+$("#nameBatchCancel").onclick = () => $("#nameBatchAsk").close();
+function startManualNameBatch(mode) {
+  $("#nameBatchAsk").close();
+  $("#nameBatchIntro").textContent =
+    mode === "all"
+      ? "全量拉取：已有名字的也会用平台当前昵称更新，旧名保留在曾用名里。"
+      : "只补没有名字的号码，已有名字的会跳过。";
+  $("#nameBatchStatus").textContent = "";
+  $("#nameBatchGo").disabled = false;
+  $("#nameBatch").showModal();
+  guard(() => runNameBatch(mode));
+}
+$("#nameBatchMissing").onclick = () => startManualNameBatch("missing");
+$("#nameBatchAll").onclick = () => startManualNameBatch("all");
 $("#nameBatchStop").onclick = () => {
   nameBatchRunning = false;
-  $("#nameBatchStatus").textContent = "已停止；再次点击「一键拉取」可继续。";
+  $("#nameBatchStatus").textContent =
+    "已停止；再次点击「一键拉取」或「批量拉取姓名」可继续。";
 };
 $("#namePrev").onclick = () =>
   guard(() => {

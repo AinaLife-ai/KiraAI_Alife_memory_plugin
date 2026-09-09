@@ -833,15 +833,21 @@ class Store:
                 self.bump(db)
             return report
 
-    def refreshable_names(self, limit=200):
-        """Entities that have a number but no current name, newest first."""
+    def refreshable_names(self, limit=200, include_named=False):
+        """Entities that have a number and can be looked up, newest first.
+
+        ``include_named=False`` keeps the original behaviour (only entities
+        without a current name); the admin batch button can ask for all of
+        them, but callers must still skip entities that already have a name
+        when writing.
+        """
         from . import identity
 
         result = []
+        where = "" if include_named else "WHERE (name IS NULL OR name='')"
         with self.connect() as db:
             rows = db.execute(
-                "SELECT id FROM entities WHERE (name IS NULL OR name='') "
-                "ORDER BY updated DESC,id LIMIT ?",
+                "SELECT id FROM entities %s ORDER BY updated DESC,id LIMIT ?" % where,
                 (max(limit * 2, 400),),
             )
             for (entity_id,) in rows:

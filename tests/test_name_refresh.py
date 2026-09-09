@@ -190,3 +190,71 @@ async def test_batch_fills_empty_name(tmp_path):
     )
     assert wrote is True and entity["name"] == "平台昵称"
     assert entity["history"][0]["reason"] == "批量确认当前QQ昵称"
+
+
+class _Req:
+    """Minimal stand-in for the host request object."""
+
+    def __init__(self, payload):
+        import json as _json
+
+        self._payload = _json.dumps(payload).encode("utf-8")
+
+    async def body(self):
+        return self._payload
+
+
+def test_refreshable_names_include_named(tmp_path):
+    store = s.Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.observe_name("qq:123", "手工名", kind="user", observed=100.0)
+    _placeholder(store, "qq:456")
+    _placeholder(store, "global")
+    _placeholder(store, "self")
+
+    assert store.refreshable_names(50) == ["qq:456"]
+    assert sorted(store.refreshable_names(50, include_named=True)) == [
+        "qq:123",
+        "qq:456",
+    ]
+
+
+def test_name_batch_mode_contract():
+    c = importlib.import_module("alife_name_test.contracts")
+    assert c.NameBatch().mode == "missing"
+    assert c.NameBatch(mode="all").mode == "all"
+    with pytest.raises(Exception):
+        c.NameBatch(mode="everything")
+
+
+@pytest.mark.asyncio
+async def test_all_mode_updates_named_entities_too(tmp_path):
+    plugin, store = _plugin(tmp_path)
+    store.observe_name("qq:123", "手工名", kind="user", observed=100.0)
+    _placeholder(store, "qq:456")
+
+    result = await plugin.api_name_refresh_batch(_Req({"mode": "all"}))
+
+    assert result["mode"] == "all"
+    assert result["scanned"] == 2
+    assert sorted(result["updated"]) == ["qq:123", "qq:456"]
+    assert result["skipped"] == []
+    entity = store.entities(ids=["qq:123"])[0]
+    assert entity["name"] == "平台昵称"          # 全量模式会更新
+    assert entity["history"][0]["name"] == "平台昵称"
+    assert "手工名" in [h["name"] for h in entity["history"]]  # 旧名留档可恢复
+    assert plugin.ctx.adapter_mgr.get_adapter("qq").bot.calls == ["123", "456"]
+
+
+@pytest.mark.asyncio
+async def test_missing_mode_only_scans_unnamed(tmp_path):
+    plugin, store = _plugin(tmp_path)
+    store.observe_name("qq:123", "手工名", kind="user", observed=100.0)
+    _placeholder(store, "qq:456")
+
+    result = await plugin.api_name_refresh_batch(_Req({"mode": "missing"}))
+
+    assert result["scanned"] == 1
+    assert result["updated"] == ["qq:456"]
+    assert result["skipped"] == []
+    assert store.entities(ids=["qq:123"])[0]["name"] == "手工名"

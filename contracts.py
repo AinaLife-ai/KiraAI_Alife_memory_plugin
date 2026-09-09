@@ -421,3 +421,5 @@ class EntityRefresh(Strict):
 class NameBatch(Strict):
     ids: list[Short] = Field(default_factory=list, max_length=200)
     reason: Short = "批量确认当前QQ昵称"
+    # missing: 只查没有名字的；all: 已有名字的也查一遍（写入时仍一律跳过）
+    mode: Literal["missing", "all"] = "missing"
