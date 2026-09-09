@@ -1239,7 +1239,7 @@ class AlifeMemoryPlugin(BasePlugin):
             )
             result = await self.store.call(
                 "search",
-                **q.model_dump(exclude={"prompt"}),
+                **q.model_dump(exclude={"prompt", "include_global"}),
                 scope=self.settings.recall_scope,
                 users=user_ids(event),
                 vector=vector,
@@ -1553,8 +1553,9 @@ class AlifeMemoryPlugin(BasePlugin):
         )
         result = await self.store.call(
             "search",
-            **q.model_dump(exclude={"prompt"}),
+            **q.model_dump(exclude={"prompt", "include_global"}),
             scope="session" if q.sid else "global",
+            strict_session=bool(q.sid) and not q.include_global,
             vector=vector,
             model=model,
             lexical=q.prompt if not vector else "",

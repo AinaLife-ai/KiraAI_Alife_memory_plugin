@@ -333,6 +333,8 @@ def dump(value):
 
 class Search(Strict):
     sid: str = ""
+    # The admin UI browses one session at a time; global memories are opt-in there.
+    include_global: bool = True
     keyword: str = Field(default="", max_length=500)
     prompt: str = Field(default="", max_length=2000)
     level: int | None = Field(default=None, ge=0, le=100)
