@@ -337,3 +337,18 @@ def test_audit_scheduler_picks_stalest_sessions(tmp_path):
             )
             db.execute("UPDATE facts SET audited=? WHERE sid=?", (audited, sid))
     assert store.sessions_by_audit_age(2) == ["a:dm:1", "a:dm:2"]
+
+
+def test_repair_synthetic_names_restores_previous(tmp_path):
+    store = s.Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.observe_name("qq:1", "萤火", kind="user", observed=100.0)
+    store.observe_name("qq:1", "提醒任务所有者", kind="user", observed=200.0)
+    assert store.entities(ids=["qq:1"])[0]["name"] == "提醒任务所有者"
+
+    repaired = store.repair_synthetic_names()
+    assert repaired == [{"id": "qq:1", "name": "萤火"}]
+    row = store.entities(ids=["qq:1"])[0]
+    assert row["name"] == "萤火"
+    assert row["history"][0]["reason"] == "忽略第三方插件的合成昵称"
+    assert store.repair_synthetic_names() == []

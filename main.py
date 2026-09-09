@@ -38,6 +38,7 @@ from .engine import Engine, compression_plan
 from .storage import Conflict, Store
 from .migration import SOURCES
 from .retrieval import (
+    SYNTHETIC_NAMES,
     TOOL_RESULT_PREFIX,
     archive_view,
     looks_like_memory_payload,
@@ -214,6 +215,14 @@ class AlifeMemoryPlugin(BasePlugin):
             logger.exception("[记忆·Z] 迁移未完成；插件继续加载，原文件保留")
             self.migration_blocked = False
         try:
+            repaired = await self.store.call("repair_synthetic_names")
+            if repaired:
+                logger.info(
+                    "[记忆·Z] 修复被第三方插件改写的昵称：%s 个", len(repaired)
+                )
+        except Exception:
+            logger.exception("[记忆·Z] 昵称修复未完成，可稍后在后台任务页重试")
+        try:
             if await self.store.call("needs_tool_cleanup"):
                 report = await self.store.call("cleanup_tool_records")
                 logger.info(
@@ -301,26 +310,34 @@ class AlifeMemoryPlugin(BasePlugin):
         )
 
     async def observe_event_names(self, event):
+        # Synthetic notices (e.g. another plugin firing a reminder as the user)
+        # carry placeholder nicknames; observing them would overwrite real names.
+        notices = any(getattr(m, "is_notice", False) for m in event.messages)
         adapter = event.session.adapter_name
         for msg in event.messages:
             sender = getattr(msg, "sender", None)
-            if sender:
-                await self.store.call(
-                    "observe_name",
-                    f"{adapter}:{sender.user_id}",
-                    sender.nickname,
-                    context=event.sid,
-                    observed=float(msg.timestamp),
-                )
-        title = getattr(event.session, "session_title", None)
-        await self.store.call(
-            "observe_name",
-            event.sid,
-            title,
-            kind="session",
-            context=event.sid,
-            observed=float(getattr(event, "timestamp", None) or time.time()),
-        )
+            if not sender or getattr(msg, "is_notice", False):
+                continue
+            nickname = str(getattr(sender, "nickname", "") or "").strip()
+            if not nickname or nickname in SYNTHETIC_NAMES:
+                continue
+            await self.store.call(
+                "observe_name",
+                f"{adapter}:{sender.user_id}",
+                nickname,
+                context=event.sid,
+                observed=float(msg.timestamp),
+            )
+        title = str(getattr(event.session, "session_title", None) or "").strip()
+        if not notices and title and title not in SYNTHETIC_NAMES:
+            await self.store.call(
+                "observe_name",
+                event.sid,
+                title,
+                kind="session",
+                context=event.sid,
+                observed=float(getattr(event, "timestamp", None) or time.time()),
+            )
 
     def adapter_names(self):
         manager = getattr(self.ctx, "adapter_mgr", None)
@@ -448,15 +465,24 @@ class AlifeMemoryPlugin(BasePlugin):
         ids = await self.store.call(
             "entity_ids", event.sid, user_ids(event), self.settings.recall_scope
         )
-        return self.recall_result(
-            event,
-            {
-                "ok": True,
-                "entities": await self.store.call(
-                    "entities", query, ids=ids, offset=offset
-                ),
-            },
-        )
+        rows = await self.store.call("entities", query, ids=ids, offset=offset)
+        entities = []
+        for row in rows:
+            item = {
+                "id": row["id"],
+                "kind": row["kind"],
+                "name": row["name"],
+                "revision": row["revision"],
+                "aliases": list(
+                    dict.fromkeys(
+                        h["name"] for h in row["history"] if h["name"] != row["name"]
+                    )
+                )[:5],
+            }
+            if row.get("lookup_id") and row["lookup_id"] != row["id"]:
+                item["lookup_id"] = row["lookup_id"]
+            entities.append(item)
+        return self.recall_result(event, {"ok": True, "entities": entities})
 
     @register.tool(
         name="CorrectMemoryName",
@@ -1479,6 +1505,13 @@ class AlifeMemoryPlugin(BasePlugin):
             "skipped": skipped,
             "failed": failed,
             "remaining": len(await self.store.call("refreshable_names", 200)),
+        }
+
+    @register.api(method="POST", path="/maintenance/names", auth=True)
+    async def api_repair_names(self):
+        return {
+            "ok": True,
+            "repaired": await self.store.call("repair_synthetic_names"),
         }
 
     @register.api(method="POST", path="/maintenance/tools", auth=True)

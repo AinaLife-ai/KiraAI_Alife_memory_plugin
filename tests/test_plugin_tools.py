@@ -98,3 +98,63 @@ async def test_search_returns_only_new_memories(tmp_path):
         await plugin.search_archive(event, keyword="喵梓", allow_seen=True)
     )
     assert len(again["items"]) == 3
+
+
+class _Sender:
+    def __init__(self, uid, nickname):
+        self.user_id = uid
+        self.nickname = nickname
+
+
+class _Message:
+    def __init__(self, uid, nickname, notice=False, timestamp=100.0):
+        self.sender = _Sender(uid, nickname)
+        self.is_notice = notice
+        self.timestamp = timestamp
+
+
+def _notice_event():
+    return types.SimpleNamespace(
+        sid="qq:dm:1835996851",
+        event_id="reminder",
+        timestamp=200.0,
+        messages=[
+            _Message("1835996851", "提醒任务所有者", notice=True, timestamp=200.0)
+        ],
+        session=types.SimpleNamespace(
+            adapter_name="qq", session_title="提醒任务所有者"
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_notice_messages_do_not_overwrite_nicknames(tmp_path):
+    plugin, store = _plugin(tmp_path)
+    plugin.engine = _Engine()
+    real = types.SimpleNamespace(
+        sid="qq:dm:1835996851",
+        event_id="real",
+        timestamp=100.0,
+        messages=[_Message("1835996851", "萤火", timestamp=100.0)],
+        session=types.SimpleNamespace(adapter_name="qq", session_title="萤火"),
+    )
+    await plugin.observe_event_names(real)
+    assert store.entities(ids=["qq:1835996851"])[0]["name"] == "萤火"
+    assert store.entities(ids=["qq:dm:1835996851"])[0]["name"] == "萤火"
+
+    await plugin.observe_event_names(_notice_event())
+    assert store.entities(ids=["qq:1835996851"])[0]["name"] == "萤火"
+    assert store.entities(ids=["qq:dm:1835996851"])[0]["name"] == "萤火"
+
+
+@pytest.mark.asyncio
+async def test_memory_names_returns_lean_entities(tmp_path):
+    plugin, store = _plugin(tmp_path)
+    plugin.engine = _Engine()
+    store.observe_name("qq:1", "小明", kind="user", observed=1.0)
+    store.observe_name("qq:1", "明哥", kind="user", observed=2.0)
+    out = json.loads(await plugin.memory_names(_event(), query="小明"))
+    entity = out["entities"][0]
+    assert set(entity) <= {"id", "kind", "name", "revision", "aliases", "lookup_id"}
+    assert entity["name"] == "明哥" and "小明" in entity["aliases"]
+    assert "identity_note" not in entity and "label" not in entity
