@@ -251,6 +251,7 @@ function tasksHtml(jobs) {
                 audit: "事实审计",
                 reindex: "语义索引",
                 classify: "记忆归类",
+                dedupe: "永久记忆合并",
                 proactive: "主动感知",
               }[j.kind] || j.kind,
             ) +

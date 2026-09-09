@@ -1051,6 +1051,17 @@ class Store:
                 )
             ]
 
+    def permanent_stats(self, sid):
+        """Active vs archived permanent memories, for diagnostics."""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT sum(CASE WHEN active=1 AND cold=0 THEN 1 ELSE 0 END) AS live, "
+                "sum(CASE WHEN active=0 OR cold=1 THEN 1 ELSE 0 END) AS archived "
+                "FROM records WHERE sid=? AND permanent=1 AND deleted=0",
+                (sid,),
+            ).fetchone()
+        return {"live": row["live"] or 0, "archived": row["archived"] or 0}
+
     def sessions_with_permanents(self):
         with self.connect() as db:
             return [

@@ -173,3 +173,39 @@ async def test_force_merge_switch_changes_dedupe_instruction(tmp_path):
         engine = e.Engine(store, lambda: cfg, model, None, None)
         await engine.consolidate(SID)
         assert marker in captured["dedupe"]
+
+
+def test_consolidate_reports_why_nothing_happened(tmp_path):
+    store = s.Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.memorize(SID, "今天天气不错适合出门", ["qq:1"], 1.0, 1.0)
+    store.memorize(SID, "群规不滥用波浪号", ["qq:1"], 2.0, 2.0)
+
+    async def model(*_args):
+        raise AssertionError("no similar cluster should reach the model")
+
+    cfg = c.Settings(dedupe_threshold=0.25, model_retries=0)
+    engine = e.Engine(store, lambda: cfg, model, None, None)
+    report = asyncio.run(engine.consolidate(SID))
+    assert report["permanent"] == 2 and report["clusters"] == 0
+    assert "未发现相似簇" in report["note"]
+
+    merged_store = s.Store(tmp_path / "merged.sqlite3")
+    merged_store.initialize()
+    ids = seed(merged_store)
+
+    async def merge_model(*_args):
+        return json.dumps(
+            {
+                "action": "merge",
+                "content": "合并后的花名册",
+                "reason": "同一份名单",
+                "source_ids": ids,
+            },
+            ensure_ascii=False,
+        )
+
+    merged = e.Engine(merged_store, lambda: cfg, merge_model, None, None)
+    asyncio.run(merged.consolidate(SID))
+    again = asyncio.run(merged.consolidate(SID))
+    assert again["permanent"] == 1 and "已归档 2 条" in again["note"]
