@@ -149,6 +149,32 @@ def profile_entries(data):
                 )
 
 
+def newest_legacy_mtime(root) -> float:
+    """旧记忆源文件里最新的修改时间（没有文件返回 0）。只 stat，不解析。"""
+    root = Path(root)
+    newest = 0.0
+    core = root / "core.txt"
+    try:
+        if core.is_file():
+            newest = max(newest, core.stat().st_mtime)
+    except OSError:
+        pass
+    for folder in ("entities", "global"):
+        base = root / folder
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix != ".toml" and path.name != "profile.json":
+                continue
+            try:
+                newest = max(newest, path.stat().st_mtime)
+            except OSError:
+                pass
+    return newest
+
+
 def snapshot(root: Path, plugin_id: str, limit: int, resolver=None):
     """Read only named memory sources; each rejected item has an auditable reason.
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import contextlib
 import hashlib
 import json
 import random
@@ -36,7 +37,7 @@ from .contracts import (
 from . import identity
 from .engine import Engine, compression_plan
 from .storage import Conflict, Store
-from .migration import SOURCES
+from .migration import SOURCES, newest_legacy_mtime
 from .retrieval import (
     SYNTHETIC_NAMES,
     TOOL_RESULT_PREFIX,
@@ -72,6 +73,16 @@ MERGE_PLUGINS = (
     "context_condensation",
     "ContextCondensation",
 )
+
+
+def _log_migration_failure(task):
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error(
+            "[记忆·Z] 迁移未完成；插件继续加载，原文件保留", exc_info=error
+        )
 
 
 def user_ids(event):
@@ -112,6 +123,7 @@ class AlifeMemoryPlugin(BasePlugin):
         self.migration_lock = asyncio.Lock()
         self.migration_blocked = False
         self.migration_note = ""
+        self.migration_task = None
         self.identity_report = {}
         self.identity_settled = True
         self.name_refresh_lock = asyncio.Lock()
@@ -141,11 +153,19 @@ class AlifeMemoryPlugin(BasePlugin):
         async with self.migration_lock:
             if not self.settings.enabled or not self.settings.auto_migrate:
                 return
+            root = Path(get_data_path()) / "memory"
+            # 源文件没变化、也没有冲突插件在跑：不必每次启动都重扫一遍。
+            if not self.conflicts():
+                newest = await asyncio.to_thread(newest_legacy_mtime, root)
+                migrated_at = await self.store.call("legacy_migrated_at")
+                if newest <= migrated_at:
+                    self.migration_blocked = False
+                    self.migration_note = "旧记忆已迁移，源文件未变化。"
+                    return
             self.migration_blocked = True
             self.migration_note = "正在安全迁移；原文件只读保留。"
             disabled = []
             try:
-                root = Path(get_data_path()) / "memory"
                 adapters = self.adapter_names()
                 # Import and verify first. Stop legacy writers only after a committed copy.
                 for pid in SOURCES:
@@ -180,6 +200,7 @@ class AlifeMemoryPlugin(BasePlugin):
                         if snap["errors"]:
                             raise ValueError("final_source_read_failed")
                     await self.store.call("canonicalize_identity", adapters)
+                await self.store.call("set_legacy_migrated_at", time.time())
                 self.migration_blocked = False
                 self.migration_note = (
                     "迁移完成，原文件完整保留。切换回旧插件前请先停用长期记忆·Z。"
@@ -222,12 +243,9 @@ class AlifeMemoryPlugin(BasePlugin):
         self.engine = Engine(
             self.store, self.runtime_settings, self.model_call, self.embed, self.notice
         )
-        try:
-            await self.migrate()
-        except Exception:
-            # A failed migration must never block loading; sources stay read-only.
-            logger.exception("[记忆·Z] 迁移未完成；插件继续加载，原文件保留")
-            self.migration_blocked = False
+        # 后台迁移：不阻塞插件加载；迁移期间记忆功能由 migration_blocked 暂停。
+        self.migration_task = asyncio.create_task(self.migrate())
+        self.migration_task.add_done_callback(_log_migration_failure)
         try:
             await self.refresh_bootstrap_review()
         except Exception:
@@ -259,7 +277,17 @@ class AlifeMemoryPlugin(BasePlugin):
             "开启" if self.settings.semantic_enabled else "关闭",
         )
 
+    async def wait_migration(self):
+        """等待后台迁移结束（状态查询与测试用）。"""
+        if self.migration_task is not None:
+            await asyncio.gather(self.migration_task, return_exceptions=True)
+
     async def terminate(self):
+        task = self.migration_task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         if self.engine:
             await self.engine.stop()
 

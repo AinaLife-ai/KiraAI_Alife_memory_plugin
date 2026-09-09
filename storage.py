@@ -452,6 +452,22 @@ class Store:
             ]
         return snapshot(root, plugin_id, limit, Resolver(entities, adapters))
 
+    def legacy_migrated_at(self):
+        """上次成功迁移旧记忆的时间戳（0 表示还没成功过）。"""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='legacy_migrated_at'"
+            ).fetchone()
+        return float(row["value"]) if row else 0.0
+
+    def set_legacy_migrated_at(self, value):
+        with self.connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('legacy_migrated_at',?)",
+                (float(value),),
+            )
+            self.bump(db)
+
     def synthetic_identity(self):
         """True while any row still carries a synthetic migration identifier."""
         with self.connect() as db:
