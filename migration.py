@@ -84,6 +84,15 @@ def timestamp(value, fallback):
     return fallback, "file_mtime_estimate"
 
 
+def _importance(value):
+    """Clamp a legacy importance value into the 1-10 range."""
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        return 5
+    return max(1, min(10, number))
+
+
 def raw_location(relative, source):
     """Raw, source-faithful bucket; hashing and dedup depend on this shape."""
     parts = relative.parts
@@ -325,6 +334,7 @@ def snapshot(root: Path, plugin_id: str, limit: int, resolver=None):
                         tags=[*tags, "legacy_import"],
                         relations=relations,
                         source_ids=["pending"],
+                        importance=_importance(metadata.get("importance")),
                     ).model_dump()
                     item.update(
                         sid=sid,
