@@ -167,7 +167,7 @@ async def test_followup_facts_excluded_before_limit(tmp_path):
     )
     await plugin.initialize()
     try:
-        for i in range(4):
+        for i in range(55):
             rid = plugin.store.memorize(
                 "test:gm:other", f"喜欢猫的证据{i}", ["test:v"], float(i), float(i)
             )
@@ -189,8 +189,11 @@ async def test_followup_facts_excluded_before_limit(tmp_path):
         event = make_event()
         first = json.loads(await plugin.overview(event))
         second = json.loads(await plugin.overview(event))
-        assert len(first["facts"]) == 2 and first["already_seen"] == 0
-        assert second["facts"] == [] and second["already_seen"] == 2
+        # MemoryOverview 每次最多返回 50 条新事实：先排除已送达的，再截断。
+        assert len(first["facts"]) == 50 and first["already_seen"] == 0
+        assert len(second["facts"]) == 5 and second["already_seen"] == 50
+        third = json.loads(await plugin.overview(event))
+        assert third["facts"] == [] and third["already_seen"] == 55
     finally:
         await plugin.terminate()
 
@@ -271,12 +274,10 @@ async def test_global_recall_has_provenance_names_and_no_vector_calls(tmp_path):
             )
         )
         assert result["ok"]
-        assert (
-            json.loads(await plugin.memory_names(event, "阿澄"))["entities"][0][
-                "history"
-            ][1]["name"]
-            == "阿澄"
-        )
+        # 2.2.8 起 MemoryNames 只返回 id/kind/name/revision/aliases，
+        # 旧称呼出现在 aliases 里。
+        renamed = json.loads(await plugin.memory_names(event, "阿澄"))["entities"][0]
+        assert renamed["name"] == "阿澄的新名字" and "阿澄" in renamed["aliases"]
         plugin.settings = plugin.settings.model_copy(update={"recall_scope": "session"})
         assert not json.loads(await plugin.memory_names(event, "阿澄"))["entities"]
     finally:
@@ -795,5 +796,112 @@ async def test_vector_opt_in_and_disable_discards_inflight_index(tmp_path):
             assert db.execute("SELECT count(*) FROM vectors").fetchone()[0] == 1
         await plugin.engine.index(key2, plugin.settings)
         assert len(calls) == 1
+    finally:
+        await plugin.terminate()
+
+
+class _PluginManager:
+    """Minimal plugin manager stub for bootstrap-guard tests."""
+
+    def __init__(self, states=None):
+        self.states = states or {}
+        self.plugin_configs = {}
+
+    def has_plugin(self, pid):
+        return pid in self.states
+
+    def is_plugin_enabled(self, pid):
+        return self.states.get(pid, False)
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_skipped_when_history_is_rewritten(tmp_path):
+    manager = _PluginManager({"kira_session_merger": True})
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path, plugin_mgr=manager
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        event = make_event()
+        request = LLMRequest(
+            messages=[OpenAIMessage(role="user", content="[B会话/阿强] 我下个月去日本")],
+            user_prompt=[Prompt("你好", name="message")],
+        )
+        await plugin.on_request(event, request)
+        # 合并插件在改写上下文：不把别的会话的内容播种成本会话经历
+        assert plugin.store.active(event.sid) == []
+        assert plugin.store.bootstrap_done(event.sid)
+        # 之后再关掉合并插件，这个会话也不会补播种（标记已写）
+        manager.states["kira_session_merger"] = False
+        await plugin.on_request(event, request)
+        assert plugin.store.active(event.sid) == []
+        assert plugin.store.purge_bootstrap()["removed"] == 0
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_seeds_then_purge_removes_and_stays_gone(tmp_path):
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path, plugin_mgr=_PluginManager()
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        event = make_event()
+        request = LLMRequest(
+            messages=[
+                OpenAIMessage(role="user", content="上周约好周日看猫"),
+                OpenAIMessage(role="assistant", content="好呀"),
+            ],
+            user_prompt=[Prompt("你好", name="message")],
+        )
+        await plugin.on_request(event, request)
+        assert len(plugin.store.active(event.sid)) == 2
+        # 无合并插件时的播种来源可确认，不进入核对列表
+        assert plugin.store.bootstrap_review() == []
+        report = plugin.store.purge_bootstrap()
+        assert report["removed"] == 2 and report["sessions"] == 1
+        assert plugin.store.active(event.sid) == []
+        # 软删除后不会重新播种
+        await plugin.on_request(event, request)
+        assert plugin.store.active(event.sid) == []
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_review_hint_only_for_legacy_records(tmp_path):
+    manager = _PluginManager({"kira_session_merger": True})
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path, plugin_mgr=manager
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        # 模拟老版本遗留：有播种记录、没有 clean 标记
+        plugin.store.capture(
+            "test:dm:old",
+            "bootstrap",
+            [{"role": "user", "content": "旧对话", "time": 1.0, "users": ["test:u"]}],
+        )
+        info = await plugin.refresh_bootstrap_review()
+        assert info["count"] == 1
+        assert info["merge_plugin"] == "kira_session_merger"
+        assert info["reviewed"] is False
+        assert info["sessions"] == ["test:dm:old"]
+        # 点「保留，不再提醒」
+        result = await plugin.api_bootstrap_review()
+        assert result["ok"] and result["reviewed"] is True and result["count"] == 1
+        # 没有合并插件时不提示
+        manager.states["kira_session_merger"] = False
+        assert (await plugin.refresh_bootstrap_review())["merge_plugin"] == ""
     finally:
         await plugin.terminate()

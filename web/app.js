@@ -304,6 +304,7 @@ async function poll() {
       if (!bootConfig.enabled && bootPlaying) endBoot();
     }
     renderMigration(next.migration);
+    renderBootstrapNotice(next.bootstrap_review);
     $$('[data-job="reindex"]').forEach((e) => {
       e.disabled = !next.semantic_enabled;
       e.title = next.semantic_enabled
@@ -1346,6 +1347,44 @@ $("#repairNames").onclick = () =>
           report.repaired.map((item) => item.name).join("、")
         : "没有发现被第三方插件改写的昵称";
       await loadNames();
+    } finally {
+      button.disabled = false;
+    }
+  });
+function renderBootstrapNotice(info) {
+  const box = $("#bootstrapNotice");
+  if (!box) return;
+  const active = info && info.merge_plugin && info.count && !info.reviewed;
+  box.classList.toggle("hide", !active);
+  if (!active) return;
+  $("#bootstrapNoticeText").textContent =
+    "检测到 " +
+    info.merge_plugin +
+    " 会改写会话上下文：库中有 " +
+    info.count +
+    " 个会话的历史播种记录无法确认来源，可能混入了其他会话。" +
+    "如果你是先装记忆插件、后装合并插件，这些记录通常是正常的，可以保留。";
+}
+$("#bootstrapGo").onclick = () => selectTab("tasks");
+$("#bootstrapKeep").onclick = () =>
+  guard(async () => {
+    await api("/maintenance/bootstrap/review", {});
+    await poll();
+  });
+$("#purgeBootstrap").onclick = () =>
+  guard(async () => {
+    const button = $("#purgeBootstrap");
+    button.disabled = true;
+    try {
+      const report = await api("/maintenance/bootstrap", {});
+      $("#purgeBootstrapHint").textContent = report.removed
+        ? "已清理 " +
+          report.removed +
+          " 条（涉及 " +
+          report.sessions +
+          " 个会话）· 原文保留可恢复"
+        : "没有发现历史播种记录";
+      await poll();
     } finally {
       button.disabled = false;
     }

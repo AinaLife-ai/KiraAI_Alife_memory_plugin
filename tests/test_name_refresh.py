@@ -11,11 +11,15 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+_SAVED_MODULES = {}
+
+
 def _install_fake_core():
     def module(name, **attrs):
         mod = types.ModuleType(name)
         for key, value in attrs.items():
             setattr(mod, key, value)
+        _SAVED_MODULES.setdefault(name, sys.modules.get(name))
         sys.modules[name] = mod
         return mod
 
@@ -72,7 +76,17 @@ def _install_fake_core():
     )
     module("core.logging_manager", get_logger=lambda *a, **k: _Logger())
     for name in ("core", "core.agent", "core.utils", "core.chat"):
+        _SAVED_MODULES.setdefault(name, sys.modules.get(name))
         sys.modules.setdefault(name, types.ModuleType(name))
+
+
+def _restore_modules():
+    """Drop the fakes again so other test files still see the real host."""
+    for name, previous in _SAVED_MODULES.items():
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
 
 
 _install_fake_core()
@@ -81,6 +95,7 @@ package.__path__ = [str(ROOT)]
 sys.modules.setdefault("alife_name_test", package)
 module = importlib.import_module("alife_name_test.main")
 s = importlib.import_module("alife_name_test.storage")
+_restore_modules()
 
 
 class _Bot:

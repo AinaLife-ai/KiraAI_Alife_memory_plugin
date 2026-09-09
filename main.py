@@ -63,6 +63,17 @@ MEMORY_RULES = (
 )
 
 
+# 会话合并/压缩类插件会改写 req.messages：播种时可能把别的会话的内容记成本会话。
+MERGE_PLUGINS = (
+    "kira_session_merger",
+    "auto_delete_session",
+    "KiraAI-ContextCondensation",
+    "KiraAI-ContextCondensation-main",
+    "context_condensation",
+    "ContextCondensation",
+)
+
+
 def user_ids(event):
     adapter = getattr(getattr(event, "session", None), "adapter_name", "")
     return sorted(
@@ -107,6 +118,9 @@ class AlifeMemoryPlugin(BasePlugin):
         self.seen_window = RecallWindow()
         self._recall_outputs = {}
         self._own_outputs = set()
+        self._bootstrap_notified = set()
+        self._bootstrap_review_logged = False
+        self.bootstrap_review = {}
 
     def conflicts(self):
         pm = getattr(self.ctx, "plugin_mgr", None)
@@ -214,6 +228,10 @@ class AlifeMemoryPlugin(BasePlugin):
             # A failed migration must never block loading; sources stay read-only.
             logger.exception("[记忆·Z] 迁移未完成；插件继续加载，原文件保留")
             self.migration_blocked = False
+        try:
+            await self.refresh_bootstrap_review()
+        except Exception:
+            logger.exception("[记忆·Z] 播种记录核对未完成，可稍后在后台任务页重试")
         try:
             repaired = await self.store.call("repair_synthetic_names")
             if repaired:
@@ -548,6 +566,59 @@ class AlifeMemoryPlugin(BasePlugin):
         except (ValueError, TimeoutError):
             return dump({"ok": False, "error": "name_lookup_unavailable"})
 
+    async def refresh_bootstrap_review(self):
+        """检查是否存在来源无法确认的历史播种记录（老版本遗留 + 合并插件在场）。"""
+        sessions = await self.store.call("bootstrap_review")
+        reviewed = await self.store.call("bootstrap_reviewed")
+        blocker = self.merge_plugin_active()
+        self.bootstrap_review = {
+            "sessions": sessions,
+            "count": len(sessions),
+            "merge_plugin": blocker,
+            "reviewed": reviewed,
+        }
+        if sessions and blocker and not reviewed and not self._bootstrap_review_logged:
+            self._bootstrap_review_logged = True
+            logger.warning(
+                "[记忆·Z] 检测到 %s 正在改写会话上下文；库中有 %s 个会话的历史播种记录"
+                "无法确认来源，可在后台任务页核对后清理",
+                blocker,
+                len(sessions),
+            )
+        return self.bootstrap_review
+
+    def merge_plugin_active(self):
+        """返回正在改写会话上下文的插件 id（没有则为空字符串）。"""
+        pm = getattr(self.ctx, "plugin_mgr", None)
+        if not pm or not hasattr(pm, "has_plugin"):
+            return ""
+        try:
+            for pid in MERGE_PLUGINS:
+                if pm.has_plugin(pid) and pm.is_plugin_enabled(pid):
+                    return pid
+            for attr in ("plugin_instances", "plugins", "_plugins"):
+                registry = getattr(pm, attr, None)
+                if not isinstance(registry, dict):
+                    continue
+                for key in registry:
+                    normalized = str(key).lower().replace("-", "").replace("_", "")
+                    if "contextcondensation" in normalized and pm.is_plugin_enabled(
+                        str(key)
+                    ):
+                        return str(key)
+        except Exception:
+            return ""
+        return ""
+
+    def bootstrap_allowed(self):
+        """是否允许把宿主旧历史播种进本会话。"""
+        mode = self.settings.bootstrap_seed
+        if mode == "off":
+            return False
+        if mode == "always":
+            return True
+        return not self.merge_plugin_active()
+
     @on.llm_request(priority=Priority.LOW)
     async def on_request(self, event, req: LLMRequest, *_):
         cfg = self.runtime_settings()
@@ -563,19 +634,41 @@ class AlifeMemoryPlugin(BasePlugin):
         await self.observe_event_names(event)
         rows = await self.store.call("active", sid)
         # Seed pre-install history once; never erase the core's own history on disk.
-        if not rows and req.messages and cfg.capture_enabled:
-            messages = [
-                {
-                    "role": m.role if m.role in ("user", "assistant") else "assistant",
-                    "content": dump(m.to_dict()),
-                    "time": time.time(),
-                    "users": user_ids(event),
-                }
-                for m in req.messages
-                if m.role != "system"
-            ]
-            await self.store.call("capture", sid, "bootstrap", messages)
-            rows = await self.store.call("active", sid)
+        if (
+            not rows
+            and req.messages
+            and cfg.capture_enabled
+            and not await self.store.call("bootstrap_done", sid)
+        ):
+            blocker = self.merge_plugin_active()
+            if self.bootstrap_allowed():
+                messages = [
+                    {
+                        "role": m.role if m.role in ("user", "assistant") else "assistant",
+                        "content": dump(m.to_dict()),
+                        "time": time.time(),
+                        "users": user_ids(event),
+                    }
+                    for m in req.messages
+                    if m.role != "system"
+                ]
+                await self.store.call("capture", sid, "bootstrap", messages)
+                rows = await self.store.call("active", sid)
+                # 当时没有合并插件在场：这批播种记录来源可确认。
+                await self.store.call("mark_bootstrap", sid, clean=not blocker)
+            else:
+                if sid not in self._bootstrap_notified:
+                    self._bootstrap_notified.add(sid)
+                    while len(self._bootstrap_notified) > 256:
+                        self._bootstrap_notified.pop()
+                    logger.info(
+                        "[记忆·Z] 检测到 %s 正在改写会话上下文，已跳过历史播种"
+                        "（避免把别的会话记成本会话）",
+                        blocker or "会话合并/压缩插件",
+                    )
+                # 无论播种还是跳过都记一次，清理后不会复活。
+                await self.store.call("mark_bootstrap", sid)
+            await self.refresh_bootstrap_review()
         if not cfg.auto_inject:
             return
         users = user_ids(event)
@@ -1260,6 +1353,7 @@ class AlifeMemoryPlugin(BasePlugin):
             **self.identity_report,
             "synthetic_remaining": await self.store.call("synthetic_identity"),
         }
+        status["bootstrap_review"] = self.bootstrap_review
         status["boot"] = {
             "enabled": self.settings.boot_enabled,
             "replay_seconds": self.settings.boot_replay_seconds,
@@ -1513,6 +1607,17 @@ class AlifeMemoryPlugin(BasePlugin):
             "ok": True,
             "repaired": await self.store.call("repair_synthetic_names"),
         }
+
+    @register.api(
+        method="POST", path="/maintenance/bootstrap/review", auth=True
+    )
+    async def api_bootstrap_review(self):
+        await self.store.call("mark_bootstrap_reviewed")
+        return {"ok": True, **await self.refresh_bootstrap_review()}
+
+    @register.api(method="POST", path="/maintenance/bootstrap", auth=True)
+    async def api_purge_bootstrap(self):
+        return {"ok": True, **await self.store.call("purge_bootstrap")}
 
     @register.api(method="POST", path="/maintenance/tools", auth=True)
     async def api_cleanup_tools(self):

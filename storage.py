@@ -156,6 +156,90 @@ class Store:
     def bump(db):
         db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
 
+    def bootstrap_done(self, sid):
+        """本会话是否已经播种过（或已决定跳过）。"""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT 1 FROM meta WHERE key=?", (f"bootstrap:{sid}",)
+            ).fetchone()
+        return row is not None
+
+    def mark_bootstrap(self, sid, clean=False):
+        """记下已处理：清理播种记录后也不会重新播种。
+
+        ``clean=True`` 表示播种当时没有任何会话合并/压缩插件在场，
+        这批记录可以确认来源，不需要事后核对。
+        """
+        with self.connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO meta VALUES (?,1)", (f"bootstrap:{sid}",)
+            )
+            if clean:
+                db.execute(
+                    "INSERT OR REPLACE INTO meta VALUES (?,1)",
+                    (f"bootstrap_clean:{sid}",),
+                )
+            self.bump(db)
+
+    def bootstrap_review(self):
+        """有播种记录、但来源无法确认（没有 clean 标记）的会话。"""
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT DISTINCT r.sid FROM records r WHERE r.deleted=0 "
+                "AND r.event_key LIKE ? AND NOT EXISTS "
+                "(SELECT 1 FROM meta WHERE key='bootstrap_clean:'||r.sid)",
+                ("%:bootstrap:%",),
+            ).fetchall()
+        return [row["sid"] for row in rows]
+
+    def bootstrap_reviewed(self):
+        with self.connect() as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM meta WHERE key='bootstrap_review_done'"
+                ).fetchone()
+                is not None
+            )
+
+    def mark_bootstrap_reviewed(self):
+        with self.connect() as db:
+            db.execute("INSERT OR REPLACE INTO meta VALUES ('bootstrap_review_done',1)")
+            self.bump(db)
+
+    def purge_bootstrap(self):
+        """软删除历史播种记录；快照留在 versions，且不会重新播种。"""
+        report = {"removed": 0, "sessions": 0, "freed_chars": 0}
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT id,sid,summary FROM records WHERE deleted=0 "
+                "AND event_key LIKE ?",
+                ("%:bootstrap:%",),
+            ).fetchall()
+            sessions = set()
+            for row in rows:
+                db.execute(
+                    "INSERT INTO versions(kind,target,snapshot,reason,created) "
+                    "VALUES ('record',?,?,?,?)",
+                    (row["id"], dump(dict(row)), "清理历史播种记录", time.time()),
+                )
+                db.execute(
+                    "UPDATE records SET deleted=1,revision=revision+1 WHERE id=?",
+                    (row["id"],),
+                )
+                self._orphan_facts(db, row["id"])
+                sessions.add(row["sid"])
+                report["removed"] += 1
+                report["freed_chars"] += len(row["summary"] or "")
+            for sid in sessions:
+                db.execute(
+                    "INSERT OR REPLACE INTO meta VALUES (?,1)", (f"bootstrap:{sid}",)
+                )
+            if report["removed"]:
+                self.bump(db)
+            report["sessions"] = len(sessions)
+        return report
+
     @staticmethod
     def row(row):
         if row is None:

@@ -441,6 +441,11 @@ main {
   color: var(--accent);
   margin-bottom: 20px;
 }
+.notice-actions {
+  display: inline-flex;
+  gap: 8px;
+  margin-left: 12px;
+}
 .pager {
   display: flex;
   justify-content: center;
