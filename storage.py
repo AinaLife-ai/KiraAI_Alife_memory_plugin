@@ -1051,6 +1051,29 @@ class Store:
                 )
             ]
 
+    def permanent_stats(self, sid):
+        """Active vs archived permanent memories, for diagnostics."""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT sum(CASE WHEN active=1 AND cold=0 THEN 1 ELSE 0 END) AS live, "
+                "sum(CASE WHEN active=0 OR cold=1 THEN 1 ELSE 0 END) AS archived "
+                "FROM records WHERE sid=? AND permanent=1 AND deleted=0",
+                (sid,),
+            ).fetchone()
+        return {"live": row["live"] or 0, "archived": row["archived"] or 0}
+
+    def sessions_by_audit_age(self, limit):
+        """Sessions whose facts are the most stale, so audits stay paced."""
+        with self.connect() as db:
+            return [
+                row[0]
+                for row in db.execute(
+                    "SELECT sid FROM facts WHERE deleted=0 GROUP BY sid "
+                    "ORDER BY min(audited) ASC, sid LIMIT ?",
+                    (max(1, limit),),
+                )
+            ]
+
     def sessions_with_permanents(self):
         with self.connect() as db:
             return [

@@ -337,16 +337,26 @@ class Engine:
         )
         if self.settings() == cfg:
             await self.store.call("audit", candidates, output)
+        return len(candidates)
 
     async def consolidate(self, sid):
         """Fold similar permanent memories with the audit model, newest wins."""
         cfg = self.settings()
+        report = {"permanent": 0, "clusters": 0, "merged": 0, "kept": 0}
         if not cfg.permanent_dedupe:
-            return
+            report["note"] = "自动合并已关闭"
+            return report
         rows = await self.store.call("permanent_records", sid)
+        report["permanent"] = len(rows)
         if len(rows) < 2:
-            return
+            stats = await self.store.call("permanent_stats", sid)
+            report["note"] = (
+                "该会话永久记忆：常驻 %s 条、已归档 %s 条（归档的需先恢复常驻才会参与合并）"
+                % (stats["live"], stats["archived"])
+            )
+            return report
         for group in permanent_clusters(rows, cfg.dedupe_threshold):
+            report["clusters"] += 1
             ids = {item["id"] for item in group}
             payload = {
                 "latest": group[0]["id"],
@@ -384,20 +394,27 @@ class Engine:
                     output["reason"],
                 )
             else:
+                report["kept"] += 1
                 logger.info(
                     "[记忆·Z] 相似永久记忆判定为保留：%s", output["reason"]
                 )
                 continue
             if self.settings() != cfg:
-                return
+                return report
             result = await self.store.call(
                 "merge_records", group[0]["id"], sources, content, reason
             )
+            report["merged"] += 1
             logger.info(
                 "[记忆·Z] 合并 %s 条相似永久记忆 → %s",
                 result["folded"],
                 result["target"][:12],
             )
+        if report["clusters"] == 0:
+            report["note"] = (
+                "未发现相似簇（阈值 %.2f）" % cfg.dedupe_threshold
+            )
+        return report
 
     async def worker(self, index):
         while not self.stopping:
@@ -415,6 +432,7 @@ class Engine:
                 continue
             started = time.monotonic()
             logger.info("[记忆·Z] 开始后台任务 %s · %s", job["kind"], job["id"][:8])
+            detail = ""
             try:
                 if job["kind"] == "compress":
                     await self.compress(job["sid"])
@@ -422,7 +440,8 @@ class Engine:
                     if cfg.proactive_enabled and job["sid"] in cfg.proactive_sessions:
                         await self.notice(job["sid"])
                 elif job["kind"] == "audit":
-                    await self.audit(job["sid"])
+                    audited = await self.audit(job["sid"])
+                    detail = "本次审计 %s 条事实" % audited
                 elif job["kind"] == "dedupe":
                     await self.consolidate(job["sid"])
                 elif job["kind"] == "classify":
@@ -454,10 +473,11 @@ class Engine:
                         offset += len(rows["items"])
                 else:
                     raise ValueError("unknown job kind")
-                await self.store.call("finish", job["id"], "completed")
+                await self.store.call("finish", job["id"], "completed", detail)
                 logger.info(
-                    "[记忆·Z] 后台任务完成 %s，耗时 %.1f 秒",
+                    "[记忆·Z] 后台任务完成 %s（%s），耗时 %.1f 秒",
                     job["kind"],
+                    detail or "无",
                     time.monotonic() - started,
                 )
             except asyncio.CancelledError:
@@ -497,10 +517,21 @@ class Engine:
                 continue
             started = time.monotonic()
             try:
-                await self.consolidate(job["sid"])
-                await self.store.call("finish", job["id"], "completed")
+                report = await self.consolidate(job["sid"])
+                detail = (
+                    "常驻 %s 条 · 相似簇 %s 个 · 合并 %s 簇 · 保留 %s 簇%s"
+                    % (
+                        report["permanent"],
+                        report["clusters"],
+                        report["merged"],
+                        report["kept"],
+                        " · " + report["note"] if report.get("note") else "",
+                    )
+                )
+                await self.store.call("finish", job["id"], "completed", detail)
                 logger.info(
-                    "[记忆·Z] 永久记忆合并完成，耗时 %.1f 秒",
+                    "[记忆·Z] 永久记忆合并完成（%s），耗时 %.1f 秒",
+                    detail,
                     time.monotonic() - started,
                 )
             except asyncio.CancelledError:
@@ -530,7 +561,11 @@ class Engine:
                             await self.enqueue("compress", sid, automatic=True)
             if cfg.audit_enabled and now - self.last_audit >= cfg.audit_interval:
                 self.last_audit = now
-                for sid in await self.store.call("sessions"):
+                # Audit only a few of the stalest sessions per interval, so a big
+                # imported backlog cannot keep the queue permanently busy.
+                for sid in await self.store.call(
+                    "sessions_by_audit_age", max(1, cfg.worker_count)
+                ):
                     await self.enqueue("audit", sid, automatic=True)
             if cfg.permanent_dedupe and now - self.last_dedupe >= cfg.audit_interval:
                 self.last_dedupe = now
