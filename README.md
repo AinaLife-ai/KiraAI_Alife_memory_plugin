@@ -248,6 +248,14 @@ KIRA_CORE=/path/to/KiraAI python -m pytest tests -q   # 真实核心接口测试
 <details>
 <summary><b>📝 更新日志（点击展开）</b></summary>
 
+### v2.5.1 (2026-09-10) — 模型输出被拒时给出可修复的提示 🛠️
+
+- **诊断信息带修复提示**：分类枚举、关系必须写在 `relations` 数组内、我们自己的语义校验原因（如「谓词没有表达具体关系」）都会写进重试反馈，**仍然不回显模型输出的内容**。
+- **压缩提示词补输出格式速查**：8 个分类 + `relations:[{subject,predicate,object}]` 示例，减少写错枚举/摊平关系字段。
+- **分类别名归一化**：`偏好 / Preference / general / 关系 / …` 自动映射到规范值（大小写不敏感）。
+- **契约被拒第二次时缩小批次**：输出的事实更少，出错机会更小。
+- 实测：用户报的那条 `facts.7.category: literal_error` / `facts.7.predicate: extra_forbidden` / `facts.10.category: literal_error` 在新版本下自动修正，只剩真正需要模型重写的语义问题。
+
 ### v2.5.0 (2026-09-10) — 记忆质量与成本 🧠
 
 详见[记忆质量与成本](docs/QUALITY_2_5_0.md)。

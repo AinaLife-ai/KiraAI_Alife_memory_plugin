@@ -60,6 +60,12 @@ def build_instruction(purpose, cfg):
             "压缩输出只含summary和facts；至多12条事实。"
             "source_ids必须逐字复制records[].id。"
             "importance 用 1-10 表示这条事实的长期价值。"
+            "facts[] 每条字段：category（只能是 "
+            "event/fact/preference/commitment/relationship/profile/resource/self）"
+            "、subject、content、reason、scenario、tags、relations、source_ids、importance。"
+            "relations 必须是数组，每项 {subject,predicate,object}；"
+            "不要把 predicate/object 平铺在事实里；谓词要表达具体关系"
+            "（如 朋友/姐姐/喜欢），不要用 认为/觉得/说。"
             + cfg.compress_instruction
         )
     if purpose == "fact_merge":
@@ -343,6 +349,10 @@ class Engine:
                             + getattr(exc, "diagnostic", "契约校验失败")
                             + "。请完整重写，不输出解释或代码围栏。"
                         )
+                        if attempt >= 1:
+                            # Repeated format failures: a smaller batch gives the
+                            # model less to get wrong.
+                            candidates = candidates[: max(2, len(candidates) // 2)]
                     else:
                         candidates = candidates[: max(2, len(candidates) // 2)]
                     logger.warning(
