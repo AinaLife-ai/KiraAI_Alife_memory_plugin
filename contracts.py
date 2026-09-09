@@ -71,6 +71,20 @@ class Fact(Strict):
     tags: list[Short] = Field(max_length=12)
     relations: list[Relation] = Field(max_length=20)
     source_ids: list[Short] = Field(min_length=1, max_length=200)
+    importance: int = Field(default=5, ge=1, le=10)
+
+
+class FactMergeGroup(Strict):
+    target_id: Short
+    source_ids: list[Short] = Field(min_length=2, max_length=50)
+    content: Text
+    reason: Short
+
+
+class FactMerge(Strict):
+    """One model call merges a batch of near-duplicate fact groups."""
+
+    groups: list[FactMergeGroup] = Field(max_length=20)
 
 
 class Compression(Strict):
@@ -106,6 +120,44 @@ class RecordMerge(Strict):
         return self
 
 
+FACT_MERGE_PROMPT = (
+    "输入是若干组待合并的事实（groups[]）：每组 subject 与 category 相同，"
+    "组内 facts 按时间从新到旧排列，facts[0] 是最新的。\n"
+    "为每一组输出一条结果，数量与顺序与输入完全一致，只做 merge（不允许 keep）。\n"
+    "以该组 facts[0] 为基准：先保留它的结论，再把其余事实里独有的人名、数字、日期、"
+    "否定、条件、状态补充进去。\n"
+    "冲突之处以时间较晚的说法为准，不保留已被推翻的旧结论。\n"
+    "涉及不同对象时必须在同一条 content 里分别写明，不得丢弃任何主体或任何独有信息。\n"
+    "content 必须自包含：不写“同上”，不引用任何 ID，不写“以上”“根据记录”之类的元话，"
+    "不重复原文措辞。\n"
+    "不得编造原文没有的信息。\n"
+    "硬性字数：每条 content ≤ {content_max} 字，reason ≤ {reason_max} 字；超出即判定失败。\n"
+    '只输出 JSON：{"groups":[{"target_id":"…","source_ids":["…"],"content":"…","reason":"…"}]}\n'
+    "target_id 取该组最新那条的 id；source_ids 为该组全部 id（至少两条），逐字复制。"
+)
+
+RECORD_MERGE_PROMPT = (
+    "records 按时间从新到旧排列，records[0] 是最新的那条。\n"
+    "只输出一个 action：merge（不允许 keep）。\n"
+    "以 records[0] 为基准：保留它的内容与结论，再把其余记录里独有的人名、群名、"
+    "数字、QQ号、日期、状态补充进去。\n"
+    "冲突之处以时间较晚的说法为准，不保留已被推翻的旧结论。\n"
+    "涉及不同主体时必须在同一条 content 里分别写明，不得丢弃任何主体或任何独有信息。\n"
+    "content 必须自包含：不写“同上”，不引用其他记录 ID，不写元话，不复述重复内容。\n"
+    "不得编造原文没有的信息。\n"
+    "硬性字数：content ≤ {content_max} 字，reason ≤ {reason_max} 字；超出即判定失败。\n"
+    '只输出 JSON：{"action":"merge","content":"…","reason":"…","source_ids":["…"]}\n'
+    "source_ids 至少两条，逐字复制 records[].id；禁止编造 ID。"
+)
+
+
+def render_prompt(template: str, content_max: int, reason_max: int) -> str:
+    """Fill the soft limits into a configurable prompt template."""
+    return template.replace("{content_max}", str(content_max)).replace(
+        "{reason_max}", str(reason_max)
+    )
+
+
 class Settings(Strict):
     enabled: bool = True
     capture_enabled: bool = True
@@ -121,8 +173,10 @@ class Settings(Strict):
     embedding_model: str = ""
     semantic_enabled: bool = False
     audit_enabled: bool = True
-    audit_interval: int = Field(default=1800, ge=30, le=604800)
+    audit_interval: int = Field(default=7200, ge=30, le=604800)
     audit_batch: int = Field(default=20, ge=1, le=50)
+    audit_recheck_days: int = Field(default=7, ge=0, le=3650)
+    audit_daily_calls: int = Field(default=24, ge=0, le=1000)
     model_timeout: int = Field(default=120, ge=5, le=600)
     model_retries: int = Field(default=2, ge=0, le=4)
     worker_count: int = Field(default=2, ge=1, le=4)
@@ -150,6 +204,42 @@ class Settings(Strict):
     dedupe_threshold: float = Field(default=0.25, ge=0.1, le=0.95)
     search_active_only: bool = True
     cold_after_days: int = Field(default=180, ge=0, le=3650)
+    fact_merge_enabled: bool = True
+    fact_merge_threshold: float = Field(default=0.25, ge=0.1, le=0.95)
+    fact_merge_soft_chars: int = Field(default=100, ge=10, le=2000)
+    fact_merge_max_chars: int = Field(default=150, ge=10, le=4000)
+    fact_merge_soft_reason_chars: int = Field(default=15, ge=2, le=200)
+    fact_merge_reason_chars: int = Field(default=40, ge=2, le=500)
+    fact_merge_batch_clusters: int = Field(default=5, ge=1, le=50)
+    fact_merge_prompt: str = Field(default=FACT_MERGE_PROMPT, max_length=8000)
+    cross_session_merge: bool = True
+    merge_pending_hide: bool = True
+    record_merge_soft_chars: int = Field(default=500, ge=50, le=16000)
+    record_merge_max_chars: int = Field(default=16000, ge=100, le=16000)
+    record_merge_soft_reason_chars: int = Field(default=15, ge=2, le=200)
+    record_merge_reason_chars: int = Field(default=60, ge=2, le=500)
+    record_merge_prompt: str = Field(default=RECORD_MERGE_PROMPT, max_length=8000)
+    profile_summary_count: int = Field(default=3, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def valid_merge_limits(self):
+        for soft, hard, name in (
+            (self.fact_merge_soft_chars, self.fact_merge_max_chars, "fact content"),
+            (
+                self.fact_merge_soft_reason_chars,
+                self.fact_merge_reason_chars,
+                "fact reason",
+            ),
+            (self.record_merge_soft_chars, self.record_merge_max_chars, "record content"),
+            (
+                self.record_merge_soft_reason_chars,
+                self.record_merge_reason_chars,
+                "record reason",
+            ),
+        ):
+            if soft > hard:
+                raise ValueError("%s soft limit exceeds hard limit" % name)
+        return self
 
     @model_validator(mode="after")
     def valid_batch(self):
@@ -227,12 +317,20 @@ class Edit(Strict):
         return self
 
 
+class Restore(Strict):
+    kind: Literal["fact", "record"]
+    target: Short
+    version_id: int = Field(ge=1)
+    revision: int = Field(ge=1)
+
+
 class NewMemory(Strict):
     sid: Short
     content: Text
     users: list[Short] = Field(default_factory=list, max_length=100)
     start: float | None = None
     end: float | None = None
+    importance: int | None = Field(default=None, ge=1, le=10)
 
 
 class Job(Strict):
