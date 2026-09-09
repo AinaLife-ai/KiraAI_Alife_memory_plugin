@@ -905,21 +905,14 @@ let bootConfig = { enabled: true, replay_seconds: 90 };
 try {
   Object.assign(bootConfig, JSON.parse(localStorage.getItem("alife-boot") || "{}"));
 } catch {}
-let bootPlaying = false,
+let bootPlaying = true,
   bootTimer = null,
   bootHiddenAt = 0;
-const BOOT_HTML =
-  '<div class="boot-stage">' +
-  '<div class="boot-ring"></div><div class="boot-orb"></div>' +
-  '<div class="boot-orb"></div><div class="boot-orb"></div>' +
-  '<div class="boot-frame"><img src="brand.png" alt="" /></div></div>' +
-  '<div class="boot-tagline">ALIFE MEMORY / Z EDITION</div>' +
-  '<div class="boot-quote" id="bootQuote"></div>' +
-  '<div class="boot-underline"></div>' +
-  '<div class="boot-hint">点击任意处跳过</div>';
 function bootQuote() {
+  const quote = $("#bootQuote");
+  if (!quote) return;
   const text = BOOT_QUOTES[Math.floor(Math.random() * BOOT_QUOTES.length)];
-  $("#bootQuote").replaceChildren(
+  quote.replaceChildren(
     ...[...text].map((ch, index) => {
       const span = document.createElement("span");
       span.textContent = ch;
@@ -927,17 +920,6 @@ function bootQuote() {
       return span;
     }),
   );
-}
-function playBoot() {
-  const boot = $("#boot");
-  if (!boot || bootPlaying || !bootConfig.enabled) return;
-  bootPlaying = true;
-  boot.innerHTML = BOOT_HTML;
-  boot.hidden = false;
-  boot.classList.remove("skip");
-  bootQuote();
-  clearTimeout(bootTimer);
-  bootTimer = setTimeout(endBoot, 3900);
 }
 function endBoot() {
   const boot = $("#boot");
@@ -950,7 +932,35 @@ function endBoot() {
     bootPlaying = false;
   }, 320);
 }
-$("#boot").onclick = endBoot;
+function startBootTimer() {
+  clearTimeout(bootTimer);
+  bootTimer = setTimeout(endBoot, 3900);
+}
+function playBoot(replay) {
+  const boot = $("#boot");
+  if (!boot) return;
+  if (!bootConfig.enabled) {
+    boot.hidden = true;
+    return;
+  }
+  if (replay) {
+    if (bootPlaying) return;
+    // Replacing the node restarts every CSS animation, including pseudo-elements.
+    const fresh = boot.cloneNode(true);
+    boot.replaceWith(fresh);
+  }
+  const current = $("#boot");
+  current.hidden = false;
+  current.classList.remove("skip");
+  bootPlaying = true;
+  bootQuote();
+  startBootTimer();
+}
+// The static markup is already animating; just fill the quote and arm the timer.
+playBoot(false);
+document.addEventListener("click", (event) => {
+  if (bootPlaying && event.target.closest("#boot")) endBoot();
+});
 document.addEventListener("keydown", (event) => {
   if (bootPlaying && ["Escape", "Enter", " "].includes(event.key)) endBoot();
 });
@@ -959,7 +969,7 @@ function bootReplay() {
   const gap = (Date.now() - bootHiddenAt) / 1000;
   bootHiddenAt = 0;
   const cooldown = Number(bootConfig.replay_seconds);
-  if (cooldown > 0 && gap >= cooldown) playBoot();
+  if (cooldown > 0 && gap >= cooldown) playBoot(true);
 }
 new IntersectionObserver(
   (entries) => {
@@ -974,7 +984,6 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") bootReplay();
   else if (!bootHiddenAt) bootHiddenAt = Date.now();
 });
-playBoot();
 $("#new").onclick = newMemory;
 $("#closeEditor").onclick = () => {
   $("#editor").close();

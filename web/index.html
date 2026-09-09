@@ -5,11 +5,33 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <meta http-equiv="Cache-Control" content="no-cache" />
     <title>Alife 记忆 · Z</title>
+    <link rel="preload" as="image" href="brand.png" />
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <div class="ambient" aria-hidden="true"></div>
-    <div id="boot" class="boot" hidden></div>
+    <div id="boot" class="boot">
+      <div class="boot-stage">
+        <div class="boot-ring"></div>
+        <div class="boot-orb"></div>
+        <div class="boot-orb"></div>
+        <div class="boot-orb"></div>
+        <div class="boot-frame"><img src="brand.png" alt="" /></div>
+      </div>
+      <div class="boot-tagline">ALIFE MEMORY / Z EDITION</div>
+      <div class="boot-quote" id="bootQuote"></div>
+      <div class="boot-underline"></div>
+      <div class="boot-hint">点击任意处跳过</div>
+    </div>
+    <script>
+      // Hide before first paint when the user turned the animation off.
+      try {
+        if (
+          JSON.parse(localStorage.getItem("alife-boot") || "{}").enabled === false
+        )
+          document.getElementById("boot").hidden = true;
+      } catch (e) {}
+    </script>
     <div class="shell">
       <aside>
         <div class="brand">
