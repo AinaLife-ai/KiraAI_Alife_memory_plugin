@@ -248,7 +248,11 @@ class AlifeMemoryPlugin(BasePlugin):
         return changed
 
     async def initialize(self):
-        await self.apply_config_migrations()
+        try:
+            await self.apply_config_migrations()
+        except Exception:
+            # A failed config migration must never stop the plugin from loading.
+            logger.exception("[记忆·Z] 配置迁移失败，本次启动继续使用现有配置")
         data_dir = self.ctx.get_plugin_data_dir()
         if data_dir is None:
             raise RuntimeError("KiraAI did not associate plugin data directory")

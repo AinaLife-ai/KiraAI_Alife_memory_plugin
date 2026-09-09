@@ -966,3 +966,34 @@ async def test_migration_background_and_skips_unchanged_sources(tmp_path):
         assert plugin.migration_note.startswith("迁移完成")
     finally:
         await plugin.terminate()
+
+@pytest.mark.asyncio
+async def test_config_migration_rewrites_only_untouched_defaults(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setattr(module, "get_config_path", lambda: tmp_path)
+    (tmp_path / "plugins").mkdir()
+    path = tmp_path / "plugins" / "alife_memory_z.json"
+    path.write_text(
+        json.dumps(
+            {
+                "alife": {"audit_interval": 1800, "top_k": 9},
+                "alife_meta": {"config_version": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(ctx, {"alife": {}})
+    changed = await plugin.apply_config_migrations()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert changed == ["audit_interval"]
+    assert saved["alife"]["audit_interval"] == 7200
+    assert saved["alife"]["top_k"] == 9
+    assert saved["alife_meta"]["config_version"] >= 2
+    assert plugin.settings.audit_interval == 7200
+    # Second run is a no-op even though audit_interval differs from the old default.
+    assert await plugin.apply_config_migrations() == []
