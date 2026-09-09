@@ -1,5 +1,6 @@
 """Run with KIRA_CORE pointing at a real checkout; no fake core modules."""
 
+import asyncio
 import importlib
 import os
 import sys
@@ -556,6 +557,7 @@ async def test_safe_migration_disables_after_commit_and_yields_to_user_switch(tm
 
     manager.set_plugin_enabled = toggle
     await plugin.initialize()
+    await plugin.wait_migration()
     try:
         assert not any(manager.states.values())
         assert plugin.runtime_settings().enabled
@@ -597,6 +599,7 @@ async def test_malformed_migration_keeps_original_enabled_then_retry(tmp_path):
         {"alife": {"probability": 0.0, "audit_enabled": False}},
     )
     await plugin.initialize()
+    await plugin.wait_migration()
     try:
         assert all(manager.states.values()) and manager.calls == []
         assert plugin.migration_blocked and not plugin.runtime_settings().enabled
@@ -635,6 +638,7 @@ async def test_failed_final_snapshot_restores_disabled_plugins(tmp_path):
         {"alife": {"probability": 0.0, "audit_enabled": False}},
     )
     await plugin.initialize()
+    await plugin.wait_migration()
     try:
         assert plugin.migration_blocked and all(manager.states.values())
         assert plugin.store.search(scope="global", keyword="original")["total"] == 1
@@ -903,5 +907,42 @@ async def test_bootstrap_review_hint_only_for_legacy_records(tmp_path):
         # 没有合并插件时不提示
         manager.states["kira_session_merger"] = False
         assert (await plugin.refresh_bootstrap_review())["merge_plugin"] == ""
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_migration_background_and_skips_unchanged_sources(tmp_path):
+    root = tmp_path / "host-data/memory"
+    root.mkdir(parents=True)
+    core = root / "core.txt"
+    core.write_text("We agreed to walk on Sunday\n", encoding="utf-8")
+    manager = LegacyManager()
+    plugin = module.AlifeMemoryPlugin(
+        types.SimpleNamespace(
+            get_plugin_data_dir=lambda: tmp_path / "plugin", plugin_mgr=manager
+        ),
+        {"alife": {"probability": 0.0, "audit_enabled": False}},
+    )
+    await plugin.initialize()
+    try:
+        # A：初始化不再等迁移，迁移在后台跑
+        assert isinstance(plugin.migration_task, asyncio.Task)
+        await plugin.wait_migration()
+        assert not plugin.migration_blocked
+        assert plugin.store.legacy_migrated_at() > 0
+        assert plugin.store.search(scope="global", keyword="Sunday")["total"] == 1
+        # C：源文件没变化 → 再调用直接跳过，不重扫
+        records = plugin.store.status()["records"]
+        plugin.migration_note = ""
+        await plugin.migrate()
+        assert plugin.migration_note == "旧记忆已迁移，源文件未变化。"
+        assert plugin.store.status()["records"] == records
+        # 源文件变化 → 重新迁移
+        core.write_text("We agreed to walk on Sunday\nA new line\n", encoding="utf-8")
+        stamp = os.path.getmtime(core) + 10
+        os.utime(core, (stamp, stamp))
+        await plugin.migrate()
+        assert plugin.migration_note.startswith("迁移完成")
     finally:
         await plugin.terminate()
