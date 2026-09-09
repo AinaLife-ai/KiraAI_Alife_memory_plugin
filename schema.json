@@ -23,6 +23,12 @@
         "description": "首次遇到旧会话时，是否把 KiraAI 已有的对话历史抄进记忆库。auto：检测到会话合并/压缩插件时跳过，避免把别的会话记成本会话；always：始终播种；off：从不播种，只记装插件之后的内容。",
         "options": ["auto", "always", "off"]
       },
+      "inject_recent_raw": {
+        "type": "switch",
+        "name": "注入最近原文",
+        "default": false,
+        "description": "把还没压缩成存档的最近对话原文也塞进每轮记忆块。默认关闭：这些原文 KiraAI 自己的上下文里就有，重复注入只会让上下文膨胀；需要时模型可用 SearchMemoryArchive 主动检索。"
+      },
       "auto_inject": {
         "type": "switch",
         "name": "持续上下文注入",
