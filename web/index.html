@@ -48,6 +48,7 @@
           ><button data-tab="profiles"><span>♧</span><em>画像与关系</em></button
           ><button data-tab="names"><span>◎</span><em>人物与群名</em></button
           ><button data-tab="tasks"><span>◷</span><em>后台任务</em></button
+          ><button data-tab="trash"><span>♺</span><em>回收站</em></button
           ><button data-tab="settings"><span>⚙</span><em>偏好设置</em></button>
         </nav>
         <div class="aside-foot">
@@ -284,6 +285,28 @@
             </div>
           </div>
           <div class="panel" id="jobs"></div>
+        </section>
+        <section id="trash" class="view hide">
+          <div class="notice">
+            这里放已经不在上下文里的记忆：被审计撤回或合并掉的事实、被删除的存档，以及冷归档。还原后它们会重新参与检索；冷归档只按 ID 可读。
+          </div>
+          <div class="filters">
+            <div class="actions">
+              <button id="trashFacts" aria-pressed="true">事实</button
+              ><button id="trashRecords" aria-pressed="false">存档</button
+              ><button id="trashCold" aria-pressed="false">冷归档</button>
+            </div>
+            <input
+              id="trashKeyword"
+              aria-label="搜索回收站"
+              placeholder="按内容搜索…"
+            /><button id="trashSearch" class="primary">查找</button>
+          </div>
+          <div id="trashCards" class="cards"></div>
+          <div class="pager">
+            <button id="trashPrev">上一页</button><span id="trashPage"></span
+            ><button id="trashNext">下一页</button>
+          </div>
         </section>
         <section id="settings" class="view hide">
           <div class="notice">

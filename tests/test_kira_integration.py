@@ -1579,3 +1579,63 @@ async def test_job_detail_lists_processed_items(tmp_path):
         assert isinstance(detail["names"], dict)
     finally:
         await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_trash_lists_cold_and_restores(tmp_path):
+    """回收站：已删除的事实/存档、冷归档都能列出来，并能还原。"""
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        store = plugin.store
+        store.capture(
+            "test:dm:u",
+            "t",
+            [{"role": "user", "content": "周六约了咖啡馆", "users": ["test:u"], "time": 1.0}],
+        )
+        record = store.active("test:dm:u")[0]
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            fact_id = store._add_fact(
+                db,
+                "test:dm:u",
+                {
+                    "category": "commitment",
+                    "subject": "test:u",
+                    "content": "周六下午三点在咖啡馆见面",
+                    "reason": "用户说的",
+                    "scenario": "",
+                    "tags": [],
+                    "relations": [],
+                    "source_ids": [record["id"]],
+                },
+            )
+        store.observe_name("test:u", "萤火", source="admin")
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE facts SET deleted=1 WHERE id=?", (fact_id,))
+            db.execute("UPDATE records SET active=0,cold=1,archived_at=99 WHERE id=?", (record["id"],))
+
+        page = await plugin.api_trash(kind="facts")
+        assert page["total"] == 1
+        assert page["items"][0]["content"] == "周六下午三点在咖啡馆见面"
+        assert page["names"]["test:u"] == "萤火"
+        assert (await plugin.api_trash(kind="facts", keyword="咖啡馆"))["total"] == 1
+        assert (await plugin.api_trash(kind="facts", keyword="不存在的词"))["total"] == 0
+        cold = await plugin.api_trash(kind="cold")
+        assert [row["id"] for row in cold["items"]] == [record["id"]]
+
+        restored = await plugin.api_trash_restore(
+            json_request({"kind": "fact", "target": fact_id})
+        )
+        assert restored == {"ok": True, "restored": True}
+        assert (await plugin.api_trash(kind="facts"))["total"] == 0
+        assert [f["id"] for f in store.facts("test:dm:u")] == [fact_id]
+    finally:
+        await plugin.terminate()

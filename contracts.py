@@ -147,6 +147,11 @@ class Compression(Strict):
     facts: list[Fact] = Field(max_length=100)
 
 
+class TrashRestore(Strict):
+    kind: Literal["fact", "record"]
+    target: Short
+
+
 class AuditAction(Strict):
     # retract 用于清理被证据推翻或纯属冗余的事实：软删、留版本、可恢复。
     action: Literal["keep", "correct", "merge", "retract"]

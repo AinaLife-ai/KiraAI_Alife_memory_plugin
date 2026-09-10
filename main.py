@@ -22,6 +22,7 @@ from core.logging_manager import get_logger
 
 from .contracts import (
     ConfigEdit,
+    TrashRestore,
     Edit,
     Fact,
     Job,
@@ -1709,7 +1710,7 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @register.api(method="GET", path="/memory/{record_id}", auth=True)
     async def api_memory(self, record_id: str):
-        result = await self.store.call("get", record_id)
+        result = await self.store.call("get", record_id, include_deleted=True)
         if result is None:
             raise HTTPException(404, "archive not found")
         return result
@@ -1814,6 +1815,42 @@ class AlifeMemoryPlugin(BasePlugin):
         )
         await self.engine.enqueue("classify", record_id)
         return {"id": record_id}
+
+    @register.api(method="GET", path="/trash", auth=True)
+    async def api_trash(
+        self,
+        kind: str = "facts",
+        category: str = "",
+        keyword: str = "",
+        offset: int = 0,
+    ):
+        if offset < 0 or len(keyword) > 500:
+            raise HTTPException(422, "invalid trash query")
+        result = await self.store.call(
+            "trash", kind, category, keyword, offset, 50
+        )
+        ids = {
+            row.get("sid", "") for row in result["items"]
+        } | {
+            user for row in result["items"] for user in row.get("users", [])
+        } | {
+            row.get("subject", "") for row in result["items"]
+        }
+        names = {
+            n["id"]: n["name"]
+            for n in await self.store.call("entities", ids=ids, limit=1000)
+            if n["name"]
+        }
+        return {**result, "names": names}
+
+    @register.api(method="POST", path="/trash/restore", auth=True)
+    async def api_trash_restore(self, request: Request):
+        value = await self.body(request, TrashRestore)
+        try:
+            restored = await self.store.call("undelete", value.kind, value.target)
+        except ValueError:
+            raise HTTPException(404, "target not found") from None
+        return {"ok": True, "restored": restored}
 
     @register.api(method="POST", path="/restore", auth=True)
     async def api_restore(self, request: Request):

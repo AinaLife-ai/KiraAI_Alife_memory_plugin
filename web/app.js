@@ -534,6 +534,7 @@ async function selectTab(name) {
     archives: ["每段经历，都有来处", "检索、编辑，或沿着存档逐层回到最初。"],
     profiles: ["记住你，也认识自己", "关系、偏好、约定，汇成有依据的画像。"],
     tasks: ["让记忆，慢慢沉淀", "在后台压缩、审计与合并，不打断当下的对话。"],
+    trash: ["离开上下文的，也还在这里", "回收站与冷归档：还原、查看或编辑。"],
     names: ["名字会改变，彼此仍相识", "以稳定ID连接现在与曾经的称呼。"],
     settings: ["按你的节奏，整理记忆", "每一项配置，保存即生效。"],
   };
@@ -545,6 +546,7 @@ async function selectTab(name) {
   }
   if (name === "archives") await loadArchives();
   if (name === "profiles") await loadFacts();
+  if (name === "trash") await loadTrash();
   if (name === "settings" && !configDirty) await loadConfig();
   saveDraft();
 }
@@ -606,6 +608,134 @@ async function loadArchives() {
   $("#prev").disabled = offset === 0;
   $("#next").disabled = offset + 20 >= total;
 }
+let trashKind = "facts";
+let trashOffset = 0;
+const TRASH_KINDS = {
+  facts: { button: "#trashFacts", cards: "#trashCards" },
+  records: { button: "#trashRecords", cards: "#trashCards" },
+  cold: { button: "#trashCold", cards: "#trashCards" },
+};
+function setTrashKind(kind) {
+  trashKind = kind;
+  trashOffset = 0;
+  Object.entries(TRASH_KINDS).forEach(([key, value]) =>
+    $(value.button).setAttribute("aria-pressed", String(key === kind)),
+  );
+  $("#trashKeyword").placeholder =
+    kind === "facts" ? "按事实内容搜索…" : "按存档摘要搜索…";
+}
+async function loadTrash() {
+  const q = new URLSearchParams({
+    kind: trashKind,
+    keyword: $("#trashKeyword").value,
+    offset: trashOffset,
+  });
+  const data = await api("/trash?" + q);
+  Object.assign(displayNames, data.names || {});
+  $("#trashCards").innerHTML = data.items.length
+    ? data.items
+        .map((row, i) => {
+          const facts = trashKind === "facts";
+          const cold = trashKind === "cold";
+          const tag = facts
+            ? labels[row.category] || row.category
+            : cold
+              ? "冷归档"
+              : row.permanent
+                ? "永久记忆"
+                : "L" + row.level;
+          const head = facts
+            ? esc(displayLabel(row.subject))
+            : esc(displayLabel(row.sid));
+          const body = facts ? row.content : row.summary;
+          const meta = [
+            facts ? "重要度 " + row.importance : null,
+            facts ? esc(row.reason ? "依据：" + row.reason : "") : null,
+            date(row.start || row.created),
+            row.removed_at ? "离开上下文 " + date(row.removed_at) : null,
+            cold ? "仅按 ID 可读" : null,
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          return (
+            '<article class="card"><div class="row"><span class="tag">' +
+            esc(tag) +
+            '</span><strong>' +
+            head +
+            "</strong></div><p>" +
+            esc(body) +
+            '</p><p class="muted">' +
+            meta +
+            "</p><footer>" +
+            (cold
+              ? '<small>冷归档不会被检索</small>'
+              : '<button class="primary" data-trashrestore="' +
+                i +
+                '">还原</button>') +
+            '<button data-trashtarget="' +
+            i +
+            '">查看与编辑</button></footer></article>'
+          );
+        })
+        .join("")
+    : empty("回收站是空的");
+  $$("[data-trashrestore]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        guard(async () => {
+          const row = data.items[Number(b.dataset.trashrestore)];
+          await api("/trash/restore", {
+            kind: trashKind === "facts" ? "fact" : "record",
+            target: row.id,
+          });
+          toast("已从回收站还原");
+          await loadTrash();
+        })),
+  );
+  $$("[data-trashtarget]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        guard(() => {
+          const row = data.items[Number(b.dataset.trashtarget)];
+          return trashKind === "facts"
+            ? openFact({ id: row.id })
+            : openRecord(row.id);
+        })),
+  );
+  $("#trashPage").textContent =
+    (data.total ? trashOffset + 1 : 0) +
+    "–" +
+    Math.min(trashOffset + 50, data.total) +
+    " / " +
+    data.total;
+  $("#trashPrev").disabled = trashOffset === 0;
+  $("#trashNext").disabled = trashOffset + 50 >= data.total;
+}
+for (const [key, value] of Object.entries(TRASH_KINDS))
+  $(value.button).onclick = () =>
+    guard(() => {
+      setTrashKind(key);
+      return loadTrash();
+    });
+$("#trashSearch").onclick = () =>
+  guard(() => {
+    trashOffset = 0;
+    return loadTrash();
+  });
+$("#trashKeyword").onkeydown = (e) => {
+  if (e.key === "Enter") $("#trashSearch").click();
+};
+$("#trashPrev").onclick = () =>
+  guard(() => {
+    trashOffset = Math.max(0, trashOffset - 50);
+    return loadTrash();
+  });
+$("#trashNext").onclick = () =>
+  guard(() => {
+    trashOffset += 50;
+    return loadTrash();
+  });
+
 async function loadFacts() {
   const byContent = $("#factContent").checked;
   const q = new URLSearchParams({

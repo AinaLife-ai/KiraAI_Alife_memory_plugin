@@ -211,3 +211,90 @@ class MergeDirectionTests(unittest.TestCase):
         assert st.facts_by_ids([b]) == []
         kept = st.facts_by_ids([b], include_deleted=True)[0]
         assert kept["content"] == "萤火喜欢猫粮"
+
+
+class TrashTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = s.Store(Path(self.temp.name) / "m.db")
+        self.store.initialize()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def add(self, content, sid="qq:gm:1", subject="qq:9"):
+        self.store.capture(
+            sid,
+            content,
+            [{"role": "user", "content": content, "users": [subject], "time": 1.0}],
+        )
+        record = self.store.active(sid)[-1]
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return self.store._add_fact(
+                db,
+                sid,
+                {
+                    "category": "fact",
+                    "subject": subject,
+                    "content": content,
+                    "reason": "用户说的",
+                    "scenario": "",
+                    "tags": [],
+                    "relations": [],
+                    "source_ids": [record["id"]],
+                },
+            )
+
+    def test_trash_lists_and_restores_deleted_fact(self):
+        fact_id = self.add("萤火喜欢猫")
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE facts SET deleted=1 WHERE id=?", (fact_id,))
+        page = self.store.trash("facts")
+        assert page["total"] == 1 and page["items"][0]["id"] == fact_id
+        assert page["items"][0]["removed_at"] == 0  # 没有版本记录时退回 0
+        assert self.store.trash("facts", keyword="猫")["total"] == 1
+        assert self.store.trash("facts", keyword="狗")["total"] == 0
+        assert self.store.undelete("fact", fact_id) is True
+        assert self.store.trash("facts")["total"] == 0
+        assert [f["id"] for f in self.store.facts("qq:gm:1")] == [fact_id]
+        # 还原动作本身也留一条版本，可追溯
+        reasons = [v["reason"] for v in self.store.versions_of("fact", fact_id)]
+        assert "从回收站还原" in reasons
+
+    def test_trash_separates_deleted_records_and_cold_archives(self):
+        self.store.capture(
+            "qq:gm:1",
+            "t",
+            [{"role": "user", "content": "周五去看展", "users": ["qq:9"], "time": 2.0}],
+        )
+        record = self.store.active("qq:gm:1")[-1]
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE records SET deleted=1 WHERE id=?", (record["id"],))
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE records SET archived_at=? WHERE id=?", (123.0, record["id"])
+            )
+        assert [r["id"] for r in self.store.trash("records")["items"]] == [record["id"]]
+        assert self.store.trash("cold")["items"] == []
+        # 冷归档：未删除但已移出上下文
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE records SET deleted=0,active=0,cold=1 WHERE id=?",
+                (record["id"],),
+            )
+        cold = self.store.trash("cold")
+        assert [r["id"] for r in cold["items"]] == [record["id"]]
+        assert self.store.trash("records")["items"] == []
+        # 按 ID 单取放行软删（编辑器要能打开回收站里的条目）
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE records SET deleted=1 WHERE id=?", (record["id"],))
+        assert self.store.get(record["id"]) is None
+        assert self.store.get(record["id"], include_deleted=True)["summary"] == "周五去看展"

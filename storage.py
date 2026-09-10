@@ -1075,11 +1075,12 @@ class Store:
                 )
             ]
 
-    def get(self, record_id):
+    def get(self, record_id, include_deleted=False):
+        clause = "" if include_deleted else " AND deleted=0"
         with self.connect() as db:
             result = self.row(
                 db.execute(
-                    "SELECT * FROM records WHERE id=? AND deleted=0", (record_id,)
+                    "SELECT * FROM records WHERE id=?" + clause, (record_id,)
                 ).fetchone()
             )
             if result:
@@ -1879,6 +1880,85 @@ class Store:
                     args,
                 )
             ]
+
+    def trash(self, kind="facts", category="", keyword="", offset=0, limit=50):
+        """回收站：已删除的事实/存档，以及未删但已移出上下文的冷归档。"""
+        kind = kind if kind in ("facts", "records", "cold") else "facts"
+        word = (keyword or "").strip()
+        with self.connect() as db:
+            if kind == "facts":
+                where, args = ["f.deleted=1"], []
+                if category:
+                    where.append("f.category=?")
+                    args.append(category)
+                if word:
+                    where.append("instr(lower(f.content),lower(?))>0")
+                    args.append(word)
+                clause = " AND ".join(where)
+                total = db.execute(
+                    "SELECT count(*) FROM facts f WHERE " + clause, args
+                ).fetchone()[0]
+                rows = [
+                    self.row(r)
+                    for r in db.execute(
+                        "SELECT f.*, coalesce((SELECT max(v.created) FROM versions v"
+                        " WHERE v.kind='fact' AND v.target=f.id),0) AS removed_at"
+                        " FROM facts f WHERE " + clause + " ORDER BY removed_at DESC, f.id"
+                        " LIMIT ? OFFSET ?",
+                        [*args, max(1, min(200, limit)), max(0, offset)],
+                    )
+                ]
+            else:
+                clause = "deleted=1" if kind == "records" else "deleted=0 AND cold=1"
+                args = []
+                if word:
+                    clause += " AND instr(lower(summary),lower(?))>0"
+                    args.append(word)
+                total = db.execute(
+                    "SELECT count(*) FROM records WHERE " + clause, args
+                ).fetchone()[0]
+                rows = [
+                    self.row(r)
+                    for r in db.execute(
+                        "SELECT id,sid,level,summary,start,end,users,permanent,cold,"
+                        "archived_at,deleted, coalesce((SELECT max(v.created) FROM"
+                        " versions v WHERE v.kind='record' AND v.target=records.id),0)"
+                        " AS removed_at FROM records WHERE " + clause
+                        + " ORDER BY coalesce(nullif(archived_at,0), removed_at) DESC, id"
+                        " LIMIT ? OFFSET ?",
+                        [*args, max(1, min(200, limit)), max(0, offset)],
+                    )
+                ]
+        return {"kind": kind, "items": rows, "total": total}
+
+    def undelete(self, kind, target):
+        """从回收站还原：软删的条目重新可见，动作本身也写一条版本。"""
+        table = "facts" if kind == "fact" else "records"
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM " + table + " WHERE id=?", (target,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("target not found")
+            if not row["deleted"]:
+                return False
+            db.execute(
+                "INSERT INTO versions(kind,target,snapshot,reason,created)"
+                " VALUES (?,?,?,?,?)",
+                (
+                    "fact" if kind == "fact" else "record",
+                    target,
+                    dump(dict(row)),
+                    "从回收站还原",
+                    time.time(),
+                ),
+            )
+            db.execute(
+                "UPDATE " + table + " SET deleted=0,revision=revision+1 WHERE id=?",
+                (target,),
+            )
+            self.bump(db)
+        return True
 
     def records_by_ids(self, ids):
         """批量取记录概要，供后台任务明细使用。"""
