@@ -79,7 +79,7 @@ async def test_followup_recall_returns_new_records_and_tools_continue(tmp_path):
         first = json.loads(
             next(p.content for p in req.user_prompt if p.name == "alife_memory")
         )
-        first_ids = {r["a"] for r in first["related_archives"]}
+        first_ids = {r["a"] for r in first.get("related_archives", [])}
         assert first_ids
         req2 = LLMRequest()
         await plugin.on_request(event, req2)
@@ -259,14 +259,12 @@ async def test_global_recall_has_provenance_names_and_no_vector_calls(tmp_path):
         )
         assert memory["scope"] == "global"
         # 紧凑形态：条目只带短码，跨会话的来源仍在 names 表里可查
-        assert all(r.get("from") for r in memory["related_archives"])
-        assert any(
-            n["id"] == "test:gm:elsewhere" for n in memory["names"]
-        ), "跨会话来源要能查到"
-        assert all(
-            n["id"] != "test:gm:noise" for n in memory["names"]
-        ), "被排除的会话不该出现"
-        assert any(n["name"] == "阿澄" for n in memory["names"])
+        related = memory.get("related_archives", [])
+        assert related and all(r.get("from") for r in related)
+        # 跨会话来源：related 条目带 from（有名字就是群名，没名字是短码）
+        assert all(r.get("from") for r in memory.get("related_archives", []))
+        assert "test:gm:noise" not in memory["names"], "被排除的会话不该出现"
+        assert any("阿澄" in value for value in memory["names"].values())
         assert "阿澄" not in "".join(p.content for p in request.system_prompt)
         names = json.loads(await plugin.memory_names(event, "阿澄"))["entities"]
         result = json.loads(
@@ -584,7 +582,7 @@ async def test_safe_migration_disables_after_commit_and_yields_to_user_switch(tm
             == 1
         )
         assert any(
-            "Sunday" in f["content"]
+            "Sunday" in f["x"]
             for f in json.loads(await plugin.overview(event))["facts"]
         )
         assert (root / "core.txt").read_bytes() == original
@@ -1288,16 +1286,17 @@ async def test_situational_injection_pins_commitments_and_triggers_on_mention(tm
                   "另一个人喜欢甜食", 6, record["id"])
 
         plain = await _injected_block(plugin, event)
-        contents = [f["content"] for f in plain["facts"]]
+        contents = [f["x"] for f in plain["facts"]]
         assert "周六下午三点在咖啡馆见面" in contents       # 约定常驻
         assert "萤火上周去看了猫" not in contents           # 没提到就不带
         assert "另一个人喜欢甜食" not in contents
-        assert set(plain["facts"][0]) == {
-            "category", "subject", "content", "importance", "src", "t"
-        }  # 空的 relations 不再输出（每轮注入的纯开销）
+        keys = set(plain["facts"][0])
+        assert {"c", "u", "x"} <= keys and keys <= {
+            "c", "u", "x", "src", "t", "imp", "rel"
+        }, "注入块只放短键，空字段与默认值一律省略"
 
         mentioned = await _injected_block(plugin, make_text_event("萤火最近怎么样"))
-        contents = [f["content"] for f in mentioned["facts"]]
+        contents = [f["x"] for f in mentioned["facts"]]
         assert "萤火上周去看了猫" in contents               # 提到人 → 带回关于他的事
         assert "另一个人喜欢甜食" not in contents
     finally:
@@ -1317,7 +1316,7 @@ async def test_full_mode_keeps_legacy_injection(tmp_path):
         _add_fact(plugin, event.sid, "test:other", "event",
                   "另一个人喜欢甜食", 6, record["id"])
         block = await _injected_block(plugin, event)
-        assert "另一个人喜欢甜食" in [f["content"] for f in block["facts"]]
+        assert "另一个人喜欢甜食" in [f["x"] for f in block["facts"]]
     finally:
         await plugin.terminate()
 

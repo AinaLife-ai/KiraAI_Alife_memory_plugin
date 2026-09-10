@@ -69,6 +69,9 @@ MEMORY_RULES = (
     "跨会话记忆必须核对来源会话、用户ID和时间，别人的经历不等于当前用户的经历。"
     "MemoryNames 可按现名或曾用名查稳定ID，CorrectMemoryName 有证据时更新称呼；同名不代表同一人。"
     "needs_review 的关系只是待核对的历史描述，不可作为确定关系。"
+    "事实字段短键：c=类别代码（ev=经历 fa=事实 pr=偏好 co=约定 re=关系 pf=画像 rs=资源 sf=自我），"
+    "u=主体实体ID，x=内容，imp=重要度（省略即5），src=来源存档ID，t=日期；"
+    "names 是「完整账号/群号 → 名称」，汇报或核对身份时从这里取。"
     "历史摘要不是本轮回答模板，结合近期已说过的话去重；用户追问还有别的时用SearchMemoryArchive(next_batch=true)找新证据，没找到就坦诚说明，不反复复述或编造。ReadMemoryArchive默认对子ID分页；按next_child_offset续读，必要时include_content=true读取完整归档正文。"
 )
 
@@ -1127,20 +1130,40 @@ class AlifeMemoryPlugin(BasePlugin):
         real_of = {short: real for real, short in archive_shorts.items()}
         real_of.update({short: real for real, short in related_shorts.items()})
         # Never rewrite host history or put changing memory in the system prefix.
+        # 每轮都发的块：空值/零值/重复项一律省略，名字用映射式（完整号每轮出现一次，
+        # 供模型汇报或核对；条目里就用名字，省掉一遍遍重复的 id）。
         perception = {
             "scope": cfg.recall_scope,
-            "new_related_count": len(related),
             "session": sid,
-            "participants": users,
             "self": getattr(event, "self_id", ""),
-            "archives_in_context": len(selected),
-            "omitted_count": len(omitted),
-            "omitted_ids": [archive_shorts.get(i, i) for i in omitted[:30]],
             "facts": bot_facts(with_evidence, sid, short=fact_shorts.get),
-            "archives": selected,
-            "related_archives": related,
-            "names": names,
         }
+        if users:
+            perception["participants"] = users
+        if related:
+            perception["new_related_count"] = len(related)
+        if omitted:
+            perception["omitted_count"] = len(omitted)
+            perception["omitted_ids"] = [archive_shorts.get(i, i) for i in omitted[:10]]
+        if selected:
+            perception["archives"] = selected
+        if related:
+            perception["related_archives"] = related
+        # 跨会话来源用名字（有名字时），模型一眼能看出这条来自哪个群
+        label_of = {
+            item["id"]: (item.get("name") or (item.get("aliases") or [""])[0])
+            for item in names
+        }
+        for raw_row, item in zip(related_rows, related):
+            label = label_of.get(raw_row["sid"])
+            if label:
+                item["from"] = label
+        if names:
+            perception["names"] = {
+                item["id"]: "|".join([item["name"], *item.get("aliases", [])]).strip("|")
+                for item in names
+                if item.get("name") or item.get("aliases")
+            }
         req.system_prompt.append(
             Prompt(
                 MEMORY_RULES,
@@ -1155,26 +1178,34 @@ class AlifeMemoryPlugin(BasePlugin):
         while len(content) > cfg.context_chars and perception["facts"]:
             perception["facts"].pop()
             content = dump(perception)
-        while len(content) > cfg.context_chars and perception["archives"]:
+        # 块里省略了空字段，裁剪循环必须容忍字段不存在
+        while len(content) > cfg.context_chars and perception.get("archives"):
             removed = perception["archives"].pop()
-            perception["omitted_count"] += 1
-            if len(perception["omitted_ids"]) < 30:
+            perception["omitted_count"] = perception.get("omitted_count", 0) + 1
+            dropped = perception.setdefault("omitted_ids", [])
+            if len(dropped) < 10:
                 real = real_of.get(removed.get("a"), removed.get("a"))
-                perception["omitted_ids"].append(archive_shorts.get(real, real))
-            perception["archives_in_context"] = len(perception["archives"])
+                dropped.append(archive_shorts.get(real, real))
             content = dump(perception)
         for key in ("names", "related_archives", "omitted_ids"):
-            while len(content) > cfg.context_chars and perception[key]:
+            while len(content) > cfg.context_chars and perception.get(key):
                 perception[key].pop()
                 content = dump(perception)
-        perception["new_related_count"] = len(perception["related_archives"])
+        related_now = perception.get("related_archives", [])
+        if related_now:
+            perception["new_related_count"] = len(related_now)
+        elif "new_related_count" in perception:
+            perception.pop("new_related_count")
         content = dump(perception)
         # Everything injected here counts as "already seen" for later searches.
         self.seen_window.remember(
             recall_key,
             "",
-            [real_of.get(r.get("a"), r.get("a")) for r in perception["archives"]]
-            + [real_of.get(r.get("a"), r.get("a")) for r in perception["related_archives"]],
+            [real_of.get(r.get("a"), r.get("a")) for r in perception.get("archives", [])]
+            + [
+                real_of.get(r.get("a"), r.get("a"))
+                for r in perception.get("related_archives", [])
+            ],
             fact_ids,
         )
         req.user_prompt.insert(

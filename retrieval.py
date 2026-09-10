@@ -388,6 +388,11 @@ def trim_nested(text, reply_chars=40, desc_chars=100):
     return "".join(out)
 
 
+def model_text(text, keep=(), reply_chars=40, desc_chars=100):
+    """统一入口：剥包裹 + 压空白 + 截断嵌套长描述（只影响模型看到的样子）。"""
+    return trim_nested(clean_text(text, keep), reply_chars, desc_chars)
+
+
 def _scan_bracket(text, start):
     """从 ``text[start]`` 的 ``[`` 起找到配对的 ``]``（考虑嵌套），返回下标或 -1。"""
     depth = 0
@@ -421,6 +426,58 @@ def short_time(value):
     if ts <= 0:
         return ""
     return time.strftime("%m-%d %H:%M", time.localtime(ts))
+
+
+def full_time(value):
+    """epoch → ``YYYY-MM-DD HH:MM``（本地时区）。
+
+    模型对浮点秒没有任何直觉（1772908601.6758957 是几号？），可读时间反而让它
+    判断时间线更准；年份必须带上，跨年批次才不会有歧义。
+    """
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+# 给模型看的类别短码：两字母，配合静态规则块里的一行图例（规则块走缓存，不额外花每轮 token）
+CATEGORY_CODES = {
+    "event": "ev",
+    "fact": "fa",
+    "preference": "pr",
+    "commitment": "co",
+    "relationship": "re",
+    "profile": "pf",
+    "resource": "rs",
+    "self": "sf",
+}
+CATEGORY_LEGEND = "事实短码：" + " ".join(
+    f"{code}={name}" for name, code in CATEGORY_CODES.items()
+)
+
+
+def named_pair(entity_id, name=None):
+    """``qq:769690776(周武)`` —— 稳定 ID 在前，名字在括号里。
+
+    模型照着抄 subject 时拿到的是 ID；同时它知道这个人叫什么，写摘要就能用名字。
+    """
+    entity_id = str(entity_id or "")
+    name = str(name or "").strip()
+    if not entity_id:
+        return name
+    if not name or name == entity_id:
+        return entity_id
+    return f"{entity_id}({name})"
+
+
+def bare_id(value):
+    """从 ``qq:769690776(周武)`` 里取回 ``qq:769690776``。"""
+    value = str(value or "").strip()
+    head, sep, _ = value.partition("(")
+    return head.strip() if sep else value
 
 
 def squeeze(text):
@@ -461,29 +518,33 @@ def bot_facts(facts, current_sid="", short=None):
     """
     view = []
     for fact in facts:
+        # 短键 + 类别短码 + 默认值省略：每轮都发的东西，信封比内容还贵
         item = {
-            "category": fact.get("category", ""),
-            "subject": fact.get("subject", ""),
-            "content": fact.get("content", ""),
-            "importance": fact.get("importance", 5),
+            "c": CATEGORY_CODES.get(fact.get("category", ""), fact.get("category", "")),
+            "u": fact.get("subject", ""),  # 稳定实体 ID 不变，工具要用它
+            "x": fact.get("content", ""),
         }
+        importance = fact.get("importance", 5)
+        if importance != 5:
+            item["imp"] = importance
         relations = fact.get("verified_relations", fact.get("relations", []))
         if relations:
-            item["relations"] = relations
+            item["rel"] = relations
         if fact.get("sid") and fact["sid"] != current_sid:
             item["sid"] = fact["sid"]
             if fact.get("src_user"):
                 item["by"] = fact["src_user"]
         source = fact.get("src") or (fact.get("sources") or [None])[-1]
         if source:
-            item["src"] = short(source) if short else source
+            # 短码映射里没有的（例如 sources 兜底值）就用原值，绝不输出 null
+            item["src"] = (short(source) or source) if short else source
         created = fact.get("created")
         if isinstance(created, (int, float)) and created > 0:
-            item["t"] = time.strftime("%Y-%m-%d", time.gmtime(created))
+            item["t"] = time.strftime("%m-%d", time.localtime(created))
         if fact.get("relationship_status") == "needs_review" or fact.get(
             "relation_warnings"
         ):
-            item["needs_review"] = True
+            item["rev"] = True
         view.append(item)
     return view
 
