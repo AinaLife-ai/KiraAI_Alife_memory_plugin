@@ -50,11 +50,13 @@ def fact(**overrides):
 class BotFactsTests(unittest.TestCase):
     def test_keeps_only_decision_and_provenance_fields(self):
         view = r.bot_facts([fact()], "qq:dm:u")[0]
-        self.assertEqual(
-            set(view), {"category", "subject", "content", "relations", "importance", "src", "t"}
-        )
+        # 默认重要度(5)省略，这里用例给的是 6，所以 imp 会出现
+        self.assertEqual(set(view), {"c", "u", "x", "imp", "src", "t"})
+        self.assertEqual(view["c"], "pr")  # 类别用短码，图例在静态规则块里
         self.assertEqual(view["src"], "rec-1")
-        self.assertEqual(view["t"], time.strftime("%Y-%m-%d", time.gmtime(1700000000.0)))
+        self.assertEqual(
+            view["t"], time.strftime("%m-%d", time.localtime(1700000000.0))
+        )  # 事实只需要月-日
         # 本会话事实不再重复 sid/by
         self.assertNotIn("sid", view)
 
@@ -66,11 +68,11 @@ class BotFactsTests(unittest.TestCase):
         self.assertEqual(view["by"], "qq:other")
 
     def test_needs_review_only_when_flagged(self):
-        self.assertNotIn("needs_review", r.bot_facts([fact()], "qq:dm:u")[0])
+        self.assertNotIn("rev", r.bot_facts([fact()], "qq:dm:u")[0])
         flagged = r.bot_facts(
             [fact(relationship_status="needs_review")], "qq:dm:u"
         )[0]
-        self.assertTrue(flagged["needs_review"])
+        self.assertTrue(flagged["rev"])  # 短键：待核对的关系
 
 
 class PayloadTests(unittest.TestCase):
@@ -82,11 +84,14 @@ class PayloadTests(unittest.TestCase):
              "start": 101.0, "end": 101.0},
         ]
         aliases = {"r1": "a" * 32, "r2": "b" * 32}
-        records = e.compress_records(rows, aliases)
+        records = e.compress_records(rows, aliases, {"u": "周武"})
         self.assertEqual([rec["id"] for rec in records], ["r1", "r2"])
         self.assertNotIn("level", records[0])
-        self.assertEqual(records[0]["t"], 100.0)
+        self.assertNotIn("role", records[0])          # 默认 user 不再显式输出
+        self.assertEqual(records[1]["bot"], 1)        # assistant 用一位短标记
+        self.assertEqual(records[0]["t"], "1970-01-01 08:01")  # 可读时间（本地）
         self.assertNotIn("start", records[0])
+        self.assertEqual(records[0]["u"], ["u(周武)"])         # 名字随行，ID 在前
 
     def test_compress_records_keep_range_for_archives(self):
         rows = [
@@ -94,8 +99,9 @@ class PayloadTests(unittest.TestCase):
              "start": 10.0, "end": 20.0},
         ]
         record = e.compress_records(rows, {"r1": "c" * 32})[0]
-        self.assertEqual((record["start"], record["end"]), (10.0, 20.0))
-        self.assertNotIn("t", record)
+        self.assertNotIn("start", record)
+        # 一层以上的存档保留起止两点，都换成可读时间
+        self.assertEqual((record["t"], record["t2"]), ("1970-01-01 08:00", "1970-01-01 08:00"))
 
     def test_restore_maps_aliases_and_rejects_unknown(self):
         aliases = {"r1": "real-1"}
@@ -216,12 +222,15 @@ class AuditPayloadTests(unittest.TestCase):
             )
         asyncio.run(self.engine.audit("qq:dm:u"))
         payload = self.seen[-1]["payload"]
+        # 入库的 facts[].id 换成了 f1..fN 短别名；sources 不再入参（指令本来就要求别用它）
+        self.assertEqual(payload["facts"][0]["id"], "f1")
         self.assertEqual(
             set(payload["facts"][0]),
             {"id", "sid", "subject", "category", "content", "reason", "relations",
-             "importance", "sources"},
+             "importance"},
         )
-        self.assertEqual(set(payload["evidence"][0]), {"content", "start", "end"})
+        self.assertNotIn("sources", json.dumps(payload))
+        self.assertEqual(set(payload["evidence"][0]), {"content", "t"})
         self.assertNotIn("title", json.dumps(self.seen[-1]["schema"]))
 
 

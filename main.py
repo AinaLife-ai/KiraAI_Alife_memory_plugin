@@ -44,6 +44,10 @@ from .storage import Conflict, Store
 from .migration import SOURCES, newest_legacy_mtime
 from .retrieval import (
     SYNTHETIC_NAMES,
+    clean_text,
+    short_time,
+    squeeze,
+    trim_nested,
     TOOL_RESULT_PREFIX,
     archive_view,
     bot_facts,
@@ -65,6 +69,9 @@ MEMORY_RULES = (
     "跨会话记忆必须核对来源会话、用户ID和时间，别人的经历不等于当前用户的经历。"
     "MemoryNames 可按现名或曾用名查稳定ID，CorrectMemoryName 有证据时更新称呼；同名不代表同一人。"
     "needs_review 的关系只是待核对的历史描述，不可作为确定关系。"
+    "事实字段短键：c=类别代码（ev=经历 fa=事实 pr=偏好 co=约定 re=关系 pf=画像 rs=资源 sf=自我），"
+    "u=主体实体ID，x=内容，imp=重要度（省略即5），src=来源存档ID，t=日期；"
+    "names 是「完整账号/群号 → 名称」，汇报或核对身份时从这里取。"
     "历史摘要不是本轮回答模板，结合近期已说过的话去重；用户追问还有别的时用SearchMemoryArchive(next_batch=true)找新证据，没找到就坦诚说明，不反复复述或编造。ReadMemoryArchive默认对子ID分页；按next_child_offset续读，必要时include_content=true读取完整归档正文。"
 )
 
@@ -536,6 +543,38 @@ class AlifeMemoryPlugin(BasePlugin):
             ),
         )
 
+    # ---- 给模型看的紧凑表示 ------------------------------------------------
+    @staticmethod
+    def model_text(text, keep=(), reply_chars=40, desc_chars=100):
+        """剥包裹 + 压空白 + 截断嵌套的长描述（只影响模型看到的样子）。
+
+        ``keep`` 传「含空格的已登记名字」：这些是真实昵称，不能被空白归一合并。
+        """
+        return trim_nested(clean_text(text, keep), reply_chars, desc_chars)
+
+    async def shortmap(self, values):
+        """批量生成短码映射 {真实 id: 短码}，供渲染时替换。"""
+        out = {}
+        for value in values:
+            if value and value not in out:
+                out[value] = await self.store.call("short_id", value)
+        return out
+
+    @staticmethod
+    def named(entities, ids):
+        """实体 id → 显示名（没登记名字就原样返回 id），并给出 名称→完整账号 表。"""
+        name_of = {e["id"]: e["name"] for e in entities if e.get("name")}
+        who = {}
+        shown = []
+        for value in ids:
+            name = name_of.get(value)
+            if name:
+                who.setdefault(name, value)
+                shown.append(name)
+            else:
+                shown.append(value)
+        return shown, who
+
     async def observe_event_names(self, event):
         # Synthetic notices (e.g. another plugin firing a reminder as the user)
         # carry placeholder nicknames; observing them would overwrite real names.
@@ -938,6 +977,7 @@ class AlifeMemoryPlugin(BasePlugin):
         subjects = await self.store.call(
             "entity_ids_for_query", query, sid, users, cfg.recall_scope
         )
+        keep_names = await self.store.call("spaced_names")  # 名字带空格的昵称，渲染时保护
         keyword_hit = any(word in query for word in cfg.recall_keywords)
         if cfg.inject_mode == "full":
             facts = await self.store.call(
@@ -955,7 +995,7 @@ class AlifeMemoryPlugin(BasePlugin):
             facts = await self.situational_facts(
                 sid, query, users, subjects, keyword_hit, cfg, prefer
             )
-        related = []
+        related, related_rows, related_shorts = [], [], {}
         if cfg.recall_scope != "session" and query.strip():
             reach = cfg.top_k * (2 if keyword_hit else 1)
             matches = await self.store.call(
@@ -971,25 +1011,23 @@ class AlifeMemoryPlugin(BasePlugin):
                 **prefer,
             )
             local_ids = {r["id"] for r in rows}
-            related = [
-                {
-                    **{
-                        k: r[k]
-                        for k in (
-                            "id",
-                            "sid",
-                            "users",
-                            "summary",
-                            "start",
-                            "end",
-                            "level",
-                        )
-                    },
-                    "archived": not r["active"],
+            related_rows = [r for r in matches["items"] if r["id"] not in local_ids][:reach]
+            related_shorts = await self.shortmap(
+                [r["id"] for r in related_rows]
+                + [r["sid"] for r in related_rows if r["sid"] != sid]
+            )
+            related = []
+            for r in related_rows:
+                item = {
+                    "a": related_shorts.get(r["id"], r["id"]),
+                    "t": short_time(r["end"] or r["start"]),
+                    "s": self.model_text(r["summary"], keep_names),
                 }
-                for r in matches["items"]
-                if r["id"] not in local_ids
-            ][:reach]
+                if not r["active"]:
+                    item["arch"] = 1
+                if r["sid"] and r["sid"] != sid:
+                    item["from"] = related_shorts.get(r["sid"], r["sid"])
+                related.append(item)
             if cfg.inject_mode == "full":
                 extra = await self.store.call(
                     "facts",
@@ -1006,32 +1044,30 @@ class AlifeMemoryPlugin(BasePlugin):
                 facts = list({f["id"]: f for f in [*extra, *facts]}.values())
         while len(dump(related)) > cfg.context_chars // 4 and related:
             related.pop()
-        names = await self.store.call(
+        names = []
+        for n in await self.store.call(
             "entities",
             ids={
                 sid,
                 *users,
-                *(u for r in related for u in r["users"]),
-                *(r["sid"] for r in related),
+                *(u for r in related_rows for u in r["users"]),
+                *(r["sid"] for r in related_rows),
                 *(f["sid"] for f in facts),
             },
             limit=30,
-        )
-        names = [
-            {
-                "id": n["id"],
-                "name": n["name"],
-                "aliases": list(dict.fromkeys(h["name"] for h in n["history"]))[:5],
-            }
-            for n in names
-        ]
+        ):
+            item = {"id": n["id"], "name": n["name"]}
+            aliases = [a for a in dict.fromkeys(h["name"] for h in n["history"]) if a][:3]
+            if aliases:
+                item["aliases"] = aliases
+            names.append(item)
         if cfg.session_affinity:
             # Provenance lets the model prefer this session without hiding others.
             session_names = {n["id"]: n["name"] for n in names}
-            for item in related:
-                item["source_session"] = item["sid"]
-                item["same_session"] = item["sid"] == sid
-                item["session_name"] = session_names.get(item["sid"], "")
+            for raw_row, item in zip(related_rows, related):
+                item["source_session"] = raw_row["sid"]
+                item["same_session"] = raw_row["sid"] == sid
+                item["session_name"] = session_names.get(raw_row["sid"], "")
             for fact in facts:
                 fact["source_session"] = fact["sid"]
                 fact["same_session"] = fact["sid"] == sid
@@ -1062,42 +1098,72 @@ class AlifeMemoryPlugin(BasePlugin):
                 key=lambda r: (-r["start"], r["id"]),
             )
             priority = [r for r in rows if r["permanent"]] + raw + recent[:2]
+        archive_shorts = await self.shortmap(
+            [r["id"] for r in priority]
+            + [r["sid"] for r in priority if r["sid"] != sid]
+        )
         chosen = {}
         for row in priority:
-            rendered = dump(
-                {
-                    "archive": row["id"],
-                    "sid": row["sid"],
-                    "users": row["users"],
-                    "level": row["level"],
-                    "start": row["start"],
-                    "end": row["end"],
-                    "summary": row["summary"],
-                }
-            )
+            packed = {
+                "a": archive_shorts.get(row["id"], row["id"]),
+                "t": short_time(row["end"] or row["start"]),
+                "s": self.model_text(row["summary"], keep_names),
+            }
+            if row["role"] == "assistant":
+                packed["bot"] = 1
+            if row["permanent"]:
+                packed["mem"] = 1
+            if row["sid"] and row["sid"] != sid:
+                packed["from"] = archive_shorts.get(row["sid"], row["sid"])
+            rendered = dump(packed)
             if len(rendered) <= budget:
-                chosen[row["id"]] = {"role": row["role"], **json.loads(rendered)}
+                chosen[row["id"]] = packed
                 budget -= len(rendered)
             else:
                 omitted.append(row["id"])
         selected = [chosen[r["id"]] for r in rows if r["id"] in chosen]
+        with_evidence = await self.store.call("attach_evidence", facts)
+        fact_shorts = await self.shortmap(
+            f.get("src") for f in with_evidence if f.get("src")
+        )
+        # 短码 → 真实 id：注入块与 seen 窗口需要真实 id
+        real_of = {short: real for real, short in archive_shorts.items()}
+        real_of.update({short: real for real, short in related_shorts.items()})
         # Never rewrite host history or put changing memory in the system prefix.
+        # 每轮都发的块：空值/零值/重复项一律省略，名字用映射式（完整号每轮出现一次，
+        # 供模型汇报或核对；条目里就用名字，省掉一遍遍重复的 id）。
         perception = {
             "scope": cfg.recall_scope,
-            "new_related_count": len(related),
             "session": sid,
-            "participants": users,
             "self": getattr(event, "self_id", ""),
-            "archives_in_context": len(selected),
-            "omitted_count": len(omitted),
-            "omitted_ids": omitted[:30],
-            "facts": bot_facts(
-                await self.store.call("attach_evidence", facts), sid
-            ),
-            "archives": selected,
-            "related_archives": related,
-            "names": names,
+            "facts": bot_facts(with_evidence, sid, short=fact_shorts.get),
         }
+        if users:
+            perception["participants"] = users
+        if related:
+            perception["new_related_count"] = len(related)
+        if omitted:
+            perception["omitted_count"] = len(omitted)
+            perception["omitted_ids"] = [archive_shorts.get(i, i) for i in omitted[:10]]
+        if selected:
+            perception["archives"] = selected
+        if related:
+            perception["related_archives"] = related
+        # 跨会话来源用名字（有名字时），模型一眼能看出这条来自哪个群
+        label_of = {
+            item["id"]: (item.get("name") or (item.get("aliases") or [""])[0])
+            for item in names
+        }
+        for raw_row, item in zip(related_rows, related):
+            label = label_of.get(raw_row["sid"])
+            if label:
+                item["from"] = label
+        if names:
+            perception["names"] = {
+                item["id"]: "|".join([item["name"], *item.get("aliases", [])]).strip("|")
+                for item in names
+                if item.get("name") or item.get("aliases")
+            }
         req.system_prompt.append(
             Prompt(
                 MEMORY_RULES,
@@ -1112,25 +1178,34 @@ class AlifeMemoryPlugin(BasePlugin):
         while len(content) > cfg.context_chars and perception["facts"]:
             perception["facts"].pop()
             content = dump(perception)
-        while len(content) > cfg.context_chars and perception["archives"]:
+        # 块里省略了空字段，裁剪循环必须容忍字段不存在
+        while len(content) > cfg.context_chars and perception.get("archives"):
             removed = perception["archives"].pop()
-            perception["omitted_count"] += 1
-            if len(perception["omitted_ids"]) < 30:
-                perception["omitted_ids"].append(removed["archive"])
-            perception["archives_in_context"] = len(perception["archives"])
+            perception["omitted_count"] = perception.get("omitted_count", 0) + 1
+            dropped = perception.setdefault("omitted_ids", [])
+            if len(dropped) < 10:
+                real = real_of.get(removed.get("a"), removed.get("a"))
+                dropped.append(archive_shorts.get(real, real))
             content = dump(perception)
         for key in ("names", "related_archives", "omitted_ids"):
-            while len(content) > cfg.context_chars and perception[key]:
+            while len(content) > cfg.context_chars and perception.get(key):
                 perception[key].pop()
                 content = dump(perception)
-        perception["new_related_count"] = len(perception["related_archives"])
+        related_now = perception.get("related_archives", [])
+        if related_now:
+            perception["new_related_count"] = len(related_now)
+        elif "new_related_count" in perception:
+            perception.pop("new_related_count")
         content = dump(perception)
         # Everything injected here counts as "already seen" for later searches.
         self.seen_window.remember(
             recall_key,
             "",
-            [r["archive"] for r in perception["archives"]]
-            + [r["id"] for r in perception["related_archives"]],
+            [real_of.get(r.get("a"), r.get("a")) for r in perception.get("archives", [])]
+            + [
+                real_of.get(r.get("a"), r.get("a"))
+                for r in perception.get("related_archives", [])
+            ],
             fact_ids,
         )
         req.user_prompt.insert(
@@ -1301,6 +1376,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 or type(include_content) is not bool
             ):
                 raise ValueError("invalid archive paging")
+            id = await self.store.call("real_id", id)  # 短码或全 id 都认
             row = await self.accessible(event, id)
             recall_key = (event.sid, tuple(user_ids(event)), self.settings.recall_scope)
             self.seen_window.remember(recall_key, "", [id])
@@ -1386,6 +1462,12 @@ class AlifeMemoryPlugin(BasePlugin):
                 )
             ):
                 raise ValueError("invalid continuation")
+            # 归一空白：日志里出现过模型传 '翅 膀' 而库里存「翅膀」的情况
+            keyword, prompt = squeeze(keyword), squeeze(prompt)
+            if exclude_ids:  # 模型回传的是短码，先还原成真实 id
+                exclude_ids = [
+                    await self.store.call("real_id", value) for value in exclude_ids
+                ]
             key = (event.sid, tuple(user_ids(event)), self.settings.recall_scope)
             previous = self.seen_window.get(key)
             if next_batch and not (keyword or prompt):
@@ -1428,32 +1510,44 @@ class AlifeMemoryPlugin(BasePlugin):
                 active=self.settings.search_active_only and not include_archived,
                 cold_after_days=self.settings.cold_after_days,
             )
-            result["items"] = [
-                {
-                    **{
-                        k: r[k]
-                        for k in (
-                            "id",
-                            "sid",
-                            "role",
-                            "level",
-                            "start",
-                            "end",
-                            "summary",
-                            "users",
-                            "revision",
-                            "permanent",
-                        )
-                    },
-                    "archived": not r["active"],
-                }
-                for r in result["items"]
-            ]
-            self.seen_window.remember(
-                key, prompt or keyword, [r["id"] for r in result["items"]]
+            raw_items = list(result["items"])  # 先留底：下面会换成紧凑形态
+            keep_names = await self.store.call("spaced_names")
+            ids = sorted({u for r in raw_items for u in r["users"]})
+            entities = await self.store.call("entities", ids=ids, limit=200) if ids else []
+            shorts = await self.shortmap(
+                [r["id"] for r in raw_items]
+                + [r["sid"] for r in raw_items if r["sid"] != event.sid]
             )
+            who = {}
+            packed = []
+            for r in raw_items:
+                # 紧凑形态：i=短码(证据编码) t=时间 s=内容 u=参与者
+                # 默认值全部省略（archived/permanent/role/level/revision 之前占了两成字符）
+                item = {
+                    "i": shorts.get(r["id"], r["id"]),
+                    "t": short_time(r["end"] or r["start"]),
+                    "s": self.model_text(r["summary"], keep_names),
+                }
+                if r["role"] == "assistant":
+                    item["bot"] = 1
+                if not r["active"]:
+                    item["arch"] = 1
+                if r["permanent"]:
+                    item["mem"] = 1
+                if r["users"]:
+                    shown, extra = self.named(entities, r["users"])
+                    item["u"] = shown
+                    who.update(extra)
+                if r["sid"] and r["sid"] != event.sid:
+                    item["from"] = shorts.get(r["sid"], r["sid"])
+                packed.append(item)
+            # 群名/账号完整形式整批只给一次：bot 之后要用/要汇报时从这里取
+            result["items"] = packed
+            if who:
+                result["who"] = who
+            self.seen_window.remember(key, prompt or keyword, [r["id"] for r in raw_items])
             result["next_page"] = (
-                page + 1 if q.offset + len(result["items"]) < result["total"] else None
+                page + 1 if q.offset + len(raw_items) < result["total"] else None
             )
             result["excluded_count"] = len(excluded)
             result["already_seen"] = len(seen)
@@ -1499,7 +1593,12 @@ class AlifeMemoryPlugin(BasePlugin):
                     "memorize revived an archived permanent memory",
                 )
             return self.recall_result(
-                event, {"ok": True, "id": existing["id"], "existing": True}
+                event,
+                {
+                    "ok": True,
+                    "id": await self.store.call("short_id", existing["id"]),
+                    "existing": True,
+                },
             )
         now = time.time()
         record_id = await self.store.call(
@@ -1508,7 +1607,9 @@ class AlifeMemoryPlugin(BasePlugin):
         await self.engine.enqueue("classify", record_id)
         if self.settings.permanent_dedupe:
             await self.engine.enqueue("dedupe", value.sid, automatic=True)
-        return self.recall_result(event, {"ok": True, "id": record_id})
+        return self.recall_result(
+            event, {"ok": True, "id": await self.store.call("short_id", record_id)}
+        )
 
     @register.tool(
         name="Forget",
@@ -1522,6 +1623,7 @@ class AlifeMemoryPlugin(BasePlugin):
     )
     async def forget(self, event, id: str):
         try:
+            id = await self.store.call("real_id", id)  # 短码或全 id 都认
             row = await self.accessible(event, id)
             await self.store.call(
                 "edit",
@@ -1605,6 +1707,7 @@ class AlifeMemoryPlugin(BasePlugin):
     )
     async def correct(self, event, id, revision, summary, reason):
         try:
+            id = await self.store.call("real_id", id)  # 短码或全 id 都认
             await self.accessible(event, id)
             edit = Edit(
                 kind="record",

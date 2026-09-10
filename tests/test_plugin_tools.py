@@ -35,7 +35,11 @@ async def test_own_tool_output_is_not_stored(tmp_path):
     plugin.engine = _Engine()
     event = _event()
     text = await plugin.memorize(event, "主人喜欢乌龙茶")
-    assert "100-" in text  # the permanent memory itself was created
+    # v2.7.0 起对外只给短码（真实 id 是 31~71 字符，模型容易抄错）
+    memorized = json.loads(text)
+    assert memorized["ok"] and len(memorized["id"]) <= 8
+    real = store.real_id(memorized["id"])
+    assert store.get(real)["permanent"] == 1
     before = len(store.export()["records"])
     await plugin.on_tool_result(event, _Result(text))
     assert len(store.export()["records"]) == before
@@ -62,11 +66,11 @@ async def test_memorize_skips_duplicates_and_revives_forgotten(tmp_path):
     assert again == {"ok": True, "id": first["id"], "existing": True}
     assert len(store.export()["records"]) == before
 
-    await plugin.forget(event, first["id"])
-    assert store.get(first["id"])["active"] == 0
+    await plugin.forget(event, first["id"])  # 用短码回传也要认得
+    assert store.get(store.real_id(first["id"]))["active"] == 0
     revived = json.loads(await plugin.memorize(event, "主人喜欢乌龙茶"))
-    assert revived["existing"] is True
-    assert store.get(first["id"])["active"] == 1
+    assert revived["existing"] is True and revived["id"] == first["id"]
+    assert store.get(store.real_id(first["id"]))["active"] == 1
 
 
 @pytest.mark.asyncio

@@ -253,8 +253,247 @@ STOP = {
 }
 
 
+import re
+
+# 纯包裹层：成对出现才剥
+WRAPPER_TAGS = ("msg", "text", "forward", "quote", "message")
+_WRAPPER_RE = {
+    tag: (
+        re.compile(rf"<{tag}(?:\s[^>]*)?>", re.I),
+        re.compile(rf"</{tag}\s*>", re.I),
+    )
+    for tag in WRAPPER_TAGS
+}
+
+# 带语义的标签：压缩成短记号，但保留信息
+_INLINE_RE = [
+    (re.compile(r"<reply>(.*?)</reply>", re.S | re.I), lambda m: "↩" + m.group(1).strip()),
+    (re.compile(r"<at>(.*?)</at>", re.S | re.I), lambda m: "@" + m.group(1).strip()),
+    (re.compile(r"<sticker>(.*?)</sticker>", re.S | re.I), lambda m: "[表情" + m.group(1).strip() + "]"),
+    (re.compile(r"<image>(.*?)</image>", re.S | re.I), lambda m: "[图片" + m.group(1).strip() + "]"),
+]
+
+_CJK = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+_SPACE_BETWEEN_CJK = re.compile(rf"(?<=[{_CJK}])[ \t]+(?=[{_CJK}])")
+# 逐字拉开写（「很 重 要」「请 注 意」）是刻意的强调：至少三个汉字被空白隔开。
+# 折行残留只会插入「一个」空格，不可能连成这种形态，所以用它区分。
+_SPACED_OUT = re.compile(rf"[{_CJK}](?:[ \t]+[{_CJK}]){{2,}}")
+_MULTI_SPACE = re.compile(r"[ \t]{2,}")
+_BLANK_LINES = re.compile(r"\n\s*\n+")
+_LEADING_INDENT = re.compile(r"\n[ \t]+")
+_BAD_CHARS = re.compile(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffd]")
+
+
+_MSG_OPEN = re.compile(r"<msg(?:\s[^>]*)?>", re.I)
+_MSG_CLOSE = re.compile(r"</msg\s*>", re.I)
+_OTHER_WRAPPERS = re.compile(r"</?(?:forward|quote|message)(?:\s[^>]*)?>", re.I)
+# 一个消息块：以 <text> 开头、</text> 收尾（允许前面有气泡/换行）。
+# 用「锚定 + 非贪婪」而不是数配对，这样正文里真的写了 <text> 也不会被吃掉。
+_BLOCK = re.compile(
+    r"(?:^|\n)[ \t]*<text(?:\s[^>]*)?>(.*?)</text\s*>(?=[ \t]*(?:\n|$))",
+    re.S | re.I,
+)
+
+
+def _strip_wrappers(text):
+    """剥掉 message_str 的最外层容器，保留消息之间的边界（换行）。"""
+    out = _MSG_OPEN.sub("", text)
+    out = _MSG_CLOSE.sub("\n", out)
+    out = _OTHER_WRAPPERS.sub("", out)
+    for _ in range(3):  # 少数情况会套两层
+        # 保留消息边界：匹配时吃掉了前导换行，这里补回来
+        new_out = _BLOCK.sub(lambda m: "\n" + m.group(1), out)
+        if new_out == out:
+            break
+        out = new_out
+    return out
+
+
+def clean_text(text, keep=()):
+    """剥掉最外层包裹 + 归一空白。孤立的 ``<``、正文里的字面标签都原样保留。
+
+    ``keep`` 是「不能被空白归一碰」的片段——昵称真的可能带空格（``星 月``），
+    渲染前先从实体表查出这类名字传进来，正文里的它们原样保留。
+    """
+    if not text:
+        return ""
+    out = str(text)
+    holders = {}
+    # 刻意拉开写的强调句先原样保出来
+    for match in _SPACED_OUT.finditer(out):
+        token = "\ue000%d\ue001" % len(holders)
+        while token in out:
+            token += "\ue000"
+        holders[token] = match.group(0)
+        out = out.replace(match.group(0), token, 1)
+    for value in keep or ():
+        value = str(value or "")
+        # 只保护真正出现、且确实含空白的名字；占位符用私用区字符，不会被其它规则碰到
+        if value and value in out and any(c.isspace() for c in value):
+            token = "\ue000%d\ue001" % len(holders)
+            while token in out:
+                token += "\ue000"
+            holders[token] = value
+            out = out.replace(value, token)
+    out = _BAD_CHARS.sub("", out)
+    out = _strip_wrappers(out)
+    for pattern, repl in _INLINE_RE:
+        out = pattern.sub(repl, out)
+    out = _LEADING_INDENT.sub("\n", out)
+    out = _BLANK_LINES.sub("\n", out)
+    out = _SPACE_BETWEEN_CJK.sub("", out)
+    out = _MULTI_SPACE.sub(" ", out)
+    out = "\n".join(line.strip() for line in out.split("\n")).strip()
+    for token, value in holders.items():
+        out = out.replace(token, value)
+    return out
+
+
+def trim_nested(text, reply_chars=40, desc_chars=100):
+    """压缩嵌套的长文本：引用里的原文、表情/图片的视觉描述。
+
+    只截断「嵌套段落」，正文摘要不动；括号用配对扫描，不会被内容里的 ``]`` 提前截断。
+    日志实测：表情包的视觉描述平均 276 字符，是摘要里最大的单块开销。
+    """
+    if not text:
+        return ""
+    out, i = [], 0
+    while i < len(text):
+        reply = _REPLY_HEAD.match(text, i)
+        if reply:
+            end = _scan_bracket(text, i)
+            if end < 0:
+                out.append(text[i:])
+                break
+            inner = text[reply.end() : end]
+            out.append(f"[Reply {reply.group(1)}: {_clip(inner, reply_chars)}]")
+            i = end + 1
+            continue
+        media = _MEDIA_HEAD.match(text, i)
+        if media:
+            end = _scan_bracket(text, i)
+            if end < 0:
+                out.append(text[i:])
+                break
+            body = text[media.end() : end].rstrip()
+            tail = ""
+            split = re.match(r"(.*?)(,\s*file_path:.*)$", body, re.S)
+            if split:
+                body, tail = split.group(1), split.group(2)
+            out.append(f"[{media.group(1)} {_clip(body, desc_chars)}{tail}]")
+            i = end + 1
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def model_text(text, keep=(), reply_chars=40, desc_chars=100):
+    """统一入口：剥包裹 + 压空白 + 截断嵌套长描述（只影响模型看到的样子）。"""
+    return trim_nested(clean_text(text, keep), reply_chars, desc_chars)
+
+
+def _scan_bracket(text, start):
+    """从 ``text[start]`` 的 ``[`` 起找到配对的 ``]``（考虑嵌套），返回下标或 -1。"""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "[":
+            depth += 1
+        elif text[i] == "]":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+_REPLY_HEAD = re.compile(r"\[Reply ID:\s*(\d+)\s*content:\s*")
+_MEDIA_HEAD = re.compile(r"\[(Sticker|Image)\s+")
+
+
+def _clip(text, limit):
+    text = text.strip()
+    if limit and len(text) > limit:
+        return text[:limit].rstrip() + "…"
+    return text
+
+
+def short_time(value):
+    """epoch → ``MM-DD HH:MM``（本地时区）。浮点秒对模型毫无意义，还占 25 字符。"""
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    return time.strftime("%m-%d %H:%M", time.localtime(ts))
+
+
+def full_time(value):
+    """epoch → ``YYYY-MM-DD HH:MM``（本地时区）。
+
+    模型对浮点秒没有任何直觉（1772908601.6758957 是几号？），可读时间反而让它
+    判断时间线更准；年份必须带上，跨年批次才不会有歧义。
+    """
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+# 给模型看的类别短码：两字母，配合静态规则块里的一行图例（规则块走缓存，不额外花每轮 token）
+CATEGORY_CODES = {
+    "event": "ev",
+    "fact": "fa",
+    "preference": "pr",
+    "commitment": "co",
+    "relationship": "re",
+    "profile": "pf",
+    "resource": "rs",
+    "self": "sf",
+}
+CATEGORY_LEGEND = "事实短码：" + " ".join(
+    f"{code}={name}" for name, code in CATEGORY_CODES.items()
+)
+
+
+def named_pair(entity_id, name=None):
+    """``qq:769690776(周武)`` —— 稳定 ID 在前，名字在括号里。
+
+    模型照着抄 subject 时拿到的是 ID；同时它知道这个人叫什么，写摘要就能用名字。
+    """
+    entity_id = str(entity_id or "")
+    name = str(name or "").strip()
+    if not entity_id:
+        return name
+    if not name or name == entity_id:
+        return entity_id
+    return f"{entity_id}({name})"
+
+
+def bare_id(value):
+    """从 ``qq:769690776(周武)`` 里取回 ``qq:769690776``。"""
+    value = str(value or "").strip()
+    head, sep, _ = value.partition("(")
+    return head.strip() if sep else value
+
+
+def squeeze(text):
+    """轻量归一：去控制/替换字符、压缩空白、去掉 CJK 之间的空格。
+
+    检索两侧都过一遍，于是「翅 膀」这种被插入空格的写法依然能命中「翅膀」。
+    """
+    if not text:
+        return ""
+    out = _BAD_CHARS.sub("", str(text))
+    out = _SPACE_BETWEEN_CJK.sub("", out)
+    return _MULTI_SPACE.sub(" ", out).strip()
+
+
 def relevance(query, text):
-    chunks = re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", query.casefold())
+    chunks = re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", squeeze(query).casefold())
     tokens = {
         t
         for c in chunks
@@ -264,39 +503,48 @@ def relevance(query, text):
             else [c[i : i + 2] for i in range(len(c) - 1)]
         )
     } - STOP
-    lowered = text.casefold()
+    lowered = squeeze(text).casefold()
     return sum(len(t) * (t in lowered) for t in tokens)
 
 
-def bot_facts(facts, current_sid=""):
+def bot_facts(facts, current_sid="", short=None):
     """给 Bot 看的精简事实视图：只留判断与追溯必需的字段。
 
     内部簿记（fingerprint/deleted/revision/merge_pending/audited）、
     分类装饰（scenario/tags）、以及只给审计用的大段 reason 都不进上下文。
+
+    ``short`` 可传入「真实 id → 短码」的转换函数；空字段（如空的 relations）
+    直接省略——它们在每轮注入里是纯开销。
     """
     view = []
     for fact in facts:
+        # 短键 + 类别短码 + 默认值省略：每轮都发的东西，信封比内容还贵
         item = {
-            "category": fact.get("category", ""),
-            "subject": fact.get("subject", ""),
-            "content": fact.get("content", ""),
-            "relations": fact.get("verified_relations", fact.get("relations", [])),
-            "importance": fact.get("importance", 5),
+            "c": CATEGORY_CODES.get(fact.get("category", ""), fact.get("category", "")),
+            "u": fact.get("subject", ""),  # 稳定实体 ID 不变，工具要用它
+            "x": fact.get("content", ""),
         }
+        importance = fact.get("importance", 5)
+        if importance != 5:
+            item["imp"] = importance
+        relations = fact.get("verified_relations", fact.get("relations", []))
+        if relations:
+            item["rel"] = relations
         if fact.get("sid") and fact["sid"] != current_sid:
             item["sid"] = fact["sid"]
             if fact.get("src_user"):
                 item["by"] = fact["src_user"]
         source = fact.get("src") or (fact.get("sources") or [None])[-1]
         if source:
-            item["src"] = source
+            # 短码映射里没有的（例如 sources 兜底值）就用原值，绝不输出 null
+            item["src"] = (short(source) or source) if short else source
         created = fact.get("created")
         if isinstance(created, (int, float)) and created > 0:
-            item["t"] = time.strftime("%Y-%m-%d", time.gmtime(created))
+            item["t"] = time.strftime("%m-%d", time.localtime(created))
         if fact.get("relationship_status") == "needs_review" or fact.get(
             "relation_warnings"
         ):
-            item["needs_review"] = True
+            item["rev"] = True
         view.append(item)
     return view
 

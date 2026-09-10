@@ -57,8 +57,9 @@ async def test_audit_invalid_record_id_retries_before_store_write(tmp_path):
                 "actions": [
                     dict(
                         action="correct",
-                        target_id=fid,
-                        source_ids=[rid if len(calls) == 1 else fid],
+                        # 入参里事实 id 已换成 f1..fN 短别名；第一次故意回一个记录 id 触发重试
+                        target_id="f1",
+                        source_ids=[rid if len(calls) == 1 else "f1"],
                         content="喜欢猫，但不养猫",
                         reason="按原文核对",
                         relations=[],

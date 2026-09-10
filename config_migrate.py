@@ -7,12 +7,18 @@ defaults (including prompt wording) without overriding personal choices.
 
 from .contracts import FACT_MERGE_PROMPT, RECORD_MERGE_PROMPT
 
-CURRENT_VERSION = 2
+CURRENT_VERSION = 3
 
 # version -> [(key, previous default, new default), ...]
 MIGRATIONS = {
     2: [
         ("audit_interval", 1800, 7200),
+    ],
+    3: [
+        # v2.6.0 把「检索默认只搜常驻」的默认值翻成关闭（归档也参与召回，更全），
+        # 但老配置里多半存着旧默认 true。只改写「仍等于旧默认」的那一个键，
+        # 用户自己设过的一律不动。
+        ("search_active_only", True, False),
     ],
 }
 
