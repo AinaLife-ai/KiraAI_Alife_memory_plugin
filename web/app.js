@@ -320,14 +320,20 @@ const JOB_ACTIONS = {
 };
 function bindJobButtons() {
   // 注意：只绑明细按钮。手动排队按钮用的是 data-job，混用会把它们的点击覆盖掉。
+  // 属性名必须与模板写出的 data-jobdetail 一致（曾写成 dataset.job → 请求 /job/undefined → 404）。
   $$("[data-jobdetail]").forEach(
     (b) => (b.onclick = (e) => {
       e.stopPropagation();
-      guard(() => openJob(b.dataset.job));
+      guard(() => openJob(b.dataset.jobdetail));
     }),
   );
 }
 async function openJob(id) {
+  if (!id) {
+    // 防御：属性名写错时曾经发出 GET /job/undefined 这种请求，只会换来一个 404
+    toast("这条任务没有可查看的明细");
+    return;
+  }
   const data = await api("/job/" + encodeURIComponent(id));
   const names = data.names || {};
   const label = (value) => (names[value] ? names[value] + " · " + value : value);
