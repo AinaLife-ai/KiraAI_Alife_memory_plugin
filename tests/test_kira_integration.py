@@ -1498,3 +1498,66 @@ async def test_fact_keyword_search_and_config_labels(tmp_path):
         assert set(labels) == set(module.Settings.model_fields)
     finally:
         await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_job_detail_lists_processed_items(tmp_path):
+    """后台任务明细接口：能拿到这次处理过的记录/事实，供前端弹卡片。"""
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        store = plugin.store
+        store.capture(
+            "test:dm:u",
+            "t",
+            [{"role": "user", "content": "周六约了咖啡馆", "users": ["test:u"], "time": 1.0}],
+        )
+        record = store.active("test:dm:u")[0]
+        job_id = store.enqueue("compress", "test:dm:u")
+        store.add_job_items(
+            job_id,
+            [
+                {
+                    "kind": "record",
+                    "target": record["id"],
+                    "action": "compressed",
+                    "note": "并入 1-abc",
+                }
+            ],
+        )
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            fact_id = store._add_fact(
+                db,
+                "test:dm:u",
+                {
+                    "category": "commitment",
+                    "subject": "test:u",
+                    "content": "周六下午三点在咖啡馆见面",
+                    "reason": "用户说的",
+                    "scenario": "",
+                    "tags": [],
+                    "relations": [],
+                    "source_ids": [record["id"]],
+                },
+            )
+        store.add_job_items(
+            job_id,
+            [{"kind": "fact", "target": fact_id, "action": "retract", "note": "与上一条重复"}],
+        )
+
+        detail = await plugin.api_job_detail(job_id)
+        assert detail["job"]["kind"] == "compress"
+        assert [item["action"] for item in detail["items"]] == ["compressed", "retract"]
+        assert detail["items"][0]["record"]["summary"] == "周六约了咖啡馆"
+        assert detail["items"][1]["fact"]["content"] == "周六下午三点在咖啡馆见面"
+        assert detail["items"][1]["note"] == "与上一条重复"
+        assert isinstance(detail["names"], dict)
+    finally:
+        await plugin.terminate()

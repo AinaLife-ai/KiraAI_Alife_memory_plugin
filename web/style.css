@@ -533,6 +533,16 @@ main {
   max-height: 280px;
   overflow: auto;
 }
+.dialog #jobItems {
+  max-height: 52vh;
+  overflow-y: auto;
+}
+.dialog #jobItems .task {
+  border-bottom: 1px solid var(--line);
+}
+.dialog #jobItems .task:last-child {
+  border-bottom: 0;
+}
 .dialog .actions {
   justify-content: flex-end;
   margin-top: 20px;

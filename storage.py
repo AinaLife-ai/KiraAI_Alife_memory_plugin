@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import math
+import random
 import sqlite3
 import time
 import uuid
@@ -102,6 +103,11 @@ class Store:
               id TEXT PRIMARY KEY, kind TEXT NOT NULL, sid TEXT NOT NULL, state TEXT NOT NULL,
               detail TEXT NOT NULL DEFAULT '', created REAL NOT NULL, updated REAL NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS job_unique ON jobs(kind,sid) WHERE state IN ('queued','running');
+            CREATE TABLE IF NOT EXISTS job_items (
+              id INTEGER PRIMARY KEY, job_id TEXT NOT NULL, kind TEXT NOT NULL,
+              target TEXT NOT NULL, action TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+              created REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS job_item_job ON job_items(job_id);
             CREATE TABLE IF NOT EXISTS vectors (
               id TEXT PRIMARY KEY REFERENCES records(id), model TEXT NOT NULL,
               revision INTEGER NOT NULL, vector TEXT NOT NULL);
@@ -1869,6 +1875,22 @@ class Store:
                 )
             ]
 
+    def records_by_ids(self, ids):
+        """批量取记录概要，供后台任务明细使用。"""
+        listing = list(dict.fromkeys(ids))
+        if not listing:
+            return []
+        with self.connect() as db:
+            return [
+                self.row(r)
+                for r in db.execute(
+                    "SELECT id,sid,role,level,start,end,summary,users,permanent,"
+                    "deleted,active FROM records WHERE id IN"
+                    " (SELECT value FROM json_each(?))",
+                    (dump(listing),),
+                )
+            ]
+
     def facts_by_ids(self, ids):
         if not ids:
             return []
@@ -2032,7 +2054,7 @@ class Store:
                 self._add_fact(db, row["sid"], fact)
             self.bump(db)
 
-    def audit(self, candidates, output):
+    def audit(self, candidates, output, job_id=""):
         by_id = {r["id"]: r for r in candidates}
         validate_audit(candidates, output)
         counts = {"keep": 0, "correct": 0, "merge": 0, "retract": 0, "merged_facts": 0}
@@ -2101,6 +2123,19 @@ class Store:
                     "UPDATE facts SET audited=? WHERE id=?", (time.time(), old["id"])
                 )
             self.bump(db)
+        if job_id:
+            self.add_job_items(
+                job_id,
+                [
+                    {
+                        "kind": "fact",
+                        "target": action["target_id"],
+                        "action": action["action"],
+                        "note": action.get("reason", ""),
+                    }
+                    for action in output["actions"]
+                ],
+            )
         return counts
 
     def set_vector(self, record_id, model, revision, vector):
@@ -2159,6 +2194,52 @@ class Store:
                 (state, detail, time.time(), job),
             )
             self.bump(db)
+
+    def add_job_items(self, job_id, items):
+        """记录后台任务处理了哪些条目，供前端「明细」查看与快速编辑。"""
+        rows = [
+            (
+                job_id,
+                item.get("kind", "record"),
+                item["target"],
+                item.get("action", ""),
+                item.get("note", ""),
+                time.time(),
+            )
+            for item in items
+            if item.get("target")
+        ]
+        if not job_id or not rows:
+            return 0
+        with self.connect() as db:
+            db.executemany(
+                "INSERT INTO job_items(job_id,kind,target,action,note,created)"
+                " VALUES (?,?,?,?,?,?)",
+                rows,
+            )
+            # 明细只做近期追溯，顺手清掉过期记录
+            if random.random() < 0.05:
+                db.execute(
+                    "DELETE FROM job_items WHERE created < ?", (time.time() - 30 * 86400,)
+                )
+            self.bump(db)
+        return len(rows)
+
+    def job_items(self, job_id):
+        with self.connect() as db:
+            return [
+                self.row(r)
+                for r in db.execute(
+                    "SELECT kind,target,action,note FROM job_items"
+                    " WHERE job_id=? ORDER BY id",
+                    (job_id,),
+                )
+            ]
+
+    def jobs_by_id(self, job_id):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            return dict(row) if row else None
 
     def status(self):
         with self.connect() as db:
