@@ -992,7 +992,7 @@ class AlifeMemoryPlugin(BasePlugin):
             facts = await self.situational_facts(
                 sid, query, users, subjects, keyword_hit, cfg, prefer
             )
-        related = []
+        related, related_rows, related_shorts = [], [], {}
         if cfg.recall_scope != "session" and query.strip():
             reach = cfg.top_k * (2 if keyword_hit else 1)
             matches = await self.store.call(

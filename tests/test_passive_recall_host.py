@@ -172,3 +172,42 @@ async def test_soft_deleted_fact_and_cold_archive_stay_out(tmp_path):
         assert perm not in await inject(plugin, event, "我师傅是星月")
     finally:
         await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_injection_survives_empty_query_and_session_scope(tmp_path):
+    """空消息 / recall_scope=session 时注入不能崩（v2.7.0 曾漏掉 related_rows 初始化）。"""
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        store = plugin.store
+        store.capture(
+            "test:dm:u", "turn",
+            [{"role": "user", "content": "随手记一句", "time": 1.0, "users": ["test:u"]}],
+        )
+        store.capture(
+            "test:gm:other", "turn",
+            [{"role": "user", "content": "别的会话", "time": 2.0, "users": ["test:v"]}],
+        )
+        # ① 事件里没有消息（query 为空）
+        event = types.SimpleNamespace(
+            sid="test:dm:u", event_id="e", messages=[], self_id="bot",
+            session=types.SimpleNamespace(adapter_name="test", session_title="私聊"),
+        )
+        req = LLMRequest(messages=[], system_prompt=[], user_prompt=[])
+        await plugin.on_request(event, req)
+        assert any(p.name == "alife_memory" for p in req.user_prompt)
+
+        # ② recall_scope=session（跳过相关存档召回）
+        plugin.settings.recall_scope = "session"
+        req = LLMRequest(messages=[], system_prompt=[], user_prompt=[])
+        await plugin.on_request(event, req)
+        assert any(p.name == "alife_memory" for p in req.user_prompt)
+    finally:
+        await plugin.terminate()
