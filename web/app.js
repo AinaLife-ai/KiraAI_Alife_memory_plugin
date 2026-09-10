@@ -312,6 +312,7 @@ const JOB_KINDS = {
 const JOB_ACTIONS = {
   archive: "记忆存档",
   compressed: "已并入存档",
+  merged: "并入",
   keep: "保留",
   correct: "修正",
   merge: "合并",
@@ -333,6 +334,11 @@ async function openJob(id) {
   $("#jobTitle").textContent = "任务明细 · " + (JOB_KINDS[job.kind] || job.kind);
   $("#jobMeta").textContent =
     [job.sid, job.detail, date(job.created)].filter(Boolean).join(" · ");
+  const byTarget = {};
+  data.items.forEach((item) => {
+    if (item.fact) byTarget[item.fact.id] = item.fact.content;
+    else if (item.record) byTarget[item.record.id] = item.record.summary;
+  });
   $("#jobItems").innerHTML = data.items.length
     ? data.items
         .map((item, i) => {
@@ -342,6 +348,20 @@ async function openJob(id) {
             : item.fact
               ? item.fact.content
               : "（已不可读取）";
+          // 修正 / 并入：把「改前 → 改后」直接摆出来
+          const shifted =
+            item.action === "merged"
+              ? [item.before, byTarget[item.note] || item.note]
+              : item.action === "correct" && item.before && item.before !== text
+                ? [item.before, text]
+                : null;
+          const arrow = shifted
+            ? '<div class="arrow"><span class="from">' +
+              esc(shifted[0]) +
+              '</span><i>→</i><strong>' +
+              esc(shifted[1]) +
+              "</strong></div>"
+            : "<strong>" + esc(text || "（空）") + "</strong>";
           const meta = item.record
             ? [
                 item.record.permanent ? "永久记忆" : "L" + item.record.level,
@@ -361,12 +381,15 @@ async function openJob(id) {
           return (
             '<div class="task"><div><span class="tag">' +
             esc(JOB_ACTIONS[item.action] || item.action) +
-            "</span> <strong>" +
-            esc(text || "（空）") +
-            '</strong><div class="muted">' +
+            (item.fact && item.fact.deleted && item.action !== "merged"
+              ? '<span class="tag off">已撤回</span>'
+              : "") +
+            "</span> " +
+            arrow +
+            '<div class="muted">' +
             esc(meta) +
-            (item.note && item.kind === "fact"
-              ? '<br>依据：' + esc(item.note)
+            (item.note && item.kind === "fact" && item.action !== "merged"
+              ? "<br>依据：" + esc(item.note)
               : "") +
             "</div></div>" +
             (target
@@ -511,6 +534,7 @@ async function selectTab(name) {
     archives: ["每段经历，都有来处", "检索、编辑，或沿着存档逐层回到最初。"],
     profiles: ["记住你，也认识自己", "关系、偏好、约定，汇成有依据的画像。"],
     tasks: ["让记忆，慢慢沉淀", "在后台压缩、审计与合并，不打断当下的对话。"],
+    trash: ["离开上下文的，也还在这里", "回收站与冷归档：还原、查看或编辑。"],
     names: ["名字会改变，彼此仍相识", "以稳定ID连接现在与曾经的称呼。"],
     settings: ["按你的节奏，整理记忆", "每一项配置，保存即生效。"],
   };
@@ -522,6 +546,7 @@ async function selectTab(name) {
   }
   if (name === "archives") await loadArchives();
   if (name === "profiles") await loadFacts();
+  if (name === "trash") await loadTrash();
   if (name === "settings" && !configDirty) await loadConfig();
   saveDraft();
 }
@@ -583,6 +608,183 @@ async function loadArchives() {
   $("#prev").disabled = offset === 0;
   $("#next").disabled = offset + 20 >= total;
 }
+let trashKind = "facts";
+let trashOffset = 0;
+const TRASH_KINDS = {
+  facts: { button: "#trashFacts", cards: "#trashCards" },
+  records: { button: "#trashRecords", cards: "#trashCards" },
+  cold: { button: "#trashCold", cards: "#trashCards" },
+};
+function setTrashKind(kind) {
+  trashKind = kind;
+  trashOffset = 0;
+  Object.entries(TRASH_KINDS).forEach(([key, value]) =>
+    $(value.button).setAttribute("aria-pressed", String(key === kind)),
+  );
+  $("#trashKeyword").placeholder =
+    kind === "facts" ? "按事实内容搜索…" : "按存档摘要搜索…";
+}
+async function loadTrash() {
+  const q = new URLSearchParams({
+    kind: trashKind,
+    keyword: $("#trashKeyword").value,
+    offset: trashOffset,
+  });
+  const data = await api("/trash?" + q);
+  Object.assign(displayNames, data.names || {});
+  $("#trashCards").innerHTML = data.items.length
+    ? data.items
+        .map((row, i) => {
+          const facts = trashKind === "facts";
+          const cold = trashKind === "cold";
+          const tag = facts
+            ? labels[row.category] || row.category
+            : cold
+              ? "冷归档"
+              : row.permanent
+                ? "永久记忆"
+                : "L" + row.level;
+          const head = facts
+            ? esc(displayLabel(row.subject))
+            : esc(displayLabel(row.sid));
+          const body = facts ? row.content : row.summary;
+          const meta = [
+            facts ? "重要度 " + row.importance : null,
+            facts ? esc(row.reason ? "依据：" + row.reason : "") : null,
+            date(row.start || row.created),
+            row.removed_at ? "离开上下文 " + date(row.removed_at) : null,
+            cold ? "仅按 ID 可读" : null,
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          return (
+            '<article class="card"><div class="row"><span class="tag">' +
+            esc(tag) +
+            '</span><strong>' +
+            head +
+            "</strong></div><p>" +
+            esc(body) +
+            '</p><p class="muted">' +
+            meta +
+            "</p><footer>" +
+            (cold
+              ? '<button class="primary" data-trashrestore="' +
+                i +
+                '">取回上下文</button>'
+              : '<button class="primary" data-trashrestore="' +
+                i +
+                '">还原</button>') +
+            '<button data-trashtarget="' +
+            i +
+            '">查看与编辑</button>' +
+            '<button class="danger" data-trashpurge="' +
+            i +
+            '">彻底删除</button></footer></article>'
+          );
+        })
+        .join("")
+    : empty("回收站是空的");
+  $$("[data-trashrestore]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        guard(async () => {
+          const row = data.items[Number(b.dataset.trashrestore)];
+          await api("/trash/restore", {
+            kind:
+              trashKind === "facts"
+                ? "fact"
+                : trashKind === "cold"
+                  ? "cold"
+                  : "record",
+            target: row.id,
+          });
+          toast(trashKind === "cold" ? "已取回上下文" : "已从回收站还原");
+          await loadTrash();
+        })),
+  );
+  $$("[data-trashtarget]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        guard(() => {
+          const row = data.items[Number(b.dataset.trashtarget)];
+          return trashKind === "facts"
+            ? openFact({ id: row.id })
+            : openRecord(row.id);
+        })),
+  );
+  $$("[data-trashpurge]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        guard(async () => {
+          const row = data.items[Number(b.dataset.trashpurge)];
+          const kind = trashKind === "facts" ? "fact" : "record";
+          const summary = trashKind === "facts" ? row.content : row.summary;
+          await askPurge(kind, row.id, summary);
+        })),
+  );
+  $("#trashPage").textContent =
+    (data.total ? trashOffset + 1 : 0) +
+    "–" +
+    Math.min(trashOffset + 50, data.total) +
+    " / " +
+    data.total;
+  $("#trashPrev").disabled = trashOffset === 0;
+  $("#trashNext").disabled = trashOffset + 50 >= data.total;
+}
+for (const [key, value] of Object.entries(TRASH_KINDS))
+  $(value.button).onclick = () =>
+    guard(() => {
+      setTrashKind(key);
+      return loadTrash();
+    });
+$("#trashSearch").onclick = () =>
+  guard(() => {
+    trashOffset = 0;
+    return loadTrash();
+  });
+$("#trashKeyword").onkeydown = (e) => {
+  if (e.key === "Enter") $("#trashSearch").click();
+};
+$("#trashPrev").onclick = () =>
+  guard(() => {
+    trashOffset = Math.max(0, trashOffset - 50);
+    return loadTrash();
+  });
+$("#trashNext").onclick = () =>
+  guard(() => {
+    trashOffset += 50;
+    return loadTrash();
+  });
+
+function askPurge(kind, target, summary) {
+  return new Promise((resolve) => {
+    const dialog = $("#purgeDialog");
+    $("#purgeTitle").textContent = "彻底删除？";
+    $("#purgeBody").textContent = summary || target;
+    $("#purgeNext").classList.remove("hide");
+    $("#purgeConfirm").classList.add("hide");
+    $("#purgeNext").onclick = () => {
+      // 第二次确认：这一步才真正执行
+      $("#purgeTitle").textContent = "最后确认：不可撤销";
+      $("#purgeNext").classList.add("hide");
+      $("#purgeConfirm").classList.remove("hide");
+    };
+    $("#purgeCancel").onclick = () => {
+      dialog.close();
+      resolve(false);
+    };
+    $("#purgeConfirm").onclick = () =>
+      guard(async () => {
+        await api("/trash/purge", { kind, target });
+        dialog.close();
+        toast("已彻底删除");
+        resolve(true);
+        await loadTrash();
+      });
+    dialog.showModal();
+  });
+}
+
 async function loadFacts() {
   const byContent = $("#factContent").checked;
   const q = new URLSearchParams({
@@ -673,6 +875,14 @@ async function openFact(row) {
   current = { kind: "fact", row };
   $("#editorTitle").textContent = "编辑画像事实";
   $("#editorMeta").textContent = row.subject + " · " + row.sid;
+  $$("#factFields .revoked").forEach((e) => e.remove());
+  if (row.deleted) {
+    const hint = document.createElement("p");
+    hint.className = "notice revoked";
+    hint.textContent =
+      "这条事实已不在上下文中（被审计撤回或合并掉了）。可在下方历史版本里点「恢复此版本」还原。";
+    $("#factFields").prepend(hint);
+  }
   $("#editLabel").textContent = "事实内容";
   $("#editText").value = row.content;
   $("#factFields").classList.remove("hide");

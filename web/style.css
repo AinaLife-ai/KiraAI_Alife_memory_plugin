@@ -84,6 +84,16 @@ textarea:focus-visible {
 .quiet {
   background: transparent;
 }
+button.danger {
+  border-color: color-mix(in srgb, #d1495b 45%, var(--line));
+}
+button.danger:hover {
+  border-color: #d1495b;
+  background: color-mix(in srgb, #d1495b 10%, transparent);
+}
+[data-theme="dark"] button.danger {
+  color: #ff8a9b;
+}
 .field .restore {
   font-size: 11px;
   padding: 2px 6px;
@@ -536,6 +546,30 @@ main {
 .dialog #jobItems {
   max-height: 52vh;
   overflow-y: auto;
+}
+.dialog #jobItems .arrow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 13px;
+}
+.dialog #jobItems .arrow .from {
+  color: var(--muted);
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--muted) 60%, transparent);
+}
+.dialog #jobItems .arrow i {
+  color: var(--accent);
+  font-style: normal;
+}
+.tag.off {
+  background: transparent;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+}
+#factFields .revoked {
+  margin: 0 0 10px;
 }
 .dialog #jobItems .task {
   border-bottom: 1px solid var(--line);
