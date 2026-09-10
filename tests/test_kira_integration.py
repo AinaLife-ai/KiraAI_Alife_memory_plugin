@@ -1549,8 +1549,21 @@ async def test_job_detail_lists_processed_items(tmp_path):
             )
         store.add_job_items(
             job_id,
-            [{"kind": "fact", "target": fact_id, "action": "retract", "note": "与上一条重复"}],
+            [
+                {
+                    "kind": "fact",
+                    "target": fact_id,
+                    "action": "retract",
+                    "note": "与上一条重复",
+                    "before": "周六下午三点在咖啡馆见面（旧）",
+                }
+            ],
         )
+        # 撤回 = 软删：默认查不到，但明细与编辑器必须还能读出来
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE facts SET deleted=1 WHERE id=?", (fact_id,))
+        assert store.facts_by_ids([fact_id]) == []
 
         detail = await plugin.api_job_detail(job_id)
         assert detail["job"]["kind"] == "compress"
@@ -1558,6 +1571,11 @@ async def test_job_detail_lists_processed_items(tmp_path):
         assert detail["items"][0]["record"]["summary"] == "周六约了咖啡馆"
         assert detail["items"][1]["fact"]["content"] == "周六下午三点在咖啡馆见面"
         assert detail["items"][1]["note"] == "与上一条重复"
+        assert detail["items"][1]["before"] == "周六下午三点在咖啡馆见面（旧）"
+        assert detail["items"][1]["fact"]["deleted"] == 1
+        # 编辑器也要能打开已撤回的事实，才能恢复
+        single = await plugin.api_fact(fact_id)
+        assert single["content"] == "周六下午三点在咖啡馆见面"
         assert isinstance(detail["names"], dict)
     finally:
         await plugin.terminate()

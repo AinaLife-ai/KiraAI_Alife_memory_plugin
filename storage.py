@@ -106,7 +106,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS job_items (
               id INTEGER PRIMARY KEY, job_id TEXT NOT NULL, kind TEXT NOT NULL,
               target TEXT NOT NULL, action TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
-              created REAL NOT NULL);
+              before TEXT NOT NULL DEFAULT '', created REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS job_item_job ON job_items(job_id);
             CREATE TABLE IF NOT EXISTS vectors (
               id TEXT PRIMARY KEY REFERENCES records(id), model TEXT NOT NULL,
@@ -149,6 +149,11 @@ class Store:
             if "importance" not in columns:
                 db.execute(
                     "ALTER TABLE records ADD COLUMN importance INTEGER NOT NULL DEFAULT 0"
+                )
+            job_item_columns = {r[1] for r in db.execute("PRAGMA table_info(job_items)")}
+            if "before" not in job_item_columns:
+                db.execute(
+                    "ALTER TABLE job_items ADD COLUMN before TEXT NOT NULL DEFAULT ''"
                 )
             fact_columns = {r[1] for r in db.execute("PRAGMA table_info(facts)")}
             if "importance" not in fact_columns:
@@ -1891,9 +1896,11 @@ class Store:
                 )
             ]
 
-    def facts_by_ids(self, ids):
+    def facts_by_ids(self, ids, include_deleted=False):
+        """按 ID 取事实。include_deleted 供审计明细/编辑器查看已撤回的事实。"""
         if not ids:
             return []
+        clause = "" if include_deleted else " AND f.deleted=0"
         with self.connect() as db:
             return [
                 self.row(r)
@@ -1901,7 +1908,7 @@ class Store:
                     "SELECT f.*, coalesce((SELECT max(r.start) FROM records r,"
                     " json_each(f.sources) s WHERE r.id=s.value),0) AS time"
                     " FROM facts f WHERE f.id IN (SELECT value FROM json_each(?))"
-                    " AND f.deleted=0",
+                    + clause,
                     (dump(list(ids)),),
                 )
             ]
@@ -2124,18 +2131,33 @@ class Store:
                 )
             self.bump(db)
         if job_id:
-            self.add_job_items(
-                job_id,
-                [
+            items = []
+            for action in output["actions"]:
+                target = action["target_id"]
+                items.append(
                     {
                         "kind": "fact",
-                        "target": action["target_id"],
+                        "target": target,
                         "action": action["action"],
                         "note": action.get("reason", ""),
+                        "before": by_id[target]["content"] if target in by_id else "",
                     }
-                    for action in output["actions"]
-                ],
-            )
+                )
+                if action["action"] == "merge":
+                    # 被并入的事实也列出来，前端才能显示「A + B → C」的方向
+                    for other in action["source_ids"]:
+                        if other == target or other not in by_id:
+                            continue
+                        items.append(
+                            {
+                                "kind": "fact",
+                                "target": other,
+                                "action": "merged",
+                                "note": target,
+                                "before": by_id[other]["content"],
+                            }
+                        )
+            self.add_job_items(job_id, items)
         return counts
 
     def set_vector(self, record_id, model, revision, vector):
@@ -2204,6 +2226,7 @@ class Store:
                 item["target"],
                 item.get("action", ""),
                 item.get("note", ""),
+                item.get("before", ""),
                 time.time(),
             )
             for item in items
@@ -2213,8 +2236,8 @@ class Store:
             return 0
         with self.connect() as db:
             db.executemany(
-                "INSERT INTO job_items(job_id,kind,target,action,note,created)"
-                " VALUES (?,?,?,?,?,?)",
+                "INSERT INTO job_items(job_id,kind,target,action,note,before,created)"
+                " VALUES (?,?,?,?,?,?,?)",
                 rows,
             )
             # 明细只做近期追溯，顺手清掉过期记录
@@ -2230,7 +2253,7 @@ class Store:
             return [
                 self.row(r)
                 for r in db.execute(
-                    "SELECT kind,target,action,note FROM job_items"
+                    "SELECT kind,target,action,note,before FROM job_items"
                     " WHERE job_id=? ORDER BY id",
                     (job_id,),
                 )

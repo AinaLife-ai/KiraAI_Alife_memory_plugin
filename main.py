@@ -1716,7 +1716,9 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @register.api(method="GET", path="/fact/{fact_id}", auth=True)
     async def api_fact(self, fact_id: str):
-        rows = await self.store.call("facts_by_ids", [fact_id])
+        rows = await self.store.call(
+            "facts_by_ids", [fact_id], include_deleted=True
+        )
         if not rows:
             raise HTTPException(404, "fact not found")
         versions = await self.store.call("versions_of", "fact", fact_id)
@@ -1850,7 +1852,12 @@ class AlifeMemoryPlugin(BasePlugin):
             row["id"]: row
             for row in await self.store.call("records_by_ids", record_ids)
         }
-        facts = {row["id"]: row for row in await self.store.call("facts_by_ids", fact_ids)}
+        facts = {
+            row["id"]: row
+            for row in await self.store.call(
+                "facts_by_ids", fact_ids, include_deleted=True
+            )
+        }
         names = {
             n["id"]: n["name"]
             for n in await self.store.call(
@@ -1872,6 +1879,7 @@ class AlifeMemoryPlugin(BasePlugin):
                     "kind": item["kind"],
                     "action": item["action"],
                     "note": item["note"],
+                    "before": item["before"],
                     "record": records.get(item["target"]),
                     "fact": facts.get(item["target"]),
                 }

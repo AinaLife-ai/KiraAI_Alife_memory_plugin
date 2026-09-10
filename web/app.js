@@ -312,6 +312,7 @@ const JOB_KINDS = {
 const JOB_ACTIONS = {
   archive: "记忆存档",
   compressed: "已并入存档",
+  merged: "并入",
   keep: "保留",
   correct: "修正",
   merge: "合并",
@@ -333,6 +334,11 @@ async function openJob(id) {
   $("#jobTitle").textContent = "任务明细 · " + (JOB_KINDS[job.kind] || job.kind);
   $("#jobMeta").textContent =
     [job.sid, job.detail, date(job.created)].filter(Boolean).join(" · ");
+  const byTarget = {};
+  data.items.forEach((item) => {
+    if (item.fact) byTarget[item.fact.id] = item.fact.content;
+    else if (item.record) byTarget[item.record.id] = item.record.summary;
+  });
   $("#jobItems").innerHTML = data.items.length
     ? data.items
         .map((item, i) => {
@@ -342,6 +348,20 @@ async function openJob(id) {
             : item.fact
               ? item.fact.content
               : "（已不可读取）";
+          // 修正 / 并入：把「改前 → 改后」直接摆出来
+          const shifted =
+            item.action === "merged"
+              ? [item.before, byTarget[item.note] || item.note]
+              : item.action === "correct" && item.before && item.before !== text
+                ? [item.before, text]
+                : null;
+          const arrow = shifted
+            ? '<div class="arrow"><span class="from">' +
+              esc(shifted[0]) +
+              '</span><i>→</i><strong>' +
+              esc(shifted[1]) +
+              "</strong></div>"
+            : "<strong>" + esc(text || "（空）") + "</strong>";
           const meta = item.record
             ? [
                 item.record.permanent ? "永久记忆" : "L" + item.record.level,
@@ -361,12 +381,15 @@ async function openJob(id) {
           return (
             '<div class="task"><div><span class="tag">' +
             esc(JOB_ACTIONS[item.action] || item.action) +
-            "</span> <strong>" +
-            esc(text || "（空）") +
-            '</strong><div class="muted">' +
+            (item.fact && item.fact.deleted && item.action !== "merged"
+              ? '<span class="tag off">已撤回</span>'
+              : "") +
+            "</span> " +
+            arrow +
+            '<div class="muted">' +
             esc(meta) +
-            (item.note && item.kind === "fact"
-              ? '<br>依据：' + esc(item.note)
+            (item.note && item.kind === "fact" && item.action !== "merged"
+              ? "<br>依据：" + esc(item.note)
               : "") +
             "</div></div>" +
             (target
@@ -673,6 +696,14 @@ async function openFact(row) {
   current = { kind: "fact", row };
   $("#editorTitle").textContent = "编辑画像事实";
   $("#editorMeta").textContent = row.subject + " · " + row.sid;
+  $$("#factFields .revoked").forEach((e) => e.remove());
+  if (row.deleted) {
+    const hint = document.createElement("p");
+    hint.className = "notice revoked";
+    hint.textContent =
+      "这条事实已不在上下文中（被审计撤回或合并掉了）。可在下方历史版本里点「恢复此版本」还原。";
+    $("#factFields").prepend(hint);
+  }
   $("#editLabel").textContent = "事实内容";
   $("#editText").value = row.content;
   $("#factFields").classList.remove("hide");
