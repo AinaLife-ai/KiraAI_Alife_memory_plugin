@@ -79,7 +79,7 @@ async def test_followup_recall_returns_new_records_and_tools_continue(tmp_path):
         first = json.loads(
             next(p.content for p in req.user_prompt if p.name == "alife_memory")
         )
-        first_ids = {r["id"] for r in first["related_archives"]}
+        first_ids = {r["a"] for r in first["related_archives"]}
         assert first_ids
         req2 = LLMRequest()
         await plugin.on_request(event, req2)
@@ -87,15 +87,15 @@ async def test_followup_recall_returns_new_records_and_tools_continue(tmp_path):
         # 已经注入过的记忆不再重复返回
         tool = json.loads(await plugin.search_archive(event, keyword="猫", count=2))
         assert tool["ok"] and tool["items"]
-        tool_ids = {r["id"] for r in tool["items"]}
+        tool_ids = {r["i"] for r in tool["items"]}
         assert not tool_ids & first_ids
         tool2 = json.loads(await plugin.search_archive(event, keyword="猫", count=2))
-        assert not {r["id"] for r in tool2["items"]} & (tool_ids | first_ids)
+        assert not {r["i"] for r in tool2["items"]} & (tool_ids | first_ids)
         # 显式重看仍然可以
         tool3 = json.loads(
             await plugin.search_archive(event, keyword="猫", count=2, allow_seen=True)
         )
-        assert {r["id"] for r in tool3["items"]} & (tool_ids | first_ids)
+        assert {r["i"] for r in tool3["items"]} & (tool_ids | first_ids)
     finally:
         await plugin.terminate()
 
@@ -258,11 +258,14 @@ async def test_global_recall_has_provenance_names_and_no_vector_calls(tmp_path):
             next(p.content for p in request.user_prompt if p.name == "alife_memory")
         )
         assert memory["scope"] == "global"
+        # 紧凑形态：条目只带短码，跨会话的来源仍在 names 表里可查
+        assert all(r.get("from") for r in memory["related_archives"])
         assert any(
-            r["sid"] == "test:gm:elsewhere" and r["users"] == ["test:cheng"]
-            for r in memory["related_archives"]
-        )
-        assert all(r["sid"] != "test:gm:noise" for r in memory["related_archives"])
+            n["id"] == "test:gm:elsewhere" for n in memory["names"]
+        ), "跨会话来源要能查到"
+        assert all(
+            n["id"] != "test:gm:noise" for n in memory["names"]
+        ), "被排除的会话不该出现"
         assert any(n["name"] == "阿澄" for n in memory["names"])
         assert "阿澄" not in "".join(p.content for p in request.system_prompt)
         names = json.loads(await plugin.memory_names(event, "阿澄"))["entities"]
@@ -1290,8 +1293,8 @@ async def test_situational_injection_pins_commitments_and_triggers_on_mention(tm
         assert "萤火上周去看了猫" not in contents           # 没提到就不带
         assert "另一个人喜欢甜食" not in contents
         assert set(plain["facts"][0]) == {
-            "category", "subject", "content", "relations", "importance", "src", "t"
-        }
+            "category", "subject", "content", "importance", "src", "t"
+        }  # 空的 relations 不再输出（每轮注入的纯开销）
 
         mentioned = await _injected_block(plugin, make_text_event("萤火最近怎么样"))
         contents = [f["content"] for f in mentioned["facts"]]

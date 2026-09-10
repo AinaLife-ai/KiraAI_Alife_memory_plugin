@@ -96,6 +96,9 @@ class Store:
               merge_pending INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS fact_identity ON facts(sid,subject,fingerprint,deleted);
             CREATE INDEX IF NOT EXISTS fact_subject ON facts(sid,subject,category,deleted);
+            CREATE TABLE IF NOT EXISTS short_ids (
+              short TEXT PRIMARY KEY, real TEXT NOT NULL UNIQUE, created REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS short_id_real ON short_ids(real);
             CREATE TABLE IF NOT EXISTS versions (
               id INTEGER PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL,
               snapshot TEXT NOT NULL, reason TEXT NOT NULL, created REAL NOT NULL);
@@ -1164,6 +1167,56 @@ class Store:
             ),
         )
         return new_id
+
+    # ---- 短码：给模型看的证据编码 ----------------------------------------
+    # 真实 id 形如 legacy-<64位十六进制>（71 字符）或 1-1772...-d8feeb77ac6e。
+    # 又长又容易抄错，所以对外只给 6 位 base36 短码，两个方向都能查。
+    SHORT_LEN = 6
+    _SHORT_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+    def short_id(self, real):
+        """真实 id → 短码（幂等，落库持久化，重启不变）。"""
+        real = str(real or "")
+        if not real:
+            return ""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT short FROM short_ids WHERE real=?", (real,)
+            ).fetchone()
+            if row:
+                return row["short"]
+            for length in range(self.SHORT_LEN, self.SHORT_LEN + 4):
+                for _ in range(8):
+                    short = "".join(
+                        random.choice(self._SHORT_ALPHABET) for _ in range(length)
+                    )
+                    taken = db.execute(
+                        "SELECT 1 FROM short_ids WHERE short=?", (short,)
+                    ).fetchone()
+                    if taken:
+                        continue
+                    db.execute(
+                        "INSERT INTO short_ids(short,real,created) VALUES (?,?,?)",
+                        (short, real, time.time()),
+                    )
+                    return short
+            return real  # 极端情况：回退到真实 id，功能不受影响
+
+    def real_id(self, value):
+        """短码或真实 id → 真实 id；两种都认，找不到就原样返回。"""
+        value = str(value or "")
+        if not value:
+            return ""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT real FROM short_ids WHERE short=?", (value,)
+            ).fetchone()
+            if row:
+                return row["real"]
+            row = db.execute(
+                "SELECT real FROM short_ids WHERE real=?", (value,)
+            ).fetchone()
+            return row["real"] if row else value
 
     def compress(self, sid, candidates, level, output):
         with self.connect() as db:

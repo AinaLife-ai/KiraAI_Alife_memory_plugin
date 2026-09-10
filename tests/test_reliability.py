@@ -172,7 +172,8 @@ def test_weak_legacy_relation_quarantined_and_audit_can_repair(tmp_path):
     from alife_test_plugin.retrieval import bot_facts
 
     # Bot 视图只带经过校验的关系，待审校连线不参与
-    assert bot_facts(rows, "test:dm:u")[0]["relations"] == []
+    # 空 relations 不再输出（每轮注入的纯开销），留待审计修复后再出现
+    assert "relations" not in bot_facts(rows, "test:dm:u")[0]
     good = {"subject": "test:u", "predicate": "朋友", "object": "阿澄"}
     output = c.Audit.model_validate(
         {

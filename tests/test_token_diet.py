@@ -51,8 +51,8 @@ class BotFactsTests(unittest.TestCase):
     def test_keeps_only_decision_and_provenance_fields(self):
         view = r.bot_facts([fact()], "qq:dm:u")[0]
         self.assertEqual(
-            set(view), {"category", "subject", "content", "relations", "importance", "src", "t"}
-        )
+            set(view), {"category", "subject", "content", "importance", "src", "t"}
+        )  # 空的 relations 已省略
         self.assertEqual(view["src"], "rec-1")
         self.assertEqual(view["t"], time.strftime("%Y-%m-%d", time.gmtime(1700000000.0)))
         # 本会话事实不再重复 sid/by

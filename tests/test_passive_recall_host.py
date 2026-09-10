@@ -144,9 +144,9 @@ async def test_passive_recall_includes_archived_other_session(tmp_path):
             summary="聊了些旧事",
         )
         block = await inject(plugin, event, "你还记得我师傅吗")
-        assert '"summary":"我师傅是星月，他跟了三年"' in block
+        assert '"s":"我师傅是星月，他跟了三年"' in block
         plugin.settings.search_active_only = True
-        assert '"summary":"我师傅是星月，他跟了三年"' not in await inject(
+        assert '"s":"我师傅是星月，他跟了三年"' not in await inject(
             plugin, event, "你还记得我师傅吗"
         )
     finally:
