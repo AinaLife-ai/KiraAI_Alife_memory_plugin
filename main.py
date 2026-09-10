@@ -22,6 +22,7 @@ from core.logging_manager import get_logger
 
 from .contracts import (
     ConfigEdit,
+    TrashPurge,
     TrashRestore,
     Edit,
     Fact,
@@ -1847,10 +1848,25 @@ class AlifeMemoryPlugin(BasePlugin):
     async def api_trash_restore(self, request: Request):
         value = await self.body(request, TrashRestore)
         try:
-            restored = await self.store.call("undelete", value.kind, value.target)
+            if value.kind == "cold":
+                restored = await self.store.call("reactivate", value.target)
+            else:
+                restored = await self.store.call("undelete", value.kind, value.target)
         except ValueError:
             raise HTTPException(404, "target not found") from None
         return {"ok": True, "restored": restored}
+
+    @register.api(method="POST", path="/trash/purge", auth=True)
+    async def api_trash_purge(self, request: Request):
+        """彻底删除：高级操作，前端有二次确认；版本与关联一并移除。"""
+        value = await self.body(request, TrashPurge)
+        try:
+            return {
+                "ok": True,
+                "purged": await self.store.call("purge", value.kind, value.target),
+            }
+        except ValueError:
+            raise HTTPException(404, "target not found") from None
 
     @register.api(method="POST", path="/restore", auth=True)
     async def api_restore(self, request: Request):

@@ -425,6 +425,18 @@
         ><button id="nameBatchMissing" class="primary">只补没有名字的</button>
       </div>
     </dialog>
+    <dialog id="purgeDialog" class="dialog">
+      <div class="panel-title"><h2 id="purgeTitle">彻底删除？</h2></div>
+      <p id="purgeBody" class="muted"></p>
+      <div class="notice" id="purgeWarn">
+        彻底删除会同时移除它的<b>版本历史</b>与关联记录，<b>无法恢复</b>，也不再有「恢复此版本」可用。日常清理请用「还原」。
+      </div>
+      <div class="actions">
+        <button id="purgeCancel">取消</button
+        ><button id="purgeNext" class="primary">继续</button
+        ><button id="purgeConfirm" class="danger hide">确认彻底删除</button>
+      </div>
+    </dialog>
     <dialog id="jobDialog" class="dialog">
       <div class="panel-title">
         <h2 id="jobTitle">任务明细</h2>

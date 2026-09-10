@@ -1960,6 +1960,64 @@ class Store:
             self.bump(db)
         return True
 
+    def reactivate(self, record_id):
+        """把冷归档取回上下文：重新参与检索与注入。"""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM records WHERE id=?", (record_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("target not found")
+            if row["deleted"]:
+                raise ValueError("target removed")
+            if not row["cold"] and row["active"]:
+                return False
+            db.execute(
+                "INSERT INTO versions(kind,target,snapshot,reason,created)"
+                " VALUES ('record',?,?,?,?)",
+                (record_id, dump(dict(row)), "从冷归档取回", time.time()),
+            )
+            db.execute(
+                "UPDATE records SET cold=0,active=1,archived_at=0,"
+                "revision=revision+1 WHERE id=?",
+                (record_id,),
+            )
+            self.bump(db)
+        return True
+
+    def purge(self, kind, target):
+        """彻底删除：连版本与关联一起移除，不可恢复（高级操作）。"""
+        table = "facts" if kind == "fact" else "records"
+        version_kind = "fact" if kind == "fact" else "record"
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT id FROM " + table + " WHERE id=?", (target,)
+            ).fetchone()
+            versions = db.execute(
+                "SELECT count(*) FROM versions WHERE kind=? AND target=?",
+                (version_kind, target),
+            ).fetchone()[0]
+            if row is None and not versions:
+                raise ValueError("target not found")
+            if table == "records":
+                # records 被 migration_items 外键引用，先断开再删
+                db.execute(
+                    "UPDATE migration_items SET record_id=NULL WHERE record_id=?",
+                    (target,),
+                )
+                db.execute(
+                    "DELETE FROM edges WHERE parent=? OR child=?", (target, target)
+                )
+                db.execute("DELETE FROM vectors WHERE id=?", (target,))
+            db.execute("DELETE FROM " + table + " WHERE id=?", (target,))
+            db.execute(
+                "DELETE FROM versions WHERE kind=? AND target=?",
+                (version_kind, target),
+            )
+            db.execute("DELETE FROM job_items WHERE target=?", (target,))
+            self.bump(db)
+        return True
+
     def records_by_ids(self, ids):
         """批量取记录概要，供后台任务明细使用。"""
         listing = list(dict.fromkeys(ids))

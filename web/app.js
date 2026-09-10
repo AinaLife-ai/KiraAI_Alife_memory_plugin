@@ -668,13 +668,18 @@ async function loadTrash() {
             meta +
             "</p><footer>" +
             (cold
-              ? '<small>冷归档不会被检索</small>'
+              ? '<button class="primary" data-trashrestore="' +
+                i +
+                '">取回上下文</button>'
               : '<button class="primary" data-trashrestore="' +
                 i +
                 '">还原</button>') +
             '<button data-trashtarget="' +
             i +
-            '">查看与编辑</button></footer></article>'
+            '">查看与编辑</button>' +
+            '<button class="danger" data-trashpurge="' +
+            i +
+            '">彻底删除</button></footer></article>'
           );
         })
         .join("")
@@ -685,10 +690,15 @@ async function loadTrash() {
         guard(async () => {
           const row = data.items[Number(b.dataset.trashrestore)];
           await api("/trash/restore", {
-            kind: trashKind === "facts" ? "fact" : "record",
+            kind:
+              trashKind === "facts"
+                ? "fact"
+                : trashKind === "cold"
+                  ? "cold"
+                  : "record",
             target: row.id,
           });
-          toast("已从回收站还原");
+          toast(trashKind === "cold" ? "已取回上下文" : "已从回收站还原");
           await loadTrash();
         })),
   );
@@ -700,6 +710,16 @@ async function loadTrash() {
           return trashKind === "facts"
             ? openFact({ id: row.id })
             : openRecord(row.id);
+        })),
+  );
+  $$("[data-trashpurge]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        guard(async () => {
+          const row = data.items[Number(b.dataset.trashpurge)];
+          const kind = trashKind === "facts" ? "fact" : "record";
+          const summary = trashKind === "facts" ? row.content : row.summary;
+          await askPurge(kind, row.id, summary);
         })),
   );
   $("#trashPage").textContent =
@@ -735,6 +755,35 @@ $("#trashNext").onclick = () =>
     trashOffset += 50;
     return loadTrash();
   });
+
+function askPurge(kind, target, summary) {
+  return new Promise((resolve) => {
+    const dialog = $("#purgeDialog");
+    $("#purgeTitle").textContent = "彻底删除？";
+    $("#purgeBody").textContent = summary || target;
+    $("#purgeNext").classList.remove("hide");
+    $("#purgeConfirm").classList.add("hide");
+    $("#purgeNext").onclick = () => {
+      // 第二次确认：这一步才真正执行
+      $("#purgeTitle").textContent = "最后确认：不可撤销";
+      $("#purgeNext").classList.add("hide");
+      $("#purgeConfirm").classList.remove("hide");
+    };
+    $("#purgeCancel").onclick = () => {
+      dialog.close();
+      resolve(false);
+    };
+    $("#purgeConfirm").onclick = () =>
+      guard(async () => {
+        await api("/trash/purge", { kind, target });
+        dialog.close();
+        toast("已彻底删除");
+        resolve(true);
+        await loadTrash();
+      });
+    dialog.showModal();
+  });
+}
 
 async function loadFacts() {
   const byContent = $("#factContent").checked;

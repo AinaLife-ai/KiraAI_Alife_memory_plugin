@@ -1637,5 +1637,28 @@ async def test_trash_lists_cold_and_restores(tmp_path):
         assert restored == {"ok": True, "restored": True}
         assert (await plugin.api_trash(kind="facts"))["total"] == 0
         assert [f["id"] for f in store.facts("test:dm:u")] == [fact_id]
+
+        # 冷归档可以取回上下文
+        brought = await plugin.api_trash_restore(
+            json_request({"kind": "cold", "target": record["id"]})
+        )
+        assert brought == {"ok": True, "restored": True}
+        assert (await plugin.api_trash(kind="cold"))["total"] == 0
+        assert store.get(record["id"])["active"] == 1
+
+        # 彻底删除：连版本一起移除，且没有记录时返回 404
+        purged = await plugin.api_trash_purge(
+            json_request({"kind": "fact", "target": fact_id})
+        )
+        assert purged == {"ok": True, "purged": True}
+        assert store.facts_by_ids([fact_id], include_deleted=True) == []
+        assert store.versions_of("fact", fact_id) == []
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as error:
+            await plugin.api_trash_purge(
+                json_request({"kind": "fact", "target": "missing"})
+            )
+        assert error.value.status_code == 404
     finally:
         await plugin.terminate()

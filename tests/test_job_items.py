@@ -298,3 +298,57 @@ class TrashTests(unittest.TestCase):
             db.execute("UPDATE records SET deleted=1 WHERE id=?", (record["id"],))
         assert self.store.get(record["id"]) is None
         assert self.store.get(record["id"], include_deleted=True)["summary"] == "周五去看展"
+
+
+    def test_reactivate_brings_cold_archive_back(self):
+        self.store.capture(
+            "qq:gm:1",
+            "t",
+            [{"role": "user", "content": "周五去看展", "users": ["qq:9"], "time": 2.0}],
+        )
+        record = self.store.active("qq:gm:1")[-1]
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE records SET active=0,cold=1,archived_at=99 WHERE id=?",
+                (record["id"],),
+            )
+        assert self.store.trash("cold")["total"] == 1
+        assert self.store.reactivate(record["id"]) is True
+        row = self.store.get(record["id"])
+        assert row["cold"] == 0 and row["active"] == 1 and row["archived_at"] == 0
+        assert self.store.trash("cold")["total"] == 0
+        reasons = [v["reason"] for v in self.store.versions_of("record", record["id"])]
+        assert "从冷归档取回" in reasons
+
+    def test_purge_removes_row_versions_and_links(self):
+        fact_id = self.add("萤火喜欢猫")
+        self.store.capture(
+            "qq:gm:1",
+            "t2",
+            [{"role": "user", "content": "周五去看展", "users": ["qq:9"], "time": 2.0}],
+        )
+        record = self.store.active("qq:gm:1")[-1]
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE facts SET deleted=1 WHERE id=?", (fact_id,))
+            db.execute(
+                "INSERT INTO versions(kind,target,snapshot,reason,created)"
+                " VALUES ('fact',?,?,'测试',1.0)",
+                (fact_id, "{}"),
+            )
+            # 外键引用的迁移项必须先断开，否则删不掉
+            db.execute(
+                "INSERT INTO migration_items(source,source_key,digest,record_id,reason,"
+                "file_hash,metadata,created) VALUES ('old','k','d',?,'r','h','{}',1.0)",
+                (record["id"],),
+            )
+        assert self.store.purge("fact", fact_id) is True
+        assert self.store.trash("facts")["total"] == 0
+        assert self.store.versions_of("fact", fact_id) == []
+        assert self.store.purge("record", record["id"]) is True
+        assert self.store.get(record["id"], include_deleted=True) is None
+        with self.store.connect() as db:
+            assert db.execute(
+                "SELECT record_id FROM migration_items WHERE source_key='k'"
+            ).fetchone()[0] is None

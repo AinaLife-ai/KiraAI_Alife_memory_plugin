@@ -148,6 +148,11 @@ class Compression(Strict):
 
 
 class TrashRestore(Strict):
+    kind: Literal["fact", "record", "cold"]
+    target: Short
+
+
+class TrashPurge(Strict):
     kind: Literal["fact", "record"]
     target: Short
 
