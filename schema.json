@@ -243,6 +243,36 @@
         "minimum": 60,
         "maximum": 604800
       },
+      "proactive_jitter": {
+        "type": "integer",
+        "name": "主动感知随机偏移（秒）",
+        "default": 0,
+        "description": "在间隔基础上再加一段随机时间，实际间隔 = 间隔 + 0~该值 的随机数。0 表示固定间隔不加随机。",
+        "minimum": 0,
+        "maximum": 86400
+      },
+      "proactive_min_sessions": {
+        "type": "integer",
+        "name": "每轮最少会话数",
+        "default": 1,
+        "description": "每次主动感知至少挑几个会话。会话列表只有一个时无意义。",
+        "minimum": 1,
+        "maximum": 100
+      },
+      "proactive_max_sessions": {
+        "type": "integer",
+        "name": "每轮最多会话数",
+        "default": 0,
+        "description": "每次主动感知最多挑几个会话，0 表示不限（全部触发）。与最少值相等时就是固定个数，不随机。",
+        "minimum": 0,
+        "maximum": 100
+      },
+      "proactive_rotate": {
+        "type": "switch",
+        "name": "轮流挑选会话",
+        "default": false,
+        "description": "关（默认）：每轮从会话列表里纯随机抽取。开：优先挑最久没被触发过的会话（同龄随机），避免长期没轮到。"
+      },
       "proactive_sessions": {
         "type": "list",
         "name": "主动感知会话",
