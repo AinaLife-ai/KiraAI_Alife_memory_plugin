@@ -2,7 +2,7 @@
 
 ## 问题（实测）
 
-宿主 KiraAI 的会话历史本身就是「最近 N 轮原文」（`session_manager.py:251`，`max_memory_length` 默认 50 轮，超了从头部硬砍）。而我们在每轮记忆块里又把**还没压缩的原始记录（L0）**按"最近优先"注入了一遍：
+宿主 KiraAI 的会话历史本身就是「最近 N 轮原文」（`bot_config.bot.max_memory_length`，默认 10 轮；KiraAI v2.34.2 起溢出时还会按 `memory_overflow_discard_count` **成批多丢几条**，并把被丢弃的原文通过 `session_memory_updated` 事件发出来——本插件不依赖该属性，自己那份记忆不受影响）。而我们在每轮记忆块里又把**还没压缩的原始记录（L0）**按"最近优先"注入了一遍：
 
 | 状态 | 注入块 | 其中与宿主历史重复 |
 | --- | --- | --- |
