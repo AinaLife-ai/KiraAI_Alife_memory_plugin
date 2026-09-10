@@ -62,3 +62,23 @@ class MigrationCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_search_active_only_flips_only_when_untouched():
+    """v2.6.0 翻转的默认值：老配置要被带过去，用户自己设过的不动。"""
+    current = {
+        "alife": {"search_active_only": True, "threshold": 120},
+        "alife_meta": {"config_version": 2},
+    }
+    changed, updated = m.migrate(current)
+    assert changed == ["search_active_only"]
+    assert updated["alife"]["search_active_only"] is False
+    assert updated["alife"]["threshold"] == 120  # 其它自定义保持不变
+
+    # 用户若是刻意设回 true（而不是停留旧默认），不该被改写：
+    # 迁移只在「配置版本落后 + 值等于旧默认」时生效，版本已是最新就等于不再动它。
+    settled = {
+        "alife": {"search_active_only": True},
+        "alife_meta": {"config_version": m.CURRENT_VERSION},
+    }
+    assert m.migrate(settled) == ([], settled)
