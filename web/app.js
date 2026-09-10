@@ -283,7 +283,9 @@ function tasksHtml(jobs) {
                 ? "旧任务超时：可减小批次、提高超时或更换模型后重新排队。"
                 : j.detail || date(j.created),
             ) +
-            '</small></div><span class="state-' +
+            '</small></div><div class="actions"><button data-job="' +
+            esc(j.id) +
+            '">明细</button></div><span class="state-' +
             esc(j.state) +
             '">' +
             esc(
@@ -299,6 +301,96 @@ function tasksHtml(jobs) {
         .join("")
     : empty("暂时没有后台任务");
 }
+const JOB_KINDS = {
+  compress: "分层压缩",
+  audit: "事实审计",
+  reindex: "语义索引",
+  classify: "记忆归类",
+  dedupe: "永久记忆合并",
+  proactive: "主动感知",
+};
+const JOB_ACTIONS = {
+  archive: "记忆存档",
+  compressed: "已并入存档",
+  keep: "保留",
+  correct: "修正",
+  merge: "合并",
+  retract: "撤回",
+};
+function bindJobButtons() {
+  $$("[data-job]").forEach(
+    (b) => (b.onclick = (e) => {
+      e.stopPropagation();
+      guard(() => openJob(b.dataset.job));
+    }),
+  );
+}
+async function openJob(id) {
+  const data = await api("/job/" + encodeURIComponent(id));
+  const names = data.names || {};
+  const label = (value) => (names[value] ? names[value] + " · " + value : value);
+  const job = data.job;
+  $("#jobTitle").textContent = "任务明细 · " + (JOB_KINDS[job.kind] || job.kind);
+  $("#jobMeta").textContent =
+    [job.sid, job.detail, date(job.created)].filter(Boolean).join(" · ");
+  $("#jobItems").innerHTML = data.items.length
+    ? data.items
+        .map((item, i) => {
+          const target = item.record || item.fact;
+          const text = item.record
+            ? item.record.summary
+            : item.fact
+              ? item.fact.content
+              : "（已不可读取）";
+          const meta = item.record
+            ? [
+                item.record.permanent ? "永久记忆" : "L" + item.record.level,
+                date(item.record.start) + " — " + date(item.record.end),
+                label(item.record.sid),
+                item.record.users.map(label).join(" · "),
+              ]
+                .filter(Boolean)
+                .join(" · ")
+            : item.fact
+              ? [
+                  label(item.fact.subject),
+                  labels[item.fact.category] || item.fact.category,
+                  "重要度 " + item.fact.importance,
+                ].join(" · ")
+              : "";
+          return (
+            '<div class="task"><div><span class="tag">' +
+            esc(JOB_ACTIONS[item.action] || item.action) +
+            "</span> <strong>" +
+            esc(text || "（空）") +
+            '</strong><div class="muted">' +
+            esc(meta) +
+            (item.note && item.kind === "fact"
+              ? '<br>依据：' + esc(item.note)
+              : "") +
+            "</div></div>" +
+            (target
+              ? '<button data-jobitem="' + i + '">查看与编辑</button>'
+              : "") +
+            "</div>"
+          );
+        })
+        .join("")
+    : empty("这次任务没有留下明细");
+  $$("[data-jobitem]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        guard(() => {
+          const item = data.items[Number(b.dataset.jobitem)];
+          $("#jobDialog").close();
+          if (item.kind === "fact" && item.fact) return openFact({ id: item.fact.id });
+          if (item.record) return openRecord(item.record.id);
+        })),
+  );
+  $("#jobDialog").showModal();
+}
+$("#closeJob").onclick = () => $("#jobDialog").close();
+
 async function poll() {
   try {
     const next = await api("/status");
@@ -370,7 +462,9 @@ async function poll() {
           .join("")
       : empty("记忆空间已准备好");
     $("#recent").innerHTML = tasksHtml(next.jobs.slice(0, 3));
+    bindJobButtons();
     $("#jobs").innerHTML = tasksHtml(next.jobs);
+    bindJobButtons();
     for (const id of ["session", "jobSession"]) {
       const e = $("#" + id),
         value = e.value;
@@ -978,14 +1072,19 @@ function spawnMeteor(front) {
   const layer = front ? $("#fxFront") : $("#fxStars");
   if (!layer) return;
   const hue = FX_HUES[Math.floor(Math.random() * FX_HUES.length)];
-  const angle = 16 + Math.random() * 20;
-  const travelX = 45 + Math.random() * 45;
-  const travelY = travelX * Math.tan((angle * Math.PI) / 180) * 0.55;
+  // 方向：0°=向右、90°=正下、180°=向左 —— 取 0~180 就永远不会向上飞
+  const angle = 8 + Math.random() * 164;
+  const rad = (angle * Math.PI) / 180;
+  const distance = front ? 70 + Math.random() * 45 : 55 + Math.random() * 45;
+  const travelX = Math.cos(rad) * distance;
+  const travelY = Math.sin(rad) * distance * 0.6;
+  // 起点随方向换边：向右飞从左侧入场、向左飞从右侧入场，纵向都偏上
+  const fromLeft = Math.cos(rad) >= 0;
   const node = document.createElement("div");
   node.className = "meteor";
   node.style.cssText =
-    "left:" + (-12 + Math.random() * 66).toFixed(1) + "vw;" +
-    "top:" + (-12 + Math.random() * 44).toFixed(1) + "vh;" +
+    "left:" + (fromLeft ? -18 + Math.random() * 44 : 56 + Math.random() * 44).toFixed(1) + "vw;" +
+    "top:" + (-16 + Math.random() * 36).toFixed(1) + "vh;" +
     "--fx-hue:" + hue + ";" +
     "--fx-angle:" + angle.toFixed(1) + "deg;" +
     "--fx-dx:" + travelX.toFixed(1) + "vw;" +

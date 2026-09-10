@@ -1837,6 +1837,48 @@ class AlifeMemoryPlugin(BasePlugin):
             raise HTTPException(404, "entity not found")
         return result
 
+    @register.api(method="GET", path="/job/{job_id}", auth=True)
+    async def api_job_detail(self, job_id: str):
+        """后台任务明细：这次压缩/审计具体处理了哪几条，能直接跳去编辑。"""
+        job = await self.store.call("jobs_by_id", job_id)
+        if job is None:
+            raise HTTPException(404, "job not found")
+        items = await self.store.call("job_items", job_id)
+        record_ids = [i["target"] for i in items if i["kind"] == "record"]
+        fact_ids = [i["target"] for i in items if i["kind"] == "fact"]
+        records = {
+            row["id"]: row
+            for row in await self.store.call("records_by_ids", record_ids)
+        }
+        facts = {row["id"]: row for row in await self.store.call("facts_by_ids", fact_ids)}
+        names = {
+            n["id"]: n["name"]
+            for n in await self.store.call(
+                "entities",
+                ids={
+                    *(row["sid"] for row in records.values()),
+                    *(user for row in records.values() for user in row["users"]),
+                    *(row["subject"] for row in facts.values()),
+                },
+                limit=1000,
+            )
+            if n["name"]
+        }
+        return {
+            "job": job,
+            "names": names,
+            "items": [
+                {
+                    "kind": item["kind"],
+                    "action": item["action"],
+                    "note": item["note"],
+                    "record": records.get(item["target"]),
+                    "fact": facts.get(item["target"]),
+                }
+                for item in items
+            ],
+        }
+
     @register.api(method="POST", path="/jobs", auth=True)
     async def api_job(self, request: Request):
         value = await self.body(request, Job)

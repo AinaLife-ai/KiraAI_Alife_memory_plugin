@@ -134,6 +134,16 @@ def restore_compress_ids(output, aliases):
     return output
 
 
+def compress_summary(steps):
+    """压缩任务详情：压缩了几批、每批多少条进了哪一层。"""
+    if not steps:
+        return "本次没有需要压缩的内容"
+    parts = ["%d 条 → L%d" % (step["count"], step["level"]) for step in steps[:3]]
+    if len(steps) > 3:
+        parts.append("等 %d 批" % len(steps))
+    return "压缩 " + " · ".join(parts)
+
+
 def audit_summary(counts):
     """后台任务列表里显示审计做了什么：保留/修正/合并/撤回各多少。"""
     if not isinstance(counts, dict):
@@ -381,27 +391,31 @@ class Engine:
                     " 上次输出被拒绝：" + detail + "。请完整重写，保持Schema不变。"
                 )
 
-    async def compress(self, sid):
+    async def compress(self, sid, job_id=None):
         # A job drains the cascade with a finite cap; the scheduler resumes backlog.
         started_at = time.time()
+        steps = []
         try:
-            await self._compress_cascade(sid)
+            await self._compress_cascade(sid, steps, job_id)
         finally:
             # Facts written by any path above still need the duplicate scan.
             try:
                 await self.queue_fact_merges(sid, started_at)
             except Exception:
                 logger.exception("[记忆·Z] 事实重复扫描失败，本次压缩结果不受影响")
+        return steps
 
-    async def _compress_cascade(self, sid):
+    async def _compress_cascade(self, sid, steps=None, job_id=None):
+        if steps is None:
+            steps = []
         for _ in range(64):
             cfg = self.settings()
             if not cfg.enabled:
-                return
+                return steps
             rows = await self.store.call("active", sid)
             plan = compression_plan(rows, cfg)
             if plan is None:
-                return
+                return steps
             candidates, level = plan
             # Bound complete records in one pass, never truncate evidence or fabricate a level.
             used, count = 0, 0
@@ -488,7 +502,37 @@ class Engine:
             record_id = await self.store.call(
                 "compress", sid, candidates, level, output
             )
-            logger.info(
+            steps.append(
+                {
+                    "count": len(candidates),
+                    "level": level,
+                    "archive": record_id,
+                    "ids": [row["id"] for row in candidates],
+                }
+            )
+            if job_id:
+                await self.store.call(
+                    "add_job_items",
+                    job_id,
+                    [
+                        {
+                            "kind": "record",
+                            "target": record_id,
+                            "action": "archive",
+                            "note": "压缩 %d 条 → L%d" % (len(candidates), level),
+                        },
+                        *[
+                            {
+                                "kind": "record",
+                                "target": row["id"],
+                                "action": "compressed",
+                                "note": "并入 %s" % record_id,
+                            }
+                            for row in candidates
+                        ],
+                    ],
+                )
+            logger.debug(
                 "[记忆·Z] 压缩完成：%d 条 → L%d，原文已保留", len(candidates), level
             )
             if cfg.semantic_enabled:
@@ -505,7 +549,7 @@ class Engine:
                     "set_vector", record_id, model, row["revision"], vector
                 )
 
-    async def audit(self, sid):
+    async def audit(self, sid, job_id=None):
         cfg = self.settings()
         candidates = await self.store.call(
             "audit_candidates",
@@ -567,7 +611,9 @@ class Engine:
         )
         counts = {"scanned": len(candidates)}
         if self.settings() == cfg:
-            counts.update(await self.store.call("audit", candidates, output))
+            counts.update(
+                await self.store.call("audit", candidates, output, job_id or "")
+            )
         return counts
 
     CROSS_SESSION_CATEGORIES = ("profile", "preference", "relationship")
@@ -923,16 +969,21 @@ class Engine:
             detail = ""
             try:
                 if job["kind"] == "compress":
-                    await self.compress(job["sid"])
+                    steps = await self.compress(job["sid"], job["id"])
+                    detail = compress_summary(steps)
                 elif job["kind"] == "proactive":
                     if cfg.proactive_enabled and job["sid"] in cfg.proactive_sessions:
                         await self.notice(job["sid"])
+                        detail = "已唤起 Bot 自行判断是否跟进"
                 elif job["kind"] == "audit":
-                    counts = await self.audit(job["sid"])
+                    counts = await self.audit(job["sid"], job["id"])
                     detail = audit_summary(counts)
-                    logger.info("[记忆·Z] 审计完成：%s", detail)
                 elif job["kind"] == "dedupe":
-                    await self.consolidate(job["sid"])
+                    report = await self.consolidate(job["sid"])
+                    detail = "常驻 %d 条 · 合并 %d 簇" % (
+                        report.get("permanent", 0),
+                        report.get("merged", 0),
+                    )
                 elif job["kind"] == "classify":
                     row = await self.store.call("get", job["sid"])
                     if row:
