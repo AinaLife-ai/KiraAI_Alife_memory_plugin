@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import random
 import time
 from pathlib import Path
@@ -398,6 +399,7 @@ class AlifeMemoryPlugin(BasePlugin):
                     **prefer,
                 )
             )
+        entity_hits = len(triggered)
         if keyword_hit:
             # 触发词（记得/之前/上次）：把范围放宽一档，按重要度取本会话事实。
             triggered.extend(
@@ -417,10 +419,48 @@ class AlifeMemoryPlugin(BasePlugin):
                     **prefer,
                 )
             )
+        keyword_hits = len(triggered) - entity_hits
+        if cfg.fact_recall_min_score and query.strip():
+            # 内容匹配：消息里出现的词直接命中事实内容。
+            # 只按类别/实体召回会漏掉「事实内容里有这个词、但主体和名字都没出现」的情况
+            # （例：问「你师傅是谁」→ 事实「我师傅是星月」）。软删与待合并的自然被排除。
+            triggered.extend(
+                await self.store.call(
+                    "facts",
+                    sid,
+                    subject="",
+                    category="",
+                    limit=cfg.top_k,
+                    offset=0,
+                    global_scope=cfg.recall_scope == "global",
+                    users=users,
+                    include_shared=True,
+                    hide_pending=cfg.merge_pending_hide,
+                    importance_first=True,
+                    lexical=query,
+                    min_score=cfg.fact_recall_min_score,
+                    prefer_subjects=tuple(subjects),
+                    **prefer,
+                )
+            )
+        lexical_hits = len(triggered) - entity_hits - keyword_hits
         merged = {}
         for fact in [*pinned, *triggered]:
             merged.setdefault(fact["id"], fact)
-        return list(merged.values())
+        values = list(merged.values())
+        # 调门槛时看这一行：哪条通道带回来多少条（DEBUG 级别才输出）
+        logger.debug(
+            "[记忆·Z] 被动召回 %s：常驻 %d / 实体 %d / 触发词 %d / 内容匹配 %d"
+            "（去重后 %d 条，门槛 %d）",
+            sid,
+            len(pinned),
+            entity_hits,
+            keyword_hits,
+            lexical_hits,
+            len(values),
+            cfg.fact_recall_min_score,
+        )
+        return values
 
     async def model_call(self, model, purpose, instruction, schema, payload):
         client = (
@@ -1282,7 +1322,7 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @register.tool(
         name="SearchMemoryArchive",
-        description="按关键词、层级、时间范围搜索存档；默认只搜常驻上下文，需要翻已归档的旧记忆时传 include_archived=true。prompt 默认本地词语匹配排序，可翻页并返回总数。",
+        description="按关键词、层级、时间范围搜索存档；默认连已归档的旧记忆一起搜，若设置里开启了「检索默认只搜常驻」，则需传 include_archived=true 才能翻到旧记忆。prompt 默认本地词语匹配排序，可翻页并返回总数。",
         params={
             "type": "object",
             "properties": {
@@ -1383,8 +1423,8 @@ class AlifeMemoryPlugin(BasePlugin):
                 model=model,
                 lexical=q.prompt if not vector else "",
                 exclude_ids=excluded,
-                # Archived memories are hidden unless explicitly requested;
-                # cold archives are never searchable.
+                # 归档是否参与由设置决定（默认参与，召回更全）；
+                # 冷归档与软删永远搜不到。
                 active=self.settings.search_active_only and not include_archived,
                 cold_after_days=self.settings.cold_after_days,
             )

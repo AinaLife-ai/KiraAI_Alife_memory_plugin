@@ -424,11 +424,17 @@
         "minimum": 1,
         "maximum": 10
       },
+      "fact_recall_min_score": {
+        "type": "integer",
+        "name": "事实内容匹配门槛",
+        "default": 2,
+        "description": "被动召回时，消息内容与事实内容的词面匹配分门槛。中文按 2 字切分，命任一双字片段=2分。默认 2（命中即可召回）；调高更干净但会漏（例如只提到「师傅」两字时会被挡掉）；填 0 关闭内容匹配，回到只按类别与实体召回。"
+      },
       "search_active_only": {
         "type": "switch",
         "name": "检索默认只搜常驻",
-        "default": true,
-        "description": "开启后，记忆检索默认只搜常驻上下文（近期原文、活跃摘要、永久记忆）；已归档的旧记忆需要显式 include_archived=true 才会返回。关闭则默认连归档一起搜。"
+        "default": false,
+        "description": "关闭（默认）时连已归档的旧记忆一起搜，被动召回更全；开启后只搜常驻上下文（近期原文、活跃摘要、永久记忆），已归档的旧记忆需要显式 include_archived=true 才会返回。冷归档、软删与超龄淡出不受此开关影响。"
       },
       "cold_after_days": {
         "type": "integer",

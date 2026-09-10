@@ -276,7 +276,8 @@ class Settings(Strict):
     permanent_dedupe: bool = True
     dedupe_force_merge: bool = True
     dedupe_threshold: float = Field(default=0.25, ge=0.1, le=0.95)
-    search_active_only: bool = True
+    fact_recall_min_score: int = Field(default=2, ge=0, le=20)
+    search_active_only: bool = False
     cold_after_days: int = Field(default=180, ge=0, le=3650)
     fact_merge_enabled: bool = True
     fact_merge_threshold: float = Field(default=0.25, ge=0.1, le=0.95)

@@ -1697,6 +1697,9 @@ class Store:
                     lambda text: relevance(lexical, text),
                 )
                 clauses.append("lexical_score(summary)>0")
+            # 归档也参与召回时，同分让常驻的排在前面：
+            # 旧原文和新摘要词面打平时，先给模型看「还在上下文里」的那条。
+            active_tier = "" if active else "CASE WHEN active=1 THEN 0 ELSE 1 END,"
             where = " AND ".join(clauses)
             total = db.execute(
                 "SELECT count(*) FROM records WHERE " + where, args
@@ -1725,7 +1728,7 @@ class Store:
                     "SELECT * FROM records WHERE "
                     + where
                     + (
-                        f" ORDER BY {tier_sql}lexical_score(summary) DESC,end,id LIMIT ? OFFSET ?"
+                        f" ORDER BY {tier_sql}lexical_score(summary) DESC,{active_tier}end,id LIMIT ? OFFSET ?"
                         if lexical
                         else f" ORDER BY {tier_sql}end,id LIMIT ? OFFSET ?"
                     ),
@@ -1750,6 +1753,7 @@ class Store:
         prefer_subjects=(),
         hide_pending=False,
         importance_first=False,
+        min_score=0,
     ):
         where, args = ["deleted=0"], []
         if hide_pending:
@@ -1794,7 +1798,14 @@ class Store:
                 db.create_function(
                     "fact_score", 1, lambda text: relevance(lexical, text)
                 )
-                where.append("fact_score(content)>0")
+                # min_score 是「内容匹配」门槛：中文按 2 字切分，任一双字片段命中 = 2 分。
+                # 默认只要求 >0；调用方（被动召回）用更高门槛挡掉「今天/喜欢」这类常见词。
+                threshold = max(1, int(min_score or 0))
+                if threshold > 1:
+                    where.append("fact_score(content)>=?")
+                    args.append(threshold)
+                else:
+                    where.append("fact_score(content)>0")
             return [
                 self.row(r)
                 for r in db.execute(
