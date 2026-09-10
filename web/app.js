@@ -283,7 +283,7 @@ function tasksHtml(jobs) {
                 ? "旧任务超时：可减小批次、提高超时或更换模型后重新排队。"
                 : j.detail || date(j.created),
             ) +
-            '</small></div><div class="actions"><button data-job="' +
+            '</small></div><div class="actions"><button data-jobdetail="' +
             esc(j.id) +
             '">明细</button></div><span class="state-' +
             esc(j.state) +
@@ -319,7 +319,8 @@ const JOB_ACTIONS = {
   retract: "撤回",
 };
 function bindJobButtons() {
-  $$("[data-job]").forEach(
+  // 注意：只绑明细按钮。手动排队按钮用的是 data-job，混用会把它们的点击覆盖掉。
+  $$("[data-jobdetail]").forEach(
     (b) => (b.onclick = (e) => {
       e.stopPropagation();
       guard(() => openJob(b.dataset.job));
