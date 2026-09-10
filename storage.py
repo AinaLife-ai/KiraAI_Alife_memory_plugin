@@ -2035,6 +2035,7 @@ class Store:
     def audit(self, candidates, output):
         by_id = {r["id"]: r for r in candidates}
         validate_audit(candidates, output)
+        counts = {"keep": 0, "correct": 0, "merge": 0, "retract": 0, "merged_facts": 0}
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             for old in candidates:
@@ -2046,6 +2047,9 @@ class Store:
             for a in output["actions"]:
                 old = by_id[a["target_id"]]
                 group = {a["target_id"], *a["source_ids"]}
+                counts[a["action"]] += 1
+                if a["action"] == "merge":
+                    counts["merged_facts"] += len(group) - 1
                 db.execute(
                     "INSERT INTO versions(kind,target,snapshot,reason,created) VALUES ('fact',?,?,?,?)",
                     (old["id"], dump(old), a["reason"], time.time()),
@@ -2097,6 +2101,7 @@ class Store:
                     "UPDATE facts SET audited=? WHERE id=?", (time.time(), old["id"])
                 )
             self.bump(db)
+        return counts
 
     def set_vector(self, record_id, model, revision, vector):
         if not vector or any(

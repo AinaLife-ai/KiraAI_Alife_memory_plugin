@@ -77,6 +77,22 @@ MERGE_PLUGINS = (
 )
 
 
+def schema_labels():
+    """schema.json 里的中文字段名：前端优先用它，避免新配置显示成英文键名。"""
+    try:
+        data = json.loads(
+            (Path(__file__).parent / "schema.json").read_text(encoding="utf-8")
+        )
+        fields = data.get("alife", {}).get("fields", {})
+        return {
+            key: value["name"]
+            for key, value in fields.items()
+            if isinstance(value, dict) and value.get("name")
+        }
+    except Exception:
+        return {}
+
+
 def _log_migration_failure(task):
     if task.cancelled():
         return
@@ -1618,6 +1634,7 @@ class AlifeMemoryPlugin(BasePlugin):
             "revision": revision(self.settings),
             "settings": self.settings.model_dump(),
             "schema": Settings.model_json_schema(),
+            "labels": schema_labels(),
             "help": HELP,
         }
 
@@ -1707,12 +1724,24 @@ class AlifeMemoryPlugin(BasePlugin):
 
     @register.api(method="GET", path="/facts", auth=True)
     async def api_facts(
-        self, sid: str = "", subject: str = "", category: str = "", offset: int = 0
+        self,
+        sid: str = "",
+        subject: str = "",
+        category: str = "",
+        keyword: str = "",
+        offset: int = 0,
     ):
-        if offset < 0:
-            raise HTTPException(422, "invalid offset")
+        if offset < 0 or len(keyword) > 500:
+            raise HTTPException(422, "invalid fact query")
         rows = await self.store.call(
-            "facts", sid, subject, category, 100, offset, not bool(sid)
+            "facts",
+            sid,
+            subject,
+            category,
+            100,
+            offset,
+            not bool(sid),
+            lexical=keyword,
         )
         ids = {f["subject"] for f in rows} | {
             r[k] for f in rows for r in f["relations"] for k in ("subject", "object")

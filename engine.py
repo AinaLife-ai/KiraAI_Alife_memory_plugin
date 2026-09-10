@@ -134,6 +134,29 @@ def restore_compress_ids(output, aliases):
     return output
 
 
+def audit_summary(counts):
+    """后台任务列表里显示审计做了什么：保留/修正/合并/撤回各多少。"""
+    if not isinstance(counts, dict):
+        return "本次审计 %s 条事实" % counts
+    scanned = counts.get("scanned", 0)
+    parts = []
+    if counts.get("correct"):
+        parts.append("修正 %d" % counts["correct"])
+    if counts.get("merge"):
+        merged = counts.get("merged_facts", 0)
+        parts.append(
+            "合并 %d 组" % counts["merge"] + ("（并入 %d 条）" % merged if merged else "")
+        )
+    if counts.get("retract"):
+        parts.append("撤回 %d" % counts["retract"])
+    if not parts:
+        return "本次审计 %d 条：全部保留" % scanned
+    return "本次审计 %d 条：保留 %d · " % (
+        scanned,
+        counts.get("keep", 0),
+    ) + " · ".join(parts)
+
+
 def enforce_limits(result, content_limit, reason_limit):
     """Configurable hard limits; Pydantic field limits are static."""
     if len(result.get("content", "")) > content_limit:
@@ -542,9 +565,10 @@ class Engine:
             },
             cfg,
         )
+        counts = {"scanned": len(candidates)}
         if self.settings() == cfg:
-            await self.store.call("audit", candidates, output)
-        return len(candidates)
+            counts.update(await self.store.call("audit", candidates, output))
+        return counts
 
     CROSS_SESSION_CATEGORIES = ("profile", "preference", "relationship")
 
@@ -904,8 +928,9 @@ class Engine:
                     if cfg.proactive_enabled and job["sid"] in cfg.proactive_sessions:
                         await self.notice(job["sid"])
                 elif job["kind"] == "audit":
-                    audited = await self.audit(job["sid"])
-                    detail = "本次审计 %s 条事实" % audited
+                    counts = await self.audit(job["sid"])
+                    detail = audit_summary(counts)
+                    logger.info("[记忆·Z] 审计完成：%s", detail)
                 elif job["kind"] == "dedupe":
                     await self.consolidate(job["sid"])
                 elif job["kind"] == "classify":

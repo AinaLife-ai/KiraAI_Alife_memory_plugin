@@ -227,3 +227,79 @@ class AuditPayloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuditSummaryTests(unittest.TestCase):
+    def test_summary_lists_actions(self):
+        e = importlib.import_module("alife_diet_test.engine")
+        self.assertEqual(
+            e.audit_summary({"scanned": 20, "keep": 20}), "本次审计 20 条：全部保留"
+        )
+        self.assertEqual(
+            e.audit_summary(
+                {"scanned": 20, "keep": 15, "correct": 3, "merge": 2, "merged_facts": 2, "retract": 1}
+            ),
+            "本次审计 20 条：保留 15 · 修正 3 · 合并 2 组（并入 2 条） · 撤回 1",
+        )
+        self.assertIn("撤回 1", e.audit_summary({"scanned": 5, "keep": 4, "retract": 1}))
+
+
+class AuditStatsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = s.Store(Path(self.temp.name) / "m.db")
+        self.store.initialize()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def fact(self, content="萤火喜欢猫", subject="qq:9"):
+        self.store.capture(
+            "qq:gm:1", "t", [{"role": "user", "content": content, "users": [subject], "time": 1.0}]
+        )
+        record = self.store.active("qq:gm:1")[-1]
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return self.store._add_fact(
+                db,
+                "qq:gm:1",
+                {
+                    "category": "preference",
+                    "subject": subject,
+                    "content": content,
+                    "reason": "",
+                    "scenario": "",
+                    "tags": [],
+                    "relations": [],
+                    "source_ids": [record["id"]],
+                },
+            )
+
+    def test_audit_reports_counts_and_retract_hides_fact(self):
+        a = self.fact("萤火喜欢猫")
+        b = self.fact("萤火喜欢猫粮")
+        candidates = self.store.facts("qq:gm:1")
+        output = {
+            "actions": [
+                {
+                    "action": "keep",
+                    "target_id": a,
+                    "source_ids": [a],
+                    "content": "萤火喜欢猫",
+                    "reason": "证据一致",
+                },
+                {
+                    "action": "retract",
+                    "target_id": b,
+                    "source_ids": [b],
+                    "content": "萤火喜欢猫粮",
+                    "reason": "与上一条重复",
+                },
+            ]
+        }
+        counts = self.store.audit(candidates, output)
+        self.assertEqual(counts["keep"], 1)
+        self.assertEqual(counts["retract"], 1)
+        self.assertEqual(counts["merge"], 0)
+        left = [f["id"] for f in self.store.facts("qq:gm:1")]
+        self.assertEqual(left, [a])
