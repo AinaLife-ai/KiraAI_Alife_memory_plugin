@@ -327,3 +327,38 @@ class MergeCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_fact_merge_records_job_items_for_detail_view(tmp_path):
+    """合并要留下明细：哪几条并进了哪一条（前端据此渲染「旧 → 新」）。"""
+    store = s.Store(tmp_path / "db")
+    store.initialize()
+    case = MergeCase("seed")
+    case.store = store
+    case.calls = []
+    case.setUp = lambda: None
+    case.tearDown = lambda: None
+    ids = case.seed()
+    job_id = store.enqueue("fact_merge", "qq:gm:1")
+    store.claim(kind="fact_merge")
+
+    async def model(*args):
+        case.calls.append(args)
+        return MergeCase.merge_reply(args[-1])
+
+    engine = e.Engine(store, lambda: c.Settings(), model, None, None)
+    run(engine.queue_fact_merges("qq:gm:1", 0))  # 先标出待合并簇
+    run(engine.merge_facts("qq:gm:1", job_id))
+
+    items = store.job_items(job_id)
+    assert items, "事实合并必须写明细，否则前端点开是空的"
+    actions = {item["action"] for item in items}
+    assert actions == {"keep", "merged"}
+    target = next(item for item in items if item["action"] == "keep")
+    assert target["kind"] == "fact"
+    folded = [item for item in items if item["action"] == "merged"]
+    assert len(folded) == 1
+    # 被并入的那条带着原文，note 指向保留的那条 → 前端能画出「旧 → 新」
+    assert folded[0]["before"] == "萤火对花生过敏"
+    assert folded[0]["note"] == target["target"]
+    assert store.facts_by_ids([target["target"]])[0]["deleted"] == 0

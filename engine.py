@@ -55,6 +55,24 @@ AUDIT_INSTRUCTION = (
     "软删除后不再进入上下文，但原文与版本都保留、可以恢复；reason 写清为什么该删。"
 )
 
+# 后台任务的显示名（日志用；前端有一份同名映射，保持措辞一致）
+JOB_LABELS = {
+    "compress": "分层压缩",
+    "audit": "事实审计",
+    "reindex": "语义索引",
+    "classify": "记忆归类",
+    "dedupe": "永久记忆合并",
+    "fact_merge": "事实合并",
+    "proactive": "主动感知",
+}
+
+
+def preview(text, limit=24):
+    """日志里的内容预览：比截断的 id 有用得多。"""
+    text = " ".join(str(text or "").split())
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
 DEDUPE_CONSERVATIVE_INSTRUCTION = (
     "records 按时间从新到旧排列，records[0] 是最新的那条。"
     "只输出一个 action：keep 或 merge。"
@@ -300,7 +318,9 @@ def failure_detail(exc):
         )
     if isinstance(exc, ValueError):
         return "ValueError: " + diagnostic(exc)
-    return type(exc).__name__
+    # 只给类名等于没说（"NameError" 完全无法排查）；带上消息并截断
+    message = str(exc).strip()
+    return ("%s: %s" % (type(exc).__name__, message))[:200] if message else type(exc).__name__
 
 
 class Engine:
@@ -781,7 +801,7 @@ class Engine:
             groups.setdefault(find(row["id"]), []).append(row)
         return [group for group in groups.values() if len(group) > 1]
 
-    async def merge_facts(self, sid):
+    async def merge_facts(self, sid, job_id=None):
         """Merge the pending fact clusters of one session (write-time dedupe)."""
         cfg = self.settings()
         if not cfg.fact_merge_enabled:
@@ -823,6 +843,7 @@ class Engine:
             # fact hidden forever.
             await self.store.call("mark_merge_pending", leftovers, 0)
         merged = 0
+        items = []  # 明细累计（跨批次），最后一次性写入任务
         for start in range(0, len(clusters), max(1, cfg.fact_merge_batch_clusters)):
             batch = clusters[start : start + max(1, cfg.fact_merge_batch_clusters)]
             # 组内用 g{组号}-{序号} 短别名，模型回填后还原成真实 id
@@ -894,6 +915,7 @@ class Engine:
                 ]
             if self.settings() != cfg:
                 return merged
+            # 明细：哪几条并进了哪条（前端据此渲染「旧 → 新」）
             for group, verdict in verdicts:
                 target = next(r for r in group if r["id"] == verdict["target_id"])
                 new_sid = (
@@ -913,6 +935,32 @@ class Engine:
                         new_sid,
                     )
                     merged += 1
+                    items.append(
+                        {
+                            "kind": "fact",
+                            "target": verdict["target_id"],
+                            "action": "keep",
+                            "note": "",
+                        }
+                    )
+                    for row in group:
+                        if row["id"] == verdict["target_id"]:
+                            continue
+                        items.append(
+                            {
+                                "kind": "fact",
+                                "target": row["id"],
+                                "action": "merged",
+                                "note": verdict["target_id"],
+                                "before": row["content"],
+                            }
+                        )
+                    logger.info(
+                        "[记忆·Z] 合并 %s 条事实 → %s（%s）",
+                        len(group) - 1,
+                        await self.store.call("short_id", verdict["target_id"]),
+                        preview(verdict["content"]),
+                    )
                 except Exception as exc:
                     # A concurrent edit must not leave the group hidden forever.
                     logger.warning(
@@ -922,6 +970,8 @@ class Engine:
                     await self.store.call(
                         "mark_merge_pending", [row["id"] for row in group], 0
                     )
+            if job_id and items:
+                await self.store.call("add_job_items", job_id, items)
         return merged
 
     async def fact_merge_worker(self):
@@ -937,8 +987,12 @@ class Engine:
                 continue
             started = time.monotonic()
             try:
-                merged = await self.merge_facts(job["sid"])
-                detail = "合并 %s 组重复事实" % merged
+                merged = await self.merge_facts(job["sid"], job["id"])
+                job_items = await self.store.call("job_items", job["id"])
+                detail = "合并 %s 组重复事实（%s 条并入）" % (
+                    merged,
+                    sum(1 for item in job_items if item["action"] == "merged"),
+                )
                 await self.store.call("finish", job["id"], "completed", detail)
                 logger.info(
                     "[记忆·Z] 事实合并完成（%s），耗时 %.1f 秒",
@@ -959,10 +1013,11 @@ class Engine:
                 await self.store.call("finish", job["id"], "failed", detail)
                 logger.warning("[记忆·Z] 事实合并失败：%s", detail)
 
-    async def consolidate(self, sid):
+    async def consolidate(self, sid, job_id=None):
         """Fold similar permanent memories with the audit model, newest wins."""
         cfg = self.settings()
         report = {"permanent": 0, "clusters": 0, "merged": 0, "kept": 0}
+        dedupe_items = []
         if not cfg.permanent_dedupe:
             report["note"] = "自动合并已关闭"
             return report
@@ -1030,14 +1085,38 @@ class Engine:
             )
             report["merged"] += 1
             logger.info(
-                "[记忆·Z] 合并 %s 条相似永久记忆 → %s",
+                "[记忆·Z] 合并 %s 条相似永久记忆 → %s（%s）",
                 result["folded"],
-                result["target"][:12],
+                await self.store.call("short_id", result["target"]),
+                preview(content),
             )
+            # 明细：哪几条并进了哪条（与事实合并同一套语义，前端直接渲染「旧 → 新」）
+            dedupe_items.append(
+                {
+                    "kind": "record",
+                    "target": result["target"],
+                    "action": "keep",
+                    "note": "",
+                }
+            )
+            for item in group:
+                if item["id"] == result["target"] or item["id"] not in sources:
+                    continue
+                dedupe_items.append(
+                    {
+                        "kind": "record",
+                        "target": item["id"],
+                        "action": "merged",
+                        "note": result["target"],
+                        "before": item.get("summary", ""),
+                    }
+                )
         if report["clusters"] == 0:
             report["note"] = (
                 "未发现相似簇（阈值 %.2f）" % cfg.dedupe_threshold
             )
+        if job_id and dedupe_items:
+            await self.store.call("add_job_items", job_id, dedupe_items)
         return report
 
     async def worker(self, index):
@@ -1056,7 +1135,11 @@ class Engine:
                 continue
             started = time.monotonic()
             job_started = time.time()
-            logger.info("[记忆·Z] 开始后台任务 %s · %s", job["kind"], job["id"][:8])
+            logger.info(
+                "[记忆·Z] 开始后台任务 %s · %s",
+                JOB_LABELS.get(job["kind"], job["kind"]),
+                await self.store.call("short_id", job["id"]),
+            )
             detail = ""
             try:
                 if job["kind"] == "compress":
@@ -1070,7 +1153,7 @@ class Engine:
                     counts = await self.audit(job["sid"], job["id"])
                     detail = audit_summary(counts)
                 elif job["kind"] == "dedupe":
-                    report = await self.consolidate(job["sid"])
+                    report = await self.consolidate(job["sid"], job["id"])
                     detail = "常驻 %d 条 · 合并 %d 簇" % (
                         report.get("permanent", 0),
                         report.get("merged", 0),
@@ -1126,7 +1209,7 @@ class Engine:
                 await self.store.call("finish", job["id"], "completed", detail)
                 logger.info(
                     "[记忆·Z] 后台任务完成 %s（%s），耗时 %.1f 秒",
-                    job["kind"],
+                    JOB_LABELS.get(job["kind"], job["kind"]),
                     detail or "无",
                     time.monotonic() - started,
                 )

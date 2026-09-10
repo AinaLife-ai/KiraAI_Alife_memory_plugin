@@ -307,6 +307,7 @@ const JOB_KINDS = {
   reindex: "语义索引",
   classify: "记忆归类",
   dedupe: "永久记忆合并",
+  fact_merge: "事实合并",
   proactive: "主动感知",
 };
 const JOB_ACTIONS = {
@@ -317,6 +318,7 @@ const JOB_ACTIONS = {
   correct: "修正",
   merge: "合并",
   retract: "撤回",
+  classify: "分类",
 };
 function bindJobButtons() {
   // 注意：只绑明细按钮。手动排队按钮用的是 data-job，混用会把它们的点击覆盖掉。
