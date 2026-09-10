@@ -169,9 +169,10 @@ def test_weak_legacy_relation_quarantined_and_audit_can_repair(tmp_path):
         id = store._add_fact(db, "test:dm:u", fact)
     rows = store.facts("test:dm:u")
     assert rows[0]["relations"] == [bad] and not rows[0]["verified_relations"]
-    from alife_test_plugin.retrieval import safe_facts
+    from alife_test_plugin.retrieval import bot_facts
 
-    assert safe_facts(rows)[0]["relations"] == []
+    # Bot 视图只带经过校验的关系，待审校连线不参与
+    assert bot_facts(rows, "test:dm:u")[0]["relations"] == []
     good = {"subject": "test:u", "predicate": "朋友", "object": "阿澄"}
     output = c.Audit.model_validate(
         {

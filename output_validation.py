@@ -113,3 +113,16 @@ def validate_audit(candidates, output):
             ):
                 raise ValueError("cross-scope or cross-category merge is forbidden")
         touched.update(group)
+
+
+def strip_schema_titles(schema):
+    """Pydantic 给每个字段都加了 title，对模型是纯噪音，去掉省 token。"""
+    if isinstance(schema, dict):
+        return {
+            key: strip_schema_titles(value)
+            for key, value in schema.items()
+            if key != "title"
+        }
+    if isinstance(schema, list):
+        return [strip_schema_titles(item) for item in schema]
+    return schema
