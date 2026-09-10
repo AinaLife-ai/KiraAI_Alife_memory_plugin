@@ -243,7 +243,10 @@ L100 永久记忆（不参与自动压缩，只能由 Bot 主动 Memorize 或你
 python -m pip install -r requirements.txt pytest pytest-asyncio
 python -m pytest tests -q                 # 单元测试（不需要核心）
 KIRA_CORE=/path/to/KiraAI python -m pytest tests -q   # 真实核心接口测试
+python tools/web_audit.py                 # 前端静态审计：属性读写配对、绑定与读取一致、接口与路由一致
 ```
+
+`tools/web_audit.py` 专门拦截「属性名/接口路径对不上」这类只在浏览器里才发作、且要点到某个按钮才暴露的问题（v2.5.7 / v2.5.9 两次 404 都属于这一类），测试里也会调用它。
 
 真实核心测试使用 KiraAI 的事件、请求、响应与插件注册类，模型结果由确定性夹具提供。测试详情见 [验证记录](docs/VERIFICATION.md)。
 
@@ -265,6 +268,23 @@ KIRA_CORE=/path/to/KiraAI python -m pytest tests -q   # 真实核心接口测试
 
 <details>
 <summary><b>📝 更新日志（点击展开）</b></summary>
+
+### v2.5.9 (2026-09-10) — 明细按钮真的能用了（属性名错位）+ 前端静态审计 🐛
+
+- **现象**：点任务卡片上的「明细」，提示 `操作失败（404），请检查连接或登录状态`。
+- **原因**：v2.5.8 把按钮属性改成 `data-jobdetail`，但处理器仍在读 `dataset.job`（= `undefined`），
+  请求因此变成 `GET /job/undefined` → 后端查不到这个任务 → 404。上一版只改对了「写」的一半，没改「读」。
+- **修复**：处理器改读 `b.dataset.jobdetail`。
+- **同类问题全量排查**（其余均未再发现问题）：
+  - 所有 `data-*` 属性的读写配对；
+  - 每个 `$$("[data-x]")` 绑定与处理器**实际读取**的 dataset 键；
+  - 前端调用的全部接口 vs `main.py` 注册的路由（路径 + 方法）；
+  - POST 请求体字段 vs `contracts.py` 契约字段；
+  - 动态重建容器的绑定时机（确认都在渲染后重绑，不会留下点不动的按钮）。
+- **防回归**：新增 `tools/web_audit.py`（可单独运行，也被测试调用）+ 3 项测试。
+  **把旧写法改回去，测试立刻变红**（已实测）。
+- **端到端验证**：假后端 + 真前端，在浏览器里真点「明细」——修复后请求 `GET /job/job-abc123` 并正常弹出明细；
+  还原旧写法则请求 `GET /job/undefined`，与用户看到的 404 完全一致。
 
 ### v2.5.8 (2026-09-10) — 修复手动任务按钮被「明细」覆盖 🐛
 
