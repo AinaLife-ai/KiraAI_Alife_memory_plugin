@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import json
 import os
 import sys
 import types
@@ -1215,5 +1216,157 @@ async def test_injection_hides_pending_and_prefers_important_subjects(tmp_path):
         )
         # 关键词命中（extra 层）会排在重要度排序之前，这是注入的既定分层；
         # 重要度排序本身由 storage.facts(importance_first=True) 的单测覆盖。
+    finally:
+        await plugin.terminate()
+
+
+async def _diet_plugin(tmp_path, **settings):
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    base = {"probability": 0.0, "audit_enabled": False, "recall_scope": "global"}
+    base.update(settings)
+    plugin = module.AlifeMemoryPlugin(ctx, {"alife": base})
+    await plugin.initialize()
+    return plugin
+
+
+def _add_fact(plugin, sid, subject, category, content, importance, record_id):
+    with plugin.store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        return plugin.store._add_fact(
+            db,
+            sid,
+            {
+                "category": category,
+                "subject": subject,
+                "content": content,
+                "reason": "用户自己说的",
+                "scenario": "日常",
+                "tags": ["标签"],
+                "relations": [],
+                "source_ids": [record_id],
+                "importance": importance,
+            },
+        )
+
+
+async def _injected_block(plugin, event):
+    request = LLMRequest(
+        messages=[OpenAIMessage(role="user", content="原历史")],
+        system_prompt=[Prompt("人格", name="stable")],
+        user_prompt=[Prompt("问题", name="message")],
+    )
+    await plugin.on_request(event, request)
+    import json as _json
+
+    return _json.loads(
+        next(p.content for p in request.user_prompt if p.name == "alife_memory")
+    )
+
+
+@pytest.mark.asyncio
+async def test_situational_injection_pins_commitments_and_triggers_on_mention(tmp_path):
+    plugin = await _diet_plugin(tmp_path, top_k=3)
+    try:
+        event = make_text_event("今天天气不错")
+        plugin.store.capture(
+            event.sid, "t",
+            [{"role": "user", "content": "来源", "users": ["test:firefly"], "time": 1.0}],
+        )
+        record = plugin.store.active(event.sid)[0]
+        plugin.store.observe_name("test:firefly", "萤火", source="admin")
+        _add_fact(plugin, event.sid, "test:firefly", "commitment",
+                  "周六下午三点在咖啡馆见面", 8, record["id"])
+        _add_fact(plugin, event.sid, "test:firefly", "event",
+                  "萤火上周去看了猫", 7, record["id"])
+        _add_fact(plugin, event.sid, "test:other", "event",
+                  "另一个人喜欢甜食", 6, record["id"])
+
+        plain = await _injected_block(plugin, event)
+        contents = [f["content"] for f in plain["facts"]]
+        assert "周六下午三点在咖啡馆见面" in contents       # 约定常驻
+        assert "萤火上周去看了猫" not in contents           # 没提到就不带
+        assert "另一个人喜欢甜食" not in contents
+        assert set(plain["facts"][0]) == {
+            "category", "subject", "content", "relations", "importance", "src", "t"
+        }
+
+        mentioned = await _injected_block(plugin, make_text_event("萤火最近怎么样"))
+        contents = [f["content"] for f in mentioned["facts"]]
+        assert "萤火上周去看了猫" in contents               # 提到人 → 带回关于他的事
+        assert "另一个人喜欢甜食" not in contents
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_full_mode_keeps_legacy_injection(tmp_path):
+    plugin = await _diet_plugin(tmp_path, top_k=3, inject_mode="full")
+    try:
+        event = make_text_event("今天天气不错")
+        plugin.store.capture(
+            event.sid, "t",
+            [{"role": "user", "content": "来源", "users": ["test:firefly"], "time": 1.0}],
+        )
+        record = plugin.store.active(event.sid)[0]
+        _add_fact(plugin, event.sid, "test:other", "event",
+                  "另一个人喜欢甜食", 6, record["id"])
+        block = await _injected_block(plugin, event)
+        assert "另一个人喜欢甜食" in [f["content"] for f in block["facts"]]
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_bot_profile_is_trimmed_while_webui_profile_keeps_reason(tmp_path):
+    plugin = await _diet_plugin(tmp_path)
+    try:
+        event = make_text_event("你好")
+        plugin.store.capture(
+            event.sid, "t",
+            [{"role": "user", "content": "来源", "users": ["test:firefly"], "time": 1.0}],
+        )
+        record = plugin.store.active(event.sid)[0]
+        _add_fact(plugin, event.sid, "test:firefly", "preference",
+                  "喜欢猫", 7, record["id"])
+
+        tool = json.loads(await plugin.get_profile(event, "test:firefly"))
+        bot_fact = tool["profiles"][0]["categories"]["preference"][0]
+        assert "reason" not in bot_fact and "fingerprint" not in bot_fact
+        assert "src" in bot_fact
+
+        webui = await plugin.api_profile("test:firefly")
+        webui_fact = webui["categories"]["preference"][0]
+        assert webui_fact["reason"] == "用户自己说的"
+        assert "fingerprint" in webui_fact
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_persona_switches_control_model_payload(tmp_path):
+    captured = []
+
+    class _Persona:
+        content = "人设" * 10
+
+    class _Client:
+        async def chat(self, request):
+            captured.append(request.messages[1].content)
+            return types.SimpleNamespace(text_response="{}", tool_calls=None)
+
+    plugin = await _diet_plugin(tmp_path, compress_persona=False, audit_persona=True)
+    try:
+        async def _get_persona():
+            return _Persona()
+
+        plugin.ctx.persona_mgr = types.SimpleNamespace(get_persona=_get_persona)
+        plugin.ctx.get_llm_client = lambda model: _Client()
+        await plugin.model_call("m", "compress", "指令", {}, {"records": []})
+        assert "人设" not in captured[-1]
+        await plugin.model_call("m", "audit", "指令", {}, {"facts": []})
+        assert "人设" in captured[-1]
     finally:
         await plugin.terminate()

@@ -6,7 +6,12 @@ import random
 import time
 import logging
 from . import identity
-from .output_validation import OutputRejected, diagnostic, validate_audit
+from .output_validation import (
+    OutputRejected,
+    diagnostic,
+    strip_schema_titles,
+    validate_audit,
+)
 from .contracts import (
     Audit,
     Compression,
@@ -30,12 +35,14 @@ COMMON_INSTRUCTION = (
 
 AUDIT_INSTRUCTION = (
     "审计输出只含actions，禁止输出summary/facts。target_id和source_ids均来自facts[].id，"
-    "不是evidence[].id或facts[].sources。keep/correct的source_ids只能是[target_id]；"
+    "不是evidence[].id或facts[].sources。keep/correct/retract的source_ids只能是[target_id]；"
     "merge至少两个同会话、同主体、同分类事实ID，每个事实只能参与一次操作。"
     "无需操作时actions=[]。依据证据审计，保留否定、时间和不确定性；不同事件不得因相似而合并。"
     "关系警告需核对原文，correct时提供修正后的relations；无法证实连线时设为空数组。"
     "无须改关系时设null。importance 用 1-10 表示这条事实的长期价值，"
     "correct 时按证据给出修正后的值。"
+    "retract 用于清理被证据推翻、或与其他事实重复冗余而无需保留的事实："
+    "软删除后不再进入上下文，但原文与版本都保留、可以恢复；reason 写清为什么该删。"
 )
 
 DEDUPE_CONSERVATIVE_INSTRUCTION = (
@@ -60,6 +67,7 @@ def build_instruction(purpose, cfg):
             "压缩输出只含summary和facts；至多12条事实。"
             "source_ids必须逐字复制records[].id。"
             "importance 用 1-10 表示这条事实的长期价值。"
+            "reason 不超过 40 字，写清依据来源（用户原话/上下文推断）。"
             "facts[] 每条字段：category（只能是 "
             "event/fact/preference/commitment/relationship/profile/resource/self）"
             "、subject、content、reason、scenario、tags、relations、source_ids、importance。"
@@ -83,6 +91,47 @@ def build_instruction(purpose, cfg):
             )
         return DEDUPE_CONSERVATIVE_INSTRUCTION
     return AUDIT_INSTRUCTION
+
+
+def compress_records(candidates, aliases):
+    """压缩请求里的记录视图：短别名代替 UUID，L0 的起止时间合并成一个字段。
+
+    模型只需要在本次请求内引用这些 id（source_ids），真实 id 在解析后还原。
+    """
+    records = []
+    for index, row in enumerate(candidates):
+        record = {
+            "id": "r%d" % (index + 1),
+            "role": row["role"],
+            "summary": row["summary"],
+            "users": row["users"],
+        }
+        if row["level"] == 0:
+            # L0 的 start 与 end 是同一条消息的时间戳，合并省一半。
+            record["t"] = row["start"]
+        else:
+            record["start"], record["end"] = row["start"], row["end"]
+        records.append(record)
+    return records
+
+
+def restore_compress_ids(output, aliases):
+    """把模型输出的短别名映射回真实记录 ID；未知 id 交给重试路径。
+
+    真实 ID 也放行：自定义模型或测试桩可能直接回填原 ID，不必因此重试。
+    """
+    known = set(aliases.values())
+    for fact in output.get("facts", []):
+        restored = []
+        for source in fact.get("source_ids", []):
+            if source in aliases:
+                restored.append(aliases[source])
+            elif source in known:
+                restored.append(source)
+            else:
+                raise ValueError("unknown source")
+        fact["source_ids"] = restored
+    return output
 
 
 def enforce_limits(result, content_limit, reason_limit):
@@ -209,7 +258,7 @@ class Engine:
             else cfg.audit_model
         )
         instruction = COMMON_INSTRUCTION + build_instruction(purpose, cfg)
-        schema = contract.model_json_schema()
+        schema = strip_schema_titles(contract.model_json_schema())
         retries = cfg.model_retries if retry_timeout else 0
         for attempt in range(retries + 1):
             try:
@@ -302,30 +351,18 @@ class Engine:
                 used += cost
                 count += 1
             candidates = candidates[:count]
+            aliases = {
+                "r%d" % (index + 1): row["id"] for index, row in enumerate(candidates)
+            }
             payload = {
                 "range": {
                     "start": min(r["start"] for r in candidates),
                     "end": max(r["end"] for r in candidates),
                 },
-                "records": [
-                    {
-                        k: r[k]
-                        for k in (
-                            "id",
-                            "role",
-                            "level",
-                            "summary",
-                            "users",
-                            "start",
-                            "end",
-                        )
-                    }
-                    for r in candidates
-                ],
+                "records": compress_records(candidates, aliases),
                 "context": [],
             }
             for attempt in range(cfg.model_retries + 1):
-                payload["records"] = payload["records"][: len(candidates)]
                 payload["range"] = {
                     "start": min(r["start"] for r in candidates),
                     "end": max(r["end"] for r in candidates),
@@ -334,6 +371,7 @@ class Engine:
                     output = await self.structured(
                         Compression, "compress", payload, cfg, retry_timeout=False
                     )
+                    output = restore_compress_ids(output, aliases)
                     break
                 except (TimeoutError, ConnectionError, ValueError) as exc:
                     if (
@@ -355,6 +393,12 @@ class Engine:
                             candidates = candidates[: max(2, len(candidates) // 2)]
                     else:
                         candidates = candidates[: max(2, len(candidates) // 2)]
+                    # 批次变小后别名必须重建，否则模型看到的 id 与候选对不上。
+                    aliases = {
+                        "r%d" % (index + 1): row["id"]
+                        for index, row in enumerate(candidates)
+                    }
+                    payload["records"] = compress_records(candidates, aliases)
                     logger.warning(
                         "[记忆·Z] 压缩请求未完成，以 %d 条重试 %d/%d",
                         len(candidates),
@@ -415,7 +459,35 @@ class Engine:
         candidates = selected
         evidence = list(evidence_by_id.values())
         output = await self.structured(
-            Audit, "audit", {"facts": candidates, "evidence": evidence}, cfg
+            Audit,
+            "audit",
+            {
+                # 只发审计判断需要的字段：内部簿记（fingerprint/merge_pending/
+                # created/audited/revision/deleted）不进请求。
+                "facts": [
+                    {
+                        k: fact[k]
+                        for k in (
+                            "id",
+                            "sid",
+                            "subject",
+                            "category",
+                            "content",
+                            "reason",
+                            "relations",
+                            "importance",
+                            "sources",
+                        )
+                        if k in fact
+                    }
+                    for fact in candidates
+                ],
+                "evidence": [
+                    {k: row[k] for k in ("content", "start", "end") if k in row}
+                    for row in evidence
+                ],
+            },
+            cfg,
         )
         if self.settings() == cfg:
             await self.store.call("audit", candidates, output)
@@ -665,7 +737,11 @@ class Engine:
                 )
             except asyncio.CancelledError:
                 await self.store.call(
-                    "finish", job["id"], "queued", "paused during reload"
+                    "finish",
+                    job["id"],
+                    "queued",
+                    "paused during reload",
+                    only_running=True,
                 )
                 raise
             except Exception as exc:
@@ -820,7 +896,11 @@ class Engine:
                 )
             except asyncio.CancelledError:
                 await self.store.call(
-                    "finish", job["id"], "queued", "paused during reload"
+                    "finish",
+                    job["id"],
+                    "queued",
+                    "paused during reload",
+                    only_running=True,
                 )
                 raise
             except Exception as exc:
@@ -874,7 +954,11 @@ class Engine:
                 )
             except asyncio.CancelledError:
                 await self.store.call(
-                    "finish", job["id"], "queued", "paused during reload"
+                    "finish",
+                    job["id"],
+                    "queued",
+                    "paused during reload",
+                    only_running=True,
                 )
                 raise
             except Exception as exc:

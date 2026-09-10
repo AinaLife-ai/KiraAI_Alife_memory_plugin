@@ -33,6 +33,16 @@
         "default": false,
         "description": "把还没压缩成存档的最近对话原文也塞进每轮记忆块。默认关闭：这些原文 KiraAI 自己的上下文里就有，重复注入只会让上下文膨胀；需要时模型可用 SearchMemoryArchive 主动检索。"
       },
+      "inject_mode": {
+        "type": "string",
+        "name": "注入形态",
+        "default": "situational",
+        "options": [
+          "situational",
+          "full"
+        ],
+        "description": "situational（默认）：常驻只放约定/偏好/画像/最近摘要，提到人或触发词时再带回相关记忆，省 token；full：沿用旧行为，把本会话事实全量注入，回滚用。"
+      },
       "auto_inject": {
         "type": "switch",
         "name": "持续上下文注入",
@@ -151,6 +161,18 @@
         "description": "超时、连接中断或格式错误后最多重试几次。默认2；设0不重试，次数越多可能越费。",
         "minimum": 0,
         "maximum": 4
+      },
+      "compress_persona": {
+        "type": "switch",
+        "name": "压缩带人设",
+        "default": true,
+        "description": "压缩与合并请求是否带上 Bot 人设。默认开：摘要风格更贴合人设；人设很长（如 8000 字）时可关掉省 token。"
+      },
+      "audit_persona": {
+        "type": "switch",
+        "name": "审计带人设",
+        "default": false,
+        "description": "审计请求是否带上 Bot 人设。默认关：审计只判断事实有没有依据，不需要语气；人设长时这是每次调用的大头。"
       },
       "worker_count": {
         "type": "integer",

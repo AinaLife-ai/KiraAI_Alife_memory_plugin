@@ -282,6 +282,34 @@ class Store:
             ]
         return result
 
+    def attach_evidence(self, facts):
+        """为每条事实补上「最新一条来源」：src（记录 ID）与 src_user（说话人）。
+
+        注入与工具返回只带一个指针，模型据此就能 ReadMemoryArchive 追到原文。
+        """
+        sources = {s for f in facts for s in f.get("sources", [])}
+        if not sources:
+            return facts
+        with self.connect() as db:
+            meta = {
+                r[0]: (r[1] or 0, json.loads(r[2] or "[]"))
+                for r in db.execute(
+                    "SELECT id,start,users FROM records WHERE id IN"
+                    " (SELECT value FROM json_each(?))",
+                    (dump(sorted(sources)),),
+                )
+            }
+        for fact in facts:
+            best = None
+            for source in fact.get("sources", []):
+                start, users = meta.get(source, (0, []))
+                if best is None or start >= best[0]:
+                    best = (start, source, users)
+            if best:
+                fact["src"] = best[1]
+                fact["src_user"] = best[2][0] if best[2] else ""
+        return facts
+
     def observe_name(
         self,
         entity_id,
@@ -2029,6 +2057,13 @@ class Store:
                     )
                 if a["action"] == "keep":
                     continue
+                if a["action"] == "retract":
+                    # 软删：退出注入与检索，原文与版本都还在，可恢复。
+                    db.execute(
+                        "UPDATE facts SET deleted=1,revision=revision+1 WHERE id=?",
+                        (a["target_id"],),
+                    )
+                    continue
                 sources = sorted({s for k in group for s in by_id[k]["sources"]})
                 relations = {
                     dump(rel): rel for k in group for rel in by_id[k]["relations"]
@@ -2109,10 +2144,13 @@ class Store:
                 )
             return dict(row) if row else None
 
-    def finish(self, job, state, detail=""):
+    def finish(self, job, state, detail="", only_running=False):
+        # only_running：取消路径专用。worker 可能在 finish(completed) 的 await
+        # 里被取消，若再无条件改写就会把已完成的任务退回 queued、重复执行。
+        where = " AND state='running'" if only_running else ""
         with self.connect() as db:
             db.execute(
-                "UPDATE jobs SET state=?,detail=?,updated=? WHERE id=?",
+                "UPDATE jobs SET state=?,detail=?,updated=? WHERE id=?" + where,
                 (state, detail, time.time(), job),
             )
             self.bump(db)

@@ -148,7 +148,8 @@ class Compression(Strict):
 
 
 class AuditAction(Strict):
-    action: Literal["keep", "correct", "merge"]
+    # retract 用于清理被证据推翻或纯属冗余的事实：软删、留版本、可恢复。
+    action: Literal["keep", "correct", "merge", "retract"]
     target_id: Short
     source_ids: list[Short] = Field(min_length=1, max_length=100)
     content: Text
@@ -235,6 +236,9 @@ class Settings(Strict):
     audit_daily_calls: int = Field(default=24, ge=0, le=1000)
     model_timeout: int = Field(default=120, ge=5, le=600)
     model_retries: int = Field(default=2, ge=0, le=4)
+    compress_persona: bool = True
+    audit_persona: bool = False
+    inject_mode: Literal["situational", "full"] = "situational"
     worker_count: int = Field(default=2, ge=1, le=4)
     context_chars: int = Field(default=24000, ge=2000, le=500000)
     token_warning: int = Field(default=120000, ge=1000, le=2000000)

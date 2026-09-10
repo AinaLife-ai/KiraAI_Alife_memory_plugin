@@ -268,18 +268,35 @@ def relevance(query, text):
     return sum(len(t) * (t in lowered) for t in tokens)
 
 
-def safe_facts(facts):
-    return [
-        {
-            **{
-                k: v
-                for k, v in f.items()
-                if k not in {"verified_relations", "relation_warnings"}
-            },
-            "relations": f.get("verified_relations", f["relations"]),
-            "relationship_status": "needs_review"
-            if f.get("relation_warnings")
-            else "evidence_required",
+def bot_facts(facts, current_sid=""):
+    """给 Bot 看的精简事实视图：只留判断与追溯必需的字段。
+
+    内部簿记（fingerprint/deleted/revision/merge_pending/audited）、
+    分类装饰（scenario/tags）、以及只给审计用的大段 reason 都不进上下文。
+    """
+    view = []
+    for fact in facts:
+        item = {
+            "category": fact.get("category", ""),
+            "subject": fact.get("subject", ""),
+            "content": fact.get("content", ""),
+            "relations": fact.get("verified_relations", fact.get("relations", [])),
+            "importance": fact.get("importance", 5),
         }
-        for f in facts
-    ]
+        if fact.get("sid") and fact["sid"] != current_sid:
+            item["sid"] = fact["sid"]
+            if fact.get("src_user"):
+                item["by"] = fact["src_user"]
+        source = fact.get("src") or (fact.get("sources") or [None])[-1]
+        if source:
+            item["src"] = source
+        created = fact.get("created")
+        if isinstance(created, (int, float)) and created > 0:
+            item["t"] = time.strftime("%Y-%m-%d", time.gmtime(created))
+        if fact.get("relationship_status") == "needs_review" or fact.get(
+            "relation_warnings"
+        ):
+            item["needs_review"] = True
+        view.append(item)
+    return view
+

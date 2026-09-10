@@ -43,8 +43,8 @@ from .retrieval import (
     SYNTHETIC_NAMES,
     TOOL_RESULT_PREFIX,
     archive_view,
+    bot_facts,
     looks_like_memory_payload,
-    safe_facts,
     tool_call_summary,
     tool_preview,
     RecallWindow,
@@ -331,6 +331,76 @@ class AlifeMemoryPlugin(BasePlugin):
         if self.engine:
             await self.engine.stop()
 
+    async def situational_facts(self, sid, query, users, subjects, keyword_hit, cfg, prefer):
+        """情境化注入的事实：常驻约定/偏好 + 提到的人或触发词带回来的事实。
+
+        常驻只放「随时该记得」的类别；事件类事实等消息真正提到相关的人或往事时
+        才带回来，既不丢连续性，也不每轮把整库倒进上下文。
+        """
+        pinned = []
+        for category in ("commitment", "preference", "profile"):
+            pinned.extend(
+                await self.store.call(
+                    "facts",
+                    sid,
+                    subject="",
+                    category=category,
+                    limit=max(2, cfg.top_k),
+                    offset=0,
+                    global_scope=cfg.recall_scope == "global",
+                    users=users,
+                    include_shared=True,
+                    hide_pending=cfg.merge_pending_hide,
+                    importance_first=True,
+                    prefer_subjects=tuple(subjects),
+                    **prefer,
+                )
+            )
+        triggered = []
+        # 实体驱动：消息里提到谁，就把「关于这个人」的事实带回来。
+        # 用 subject 精确过滤，而不是靠 lexical（那是硬过滤，会漏掉
+        # 「内容没出现名字但就是他」的事实）或排序加成（会把无关事实一起带回）。
+        for entity in list(subjects)[:3]:
+            triggered.extend(
+                await self.store.call(
+                    "facts",
+                    sid,
+                    subject=entity,
+                    category="",
+                    limit=cfg.top_k,
+                    offset=0,
+                    global_scope=cfg.recall_scope == "global",
+                    users=users,
+                    include_shared=True,
+                    hide_pending=cfg.merge_pending_hide,
+                    importance_first=True,
+                    **prefer,
+                )
+            )
+        if keyword_hit:
+            # 触发词（记得/之前/上次）：把范围放宽一档，按重要度取本会话事实。
+            triggered.extend(
+                await self.store.call(
+                    "facts",
+                    sid,
+                    subject="",
+                    category="",
+                    limit=cfg.top_k * 2,
+                    offset=0,
+                    global_scope=cfg.recall_scope == "global",
+                    users=users,
+                    include_shared=True,
+                    hide_pending=cfg.merge_pending_hide,
+                    importance_first=True,
+                    prefer_subjects=tuple(subjects),
+                    **prefer,
+                )
+            )
+        merged = {}
+        for fact in [*pinned, *triggered]:
+            merged.setdefault(fact["id"], fact)
+        return list(merged.values())
+
     async def model_call(self, model, purpose, instruction, schema, payload):
         client = (
             self.ctx.get_llm_client(model)
@@ -343,13 +413,23 @@ class AlifeMemoryPlugin(BasePlugin):
         )
         if client is None:
             raise ValueError("model_not_configured")
-        persona = await self.ctx.persona_mgr.get_persona()
-        payload = {**payload, "persona": persona.content}
+        cfg = self.settings
+        # 人设是很多用户的大头（数千字），按用途开关，不无脑塞进每一次调用。
+        wants_persona = (
+            cfg.compress_persona
+            if purpose in ("compress", "fact_merge")
+            else cfg.audit_persona
+        )
+        if wants_persona:
+            persona = await self.ctx.persona_mgr.get_persona()
+            payload = {**payload, "persona": persona.content}
         req = LLMRequest(
             messages=[
                 OpenAIMessage(
                     role="system",
-                    content=instruction + "\nJSON Schema:\n" + dump(schema),
+                    content=instruction
+                    + "\nJSON Schema:\n"
+                    + dump(schema),
                 ),
                 OpenAIMessage(role="user", content=dump(payload)),
             ]
@@ -601,6 +681,18 @@ class AlifeMemoryPlugin(BasePlugin):
                 cfg.merge_pending_hide,
             )
             if profile:
+                rows_flat = [
+                    fact
+                    for facts in profile.get("categories", {}).values()
+                    for fact in facts
+                ]
+                if rows_flat:
+                    await self.store.call("attach_evidence", rows_flat)
+                    view = iter(bot_facts(rows_flat, event.sid))
+                    profile["categories"] = {
+                        category: [next(view) for _ in facts]
+                        for category, facts in profile.get("categories", {}).items()
+                    }
                 profiles.append(profile)
         return self.recall_result(event, {"ok": True, "profiles": profiles})
 
@@ -785,26 +877,33 @@ class AlifeMemoryPlugin(BasePlugin):
         subjects = await self.store.call(
             "entity_ids_for_query", query, sid, users, cfg.recall_scope
         )
-        facts = await self.store.call(
-            "facts",
-            sid,
-            limit=cfg.top_k * 10,
-            users=users,
-            include_shared=True,
-            hide_pending=cfg.merge_pending_hide,
-            importance_first=True,
-            prefer_subjects=tuple(subjects),
-            **prefer,
-        )
+        keyword_hit = any(word in query for word in cfg.recall_keywords)
+        if cfg.inject_mode == "full":
+            facts = await self.store.call(
+                "facts",
+                sid,
+                limit=cfg.top_k * 10,
+                users=users,
+                include_shared=True,
+                hide_pending=cfg.merge_pending_hide,
+                importance_first=True,
+                prefer_subjects=tuple(subjects),
+                **prefer,
+            )
+        else:
+            facts = await self.situational_facts(
+                sid, query, users, subjects, keyword_hit, cfg, prefer
+            )
         related = []
         if cfg.recall_scope != "session" and query.strip():
+            reach = cfg.top_k * (2 if keyword_hit else 1)
             matches = await self.store.call(
                 "search",
                 sid,
                 lexical=query,
                 scope=cfg.recall_scope,
                 users=users,
-                limit=cfg.top_k * 2,
+                limit=reach * 2,
                 exclude_sid=sid,
                 active=cfg.search_active_only,
                 cold_after_days=cfg.cold_after_days,
@@ -829,20 +928,21 @@ class AlifeMemoryPlugin(BasePlugin):
                 }
                 for r in matches["items"]
                 if r["id"] not in local_ids
-            ][: cfg.top_k]
-            extra = await self.store.call(
-                "facts",
-                sid,
-                global_scope=cfg.recall_scope == "global",
-                users=users,
-                include_shared=True,
-                lexical=query,
-                limit=cfg.top_k,
-                hide_pending=cfg.merge_pending_hide,
-                prefer_subjects=tuple(subjects),
-                **prefer,
-            )
-            facts = list({f["id"]: f for f in [*extra, *facts]}.values())
+            ][:reach]
+            if cfg.inject_mode == "full":
+                extra = await self.store.call(
+                    "facts",
+                    sid,
+                    global_scope=cfg.recall_scope == "global",
+                    users=users,
+                    include_shared=True,
+                    lexical=query,
+                    limit=cfg.top_k,
+                    hide_pending=cfg.merge_pending_hide,
+                    prefer_subjects=tuple(subjects),
+                    **prefer,
+                )
+                facts = list({f["id"]: f for f in [*extra, *facts]}.values())
         while len(dump(related)) > cfg.context_chars // 4 and related:
             related.pop()
         names = await self.store.call(
@@ -875,6 +975,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 fact["source_session"] = fact["sid"]
                 fact["same_session"] = fact["sid"] == sid
                 fact["session_name"] = session_names.get(fact["sid"], "")
+        fact_ids = [fact["id"] for fact in facts]
         # Memory data is a request-only user block; host history stays byte-stable.
         # Keep complete records and give explicit IDs for anything outside the budget.
         budget = cfg.context_chars - len(dump(related)) - len(dump(names)) - 1000
@@ -886,11 +987,20 @@ class AlifeMemoryPlugin(BasePlugin):
             if cfg.inject_recent_raw
             else []
         )
-        priority = (
-            [r for r in rows if r["permanent"]]
-            + raw
-            + [r for r in rows if r["level"] > 0 and not r["permanent"]]
-        )
+        if cfg.inject_mode == "full":
+            priority = (
+                [r for r in rows if r["permanent"]]
+                + raw
+                + [r for r in rows if r["level"] > 0 and not r["permanent"]]
+            )
+        else:
+            # 情境化：永久记忆照常常驻，普通存档只留最近两条做时间连续性，
+            # 更早的内容由 related_archives 与工具在需要时带回。
+            recent = sorted(
+                (r for r in rows if r["level"] > 0 and not r["permanent"]),
+                key=lambda r: (-r["start"], r["id"]),
+            )
+            priority = [r for r in rows if r["permanent"]] + raw + recent[:2]
         chosen = {}
         for row in priority:
             rendered = dump(
@@ -920,7 +1030,9 @@ class AlifeMemoryPlugin(BasePlugin):
             "archives_in_context": len(selected),
             "omitted_count": len(omitted),
             "omitted_ids": omitted[:30],
-            "facts": safe_facts(facts),
+            "facts": bot_facts(
+                await self.store.call("attach_evidence", facts), sid
+            ),
             "archives": selected,
             "related_archives": related,
             "names": names,
@@ -958,7 +1070,7 @@ class AlifeMemoryPlugin(BasePlugin):
             "",
             [r["archive"] for r in perception["archives"]]
             + [r["id"] for r in perception["related_archives"]],
-            [f["id"] for f in perception["facts"]],
+            fact_ids,
         )
         req.user_prompt.insert(
             0,
@@ -1404,7 +1516,9 @@ class AlifeMemoryPlugin(BasePlugin):
                 "totals": totals,
                 "already_seen": len(seen),
                 "subjects": sorted({r["subject"] for r in rows}),
-                "facts": safe_facts(rows),
+                "facts": bot_facts(
+                    await self.store.call("attach_evidence", rows), event.sid
+                ),
                 "next_offset": offset + len(rows),
             },
         )
