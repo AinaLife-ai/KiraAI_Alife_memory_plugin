@@ -94,6 +94,9 @@ def user_ids(event):
             f"{adapter}:{m.sender.user_id}"
             for m in event.messages
             if getattr(m, "sender", None)
+            # 通知类消息的发送者是占位符（群聊里是 unknown），不能当成人
+            and str(getattr(m.sender, "user_id", "") or "").strip()
+            not in ("", "unknown")
         }
     )
 
@@ -1105,6 +1108,8 @@ class AlifeMemoryPlugin(BasePlugin):
         sid, users = event.sid, user_ids(event)
         await self.observe_event_names(event)
         base = str(event.event_id)
+        # 通知类消息（主动感知、提醒插件等）是插件的实现细节，不是用户说的话：
+        # 不写进记忆，但要保留 Bot 自己的回复与工具调用。
         incoming = [
             {
                 "role": "user",
@@ -1113,8 +1118,10 @@ class AlifeMemoryPlugin(BasePlugin):
                 "users": users,
             }
             for m in event.messages
+            if not getattr(m, "is_notice", False)
         ]
-        await self.store.call("capture", sid, base + ":input", incoming)
+        if incoming:
+            await self.store.call("capture", sid, base + ":input", incoming)
         text = response.text_response or ""
         content = text
         summary = text.strip()

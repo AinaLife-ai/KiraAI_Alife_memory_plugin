@@ -161,6 +161,9 @@ L100 永久记忆（不参与自动压缩，只能由 Bot 主动 Memorize 或你
 | `auto_migrate` / `mutual_exclusion` | 开 / 开 | 自动迁移旧记忆插件（后台执行、源文件未变则跳过）、并停用冲突插件（原文件只读保留） |
 | `boot_enabled` / `boot_replay_seconds` | 开 / 90 | 打开面板的载入动画与重播冷却 |
 | `proactive_enabled` | 关 | 定时主动感知：让 Bot 依据记忆主动关心用户（默认不发消息） |
+| `proactive_interval` / `proactive_jitter` | 3600 / 0 | 基础间隔（最短 60 秒，最长 7 天）与随机偏移：实际间隔 = 间隔 + 0~偏移 的随机值，0 = 固定间隔 |
+| `proactive_min_sessions` / `proactive_max_sessions` | 1 / 0 | 每轮挑几个会话：最少/最多，0 = 不限（全部触发）；两者相等就是固定个数，不随机 |
+| `proactive_rotate` | 关 | 关=每轮纯随机抽取会话；开=优先挑最久没被触发过的（同龄随机），避免长期没轮到 |
 
 所有参数都可以在网页端改，**原子保存、即时生效**，不用重启。
 
@@ -257,6 +260,14 @@ KIRA_CORE=/path/to/KiraAI python -m pytest tests -q   # 真实核心接口测试
 
 <details>
 <summary><b>📝 更新日志（点击展开）</b></summary>
+
+### v2.5.4 (2026-09-10) — 主动感知节奏可控 · 通知不再污染记忆 ⏱️
+
+- **首轮不再"重启即触发"**：主动感知第一次要等一个完整间隔（以前 `last_proactive` 初值是 0，插件每次启动都会立刻主动一轮）。
+- **随机偏移 `proactive_jitter`**：实际间隔 = `proactive_interval` + 0~jitter 的随机秒数；默认 0 = 固定间隔。
+- **每轮会话数可控**：`proactive_min_sessions` / `proactive_max_sessions` 决定每轮挑几个会话（0 = 不限，默认全部触发；两者相等就是固定个数）。
+- **轮流挑选开关 `proactive_rotate`**：默认每轮纯随机；打开后优先挑最久没被触发过的会话，避免小概率饿死。
+- **通知不再写进记忆**：主动感知、提醒类插件发的 `is_notice` 消息不再被记成"用户说的话"；Bot 的回复与工具调用照常记录（所以"bot 发了动态"这类行为仍然可被提取）。同时群聊通知的占位发送者 `unknown` 不再进入参与者列表。
 
 ### v2.5.3 (2026-09-10) — 上下文瘦身：情境化召回 + 请求体精简 💧
 

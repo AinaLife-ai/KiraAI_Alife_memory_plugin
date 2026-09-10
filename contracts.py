@@ -247,6 +247,10 @@ class Settings(Strict):
     top_k: int = Field(default=5, ge=1, le=30)
     proactive_enabled: bool = False
     proactive_interval: int = Field(default=3600, ge=60, le=604800)
+    proactive_jitter: int = Field(default=0, ge=0, le=86400)
+    proactive_min_sessions: int = Field(default=1, ge=1, le=100)
+    proactive_max_sessions: int = Field(default=0, ge=0, le=100)
+    proactive_rotate: bool = False
     proactive_sessions: list[Short] = Field(default_factory=list, max_length=100)
     compress_instruction: str = Field(
         default="以自身视角保留事件、感情、人物、关键事实和生活轨迹。精简但不要按珍贵程度丢弃线索；只依据输入，保留时间、否定、条件和不确定性。",

@@ -218,8 +218,11 @@ class Engine:
         self.tasks = []
         self.wake = asyncio.Event()
         self.stopping = False
-        self.last_audit = self.last_proactive = 0.0
+        self.last_audit = 0.0
         self.last_dedupe = 0.0
+        # 主动感知：首轮要等一个完整间隔，避免每次重启都立刻主动一轮。
+        self.proactive_due = None
+        self.proactive_last = {}
         self.audit_day = ""
         self.audit_calls = 0
 
@@ -234,6 +237,56 @@ class Engine:
         self.tasks.append(asyncio.create_task(self.scheduler()))
         for row in await self.store.call("pending_facts"):
             await self.enqueue("fact_merge", row["sid"])
+
+    async def proactive_tick(self, now, cfg):
+        """到点就挑一批会话入队。首轮先等一个完整间隔（重启不立刻刷屏）。"""
+        if not cfg.proactive_enabled:
+            self.proactive_due = None
+            return []
+        if self.proactive_due is None:
+            self.proactive_due = now + self.proactive_delay(cfg)
+            return []
+        if now < self.proactive_due:
+            return []
+        self.proactive_due = now + self.proactive_delay(cfg)
+        picked = self.pick_proactive_sessions(cfg, now=now)
+        for sid in picked:
+            await self.enqueue("proactive", sid)
+        return picked
+
+    @staticmethod
+    def proactive_delay(cfg):
+        """基础间隔 + 0~jitter 的随机偏移；jitter=0 就是固定间隔。"""
+        jitter = getattr(cfg, "proactive_jitter", 0) or 0
+        return cfg.proactive_interval + (random.uniform(0, jitter) if jitter > 0 else 0)
+
+    def pick_proactive_sessions(self, cfg, now=None):
+        """每轮挑一批会话：数量在 [min, max] 内随机，max=0 表示不限。
+
+        默认纯随机；proactive_rotate 打开时优先挑最久没被触发过的，
+        同龄之间仍然随机，长期下来每个会话都能轮到。
+        """
+        pool = [sid for sid in cfg.proactive_sessions if sid]
+        if not pool:
+            return []
+        limit = getattr(cfg, "proactive_max_sessions", 0) or 0
+        if limit <= 0:
+            # 不限：整批触发，保持旧行为，不因为"随机个数"把会话漏掉
+            count = len(pool)
+        else:
+            limit = min(limit, len(pool))
+            low = min(max(1, getattr(cfg, "proactive_min_sessions", 1) or 1), limit)
+            count = low if low >= limit else random.randint(low, limit)
+        if getattr(cfg, "proactive_rotate", False):
+            chosen = sorted(
+                pool, key=lambda sid: (self.proactive_last.get(sid, 0.0), random.random())
+            )[:count]
+        else:
+            chosen = random.sample(pool, count)
+        stamp = time.monotonic() if now is None else now
+        for sid in chosen:
+            self.proactive_last[sid] = stamp
+        return chosen
 
     async def stop(self):
         self.stopping = True
@@ -1010,10 +1063,4 @@ class Engine:
                 self.last_dedupe = now
                 for sid in await self.store.call("sessions_with_permanents"):
                     await self.enqueue("dedupe", sid, automatic=True)
-            if (
-                cfg.proactive_enabled
-                and now - self.last_proactive >= cfg.proactive_interval
-            ):
-                self.last_proactive = now
-                for sid in cfg.proactive_sessions:
-                    await self.enqueue("proactive", sid)
+            await self.proactive_tick(now, cfg)

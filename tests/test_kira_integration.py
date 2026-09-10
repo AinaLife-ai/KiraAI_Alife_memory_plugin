@@ -1370,3 +1370,75 @@ async def test_persona_switches_control_model_payload(tmp_path):
         assert "人设" in captured[-1]
     finally:
         await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_notice_messages_are_not_captured_as_user_talk(tmp_path):
+    """主动感知/提醒类通知是插件细节，不该被记成用户说的话。"""
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+
+    def notice_event(stype="dm", sid="u"):
+        session = Session(adapter_name="test", session_type=stype, session_id=sid)
+        msg = KiraIMMessage(
+            message_id="sys",
+            self_id="bot",
+            chain=MessageChain([Text("记忆主动感知：查看当前会话的约定…")]),
+            timestamp=100,
+            sender=User(
+                user_id=sid if stype == "dm" else "unknown", nickname="system"
+            ),
+        )
+        msg.message_str = "[system] 记忆主动感知：查看当前会话的约定…"
+        msg.is_notice = True
+        return KiraMessageBatchEvent(
+            messages=[msg], session=session, timestamp=100, message_types=[]
+        )
+
+    try:
+        # 1) 整批都是通知：不写用户消息，但 Bot 的回复照记
+        event = notice_event()
+        await plugin.on_response(
+            event,
+            LLMResponse(text_response="我看下有什么要跟进的", agent_step_index=0),
+        )
+        rows = plugin.store.active(event.sid)
+        assert [r["role"] for r in rows] == ["assistant"], rows
+        assert "主动感知" not in rows[0]["content"]
+
+        # 2) 群聊通知：占位发送者不能变成参与者
+        group = notice_event("gm", "1")
+        await plugin.on_response(
+            group, LLMResponse(text_response="提醒你一下", agent_step_index=0)
+        )
+        assert all(
+            "unknown" not in user
+            for row in plugin.store.active(group.sid)
+            for user in row["users"]
+        )
+
+        # 3) 通知与真实消息同一批：只留真实的那条
+        real = KiraIMMessage(
+            message_id="m1",
+            self_id="bot",
+            chain=MessageChain([Text("今天有空吗")]),
+            timestamp=101,
+            sender=User(user_id="u", nickname="小明"),
+        )
+        real.message_str = "[小明] 今天有空吗"
+        mixed = notice_event()
+        mixed.messages = [mixed.messages[0], real]
+        await plugin.on_response(
+            mixed, LLMResponse(text_response="有空呀", agent_step_index=0)
+        )
+        summaries = [r["summary"] for r in plugin.store.active("test:dm:u")]
+        assert any("今天有空吗" in text for text in summaries)
+        assert not any("主动感知" in text for text in summaries)
+    finally:
+        await plugin.terminate()
