@@ -465,18 +465,21 @@ class Store:
         Used to give facts about the people being talked about a ranking boost,
         instead of hoping their names appear in the matched text.
         """
-        query = (query or "").strip()
+        from .retrieval import squeeze
+
+        query = squeeze((query or "").strip())  # 名字带空格（「星 月」）也能在没空格的句子里认出
         if len(query) < 2 or len(query) > 500:
             return []
         visible = None
         if scope != "global":
             visible = set(self.entity_ids(sid, users, scope))
         with self.connect() as db:
+            db.create_function("squeeze", 1, squeeze)
             rows = db.execute(
                 "SELECT DISTINCT e.id, e.name FROM entities e "
                 "LEFT JOIN entity_names n ON n.entity_id=e.id WHERE "
-                "(length(n.name)>=2 AND instr(?,n.name)>0) OR "
-                "(length(e.name)>=2 AND instr(?,e.name)>0) OR "
+                "(length(n.name)>=2 AND instr(?,squeeze(n.name))>0) OR "
+                "(length(e.name)>=2 AND instr(?,squeeze(e.name))>0) OR "
                 "(length(e.id)>=4 AND instr(?,e.id)>0) LIMIT 100",
                 (query, query, query),
             ).fetchall()
@@ -1202,6 +1205,23 @@ class Store:
                     return short
             return real  # 极端情况：回退到真实 id，功能不受影响
 
+    def spaced_names(self, limit=200):
+        """已登记、且名字里真的带空白的名（昵称可以是「星 月」）。
+
+        渲染给模型看之前把这类名字保护起来，空白归一就不会误合并它们。
+        """
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT DISTINCT name FROM entity_names "
+                "WHERE length(name)>=2 AND instr(name,' ')>0 LIMIT ?",
+                (limit,),
+            ).fetchall()
+            rows += db.execute(
+                "SELECT name FROM entities WHERE length(name)>=2 AND instr(name,' ')>0 LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return sorted({r[0] for r in rows if r[0]}, key=len, reverse=True)
+
     def real_id(self, value):
         """短码或真实 id → 真实 id；两种都认，找不到就原样返回。"""
         value = str(value or "")
@@ -1711,8 +1731,10 @@ class Store:
             )
             args.extend([sid, dump(list(users))])
         if keyword:
-            clauses.append("""(instr(lower(summary),lower(?))>0 OR EXISTS
-              (SELECT 1 FROM entity_names n WHERE instr(lower(n.name),lower(?))>0
+            # 两侧都做空白归一：库里存着「翅 膀」时，用「翅膀」也要搜得到（反之亦然）
+            clauses.append("""(instr(lower(squeeze(summary)),lower(squeeze(?)))>0 OR EXISTS
+              (SELECT 1 FROM entity_names n WHERE
+              instr(lower(squeeze(n.name)),lower(squeeze(?)))>0
               AND (n.entity_id=records.sid OR n.entity_id IN (SELECT value FROM json_each(records.users)))))""")
             args.extend([keyword, keyword])
         if level is not None:
@@ -1741,6 +1763,9 @@ class Store:
             )
             tier_args = [prefer_sid, dump(list(prefer_users))]
         with self.connect() as db:
+            from .retrieval import squeeze
+
+            db.create_function("squeeze", 1, squeeze)
             if lexical and not vector:
                 from .retrieval import relevance
 

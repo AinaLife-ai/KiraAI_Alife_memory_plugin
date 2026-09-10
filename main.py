@@ -542,9 +542,12 @@ class AlifeMemoryPlugin(BasePlugin):
 
     # ---- 给模型看的紧凑表示 ------------------------------------------------
     @staticmethod
-    def model_text(text, reply_chars=40, desc_chars=100):
-        """剥包裹 + 压空白 + 截断嵌套的长描述（只影响模型看到的样子）。"""
-        return trim_nested(clean_text(text), reply_chars, desc_chars)
+    def model_text(text, keep=(), reply_chars=40, desc_chars=100):
+        """剥包裹 + 压空白 + 截断嵌套的长描述（只影响模型看到的样子）。
+
+        ``keep`` 传「含空格的已登记名字」：这些是真实昵称，不能被空白归一合并。
+        """
+        return trim_nested(clean_text(text, keep), reply_chars, desc_chars)
 
     async def shortmap(self, values):
         """批量生成短码映射 {真实 id: 短码}，供渲染时替换。"""
@@ -971,6 +974,7 @@ class AlifeMemoryPlugin(BasePlugin):
         subjects = await self.store.call(
             "entity_ids_for_query", query, sid, users, cfg.recall_scope
         )
+        keep_names = await self.store.call("spaced_names")  # 名字带空格的昵称，渲染时保护
         keyword_hit = any(word in query for word in cfg.recall_keywords)
         if cfg.inject_mode == "full":
             facts = await self.store.call(
@@ -1014,7 +1018,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 item = {
                     "a": related_shorts.get(r["id"], r["id"]),
                     "t": short_time(r["end"] or r["start"]),
-                    "s": self.model_text(r["summary"]),
+                    "s": self.model_text(r["summary"], keep_names),
                 }
                 if not r["active"]:
                     item["arch"] = 1
@@ -1100,7 +1104,7 @@ class AlifeMemoryPlugin(BasePlugin):
             packed = {
                 "a": archive_shorts.get(row["id"], row["id"]),
                 "t": short_time(row["end"] or row["start"]),
-                "s": self.model_text(row["summary"]),
+                "s": self.model_text(row["summary"], keep_names),
             }
             if row["role"] == "assistant":
                 packed["bot"] = 1
@@ -1476,6 +1480,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 cold_after_days=self.settings.cold_after_days,
             )
             raw_items = list(result["items"])  # 先留底：下面会换成紧凑形态
+            keep_names = await self.store.call("spaced_names")
             ids = sorted({u for r in raw_items for u in r["users"]})
             entities = await self.store.call("entities", ids=ids, limit=200) if ids else []
             shorts = await self.shortmap(
@@ -1490,7 +1495,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 item = {
                     "i": shorts.get(r["id"], r["id"]),
                     "t": short_time(r["end"] or r["start"]),
-                    "s": self.model_text(r["summary"]),
+                    "s": self.model_text(r["summary"], keep_names),
                 }
                 if r["role"] == "assistant":
                     item["bot"] = 1

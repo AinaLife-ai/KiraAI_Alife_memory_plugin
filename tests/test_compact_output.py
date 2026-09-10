@@ -45,9 +45,26 @@ def test_clean_text_strips_only_outer_container():
     assert r.clean_text("<msg><text>第一条</text></msg><msg><text>第二条</text></msg>") == (
         "第一条\n第二条"
     )
-    # CJK 之间的空格去掉（日志里的「翅 膀」就是这么来的）
-    assert r.clean_text("<msg><text>翅 膀 被 打 了</text></msg>") == "翅膀被打了"
+    # 折行残留是「孤立的一个空格」，合并掉（日志里 33 处实例全是这种）
+    assert r.clean_text("<msg><text>翅 膀被他处刑</text></msg>") == "翅膀被他处刑"
+    assert r.clean_text("群友并发布鬼图，末冬 时也在") == "群友并发布鬼图，末冬时也在"
+    # 连续被空白隔开的写法（三个以上）视为刻意强调，原样保留
+    assert r.clean_text("翅 膀 被 打 了") == "翅 膀 被 打 了"
     assert r.clean_text("<reply>123</reply>他说 3<5") == "↩123他说 3<5"
+
+
+def test_spaced_text_is_not_over_normalized():
+    """真实的空格要保住：逐字强调、以及名字里真的带空白的昵称。"""
+    # 刻意的逐字强调（三个以上汉字被空白隔开）
+    assert r.clean_text("很 重 要") == "很 重 要"
+    assert r.clean_text("不 要 这 样") == "不 要 这 样"
+    # 名字带空格：调用方（main.py）会把实体表里这类名字作为 keep 传进来
+    assert r.clean_text("今天星 月来找我", keep=["星 月"]) == "今天星 月来找我"
+    assert r.clean_text("今天星 月来找我") == "今天星月来找我"  # 不传保护名单时才会合并
+    # 保护名单里的名字不会被截断/剥离，也不受折行合并影响
+    assert r.clean_text("<msg><text>并发 布鬼图，星 月也在</text></msg>", keep=["星 月"]) == (
+        "并发布鬼图，星 月也在"
+    )
 
 
 def test_trim_nested_clips_but_keeps_conversation():

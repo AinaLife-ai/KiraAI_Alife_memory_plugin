@@ -275,6 +275,9 @@ _INLINE_RE = [
 
 _CJK = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
 _SPACE_BETWEEN_CJK = re.compile(rf"(?<=[{_CJK}])[ \t]+(?=[{_CJK}])")
+# 逐字拉开写（「很 重 要」「请 注 意」）是刻意的强调：至少三个汉字被空白隔开。
+# 折行残留只会插入「一个」空格，不可能连成这种形态，所以用它区分。
+_SPACED_OUT = re.compile(rf"[{_CJK}](?:[ \t]+[{_CJK}]){{2,}}")
 _MULTI_SPACE = re.compile(r"[ \t]{2,}")
 _BLANK_LINES = re.compile(r"\n\s*\n+")
 _LEADING_INDENT = re.compile(r"\n[ \t]+")
@@ -306,11 +309,33 @@ def _strip_wrappers(text):
     return out
 
 
-def clean_text(text):
-    """剥掉最外层包裹 + 归一空白。孤立的 ``<``、正文里的字面标签都原样保留。"""
+def clean_text(text, keep=()):
+    """剥掉最外层包裹 + 归一空白。孤立的 ``<``、正文里的字面标签都原样保留。
+
+    ``keep`` 是「不能被空白归一碰」的片段——昵称真的可能带空格（``星 月``），
+    渲染前先从实体表查出这类名字传进来，正文里的它们原样保留。
+    """
     if not text:
         return ""
-    out = _BAD_CHARS.sub("", str(text))
+    out = str(text)
+    holders = {}
+    # 刻意拉开写的强调句先原样保出来
+    for match in _SPACED_OUT.finditer(out):
+        token = "\ue000%d\ue001" % len(holders)
+        while token in out:
+            token += "\ue000"
+        holders[token] = match.group(0)
+        out = out.replace(match.group(0), token, 1)
+    for value in keep or ():
+        value = str(value or "")
+        # 只保护真正出现、且确实含空白的名字；占位符用私用区字符，不会被其它规则碰到
+        if value and value in out and any(c.isspace() for c in value):
+            token = "\ue000%d\ue001" % len(holders)
+            while token in out:
+                token += "\ue000"
+            holders[token] = value
+            out = out.replace(value, token)
+    out = _BAD_CHARS.sub("", out)
     out = _strip_wrappers(out)
     for pattern, repl in _INLINE_RE:
         out = pattern.sub(repl, out)
@@ -318,7 +343,10 @@ def clean_text(text):
     out = _BLANK_LINES.sub("\n", out)
     out = _SPACE_BETWEEN_CJK.sub("", out)
     out = _MULTI_SPACE.sub(" ", out)
-    return "\n".join(line.strip() for line in out.split("\n")).strip()
+    out = "\n".join(line.strip() for line in out.split("\n")).strip()
+    for token, value in holders.items():
+        out = out.replace(token, value)
+    return out
 
 
 def trim_nested(text, reply_chars=40, desc_chars=100):
