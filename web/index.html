@@ -9,7 +9,10 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <div class="ambient" aria-hidden="true"></div>
+    <div class="ambient" aria-hidden="true">
+      <div class="fx-stars" id="fxStars"></div>
+    </div>
+    <div class="fx-front" id="fxFront" aria-hidden="true"></div>
     <div id="boot" class="boot">
       <div class="boot-stage">
         <div class="boot-ring"></div>
@@ -61,6 +64,7 @@
           </div>
           <div class="actions">
             <button id="theme" aria-label="切换主题">◐</button
+            ><button id="fx" aria-pressed="true" aria-label="星尘特效开关">✦</button
             ><button id="motion" aria-pressed="false" aria-label="动效开关">❖</button
             ><button id="refresh" aria-pressed="true">
               <svg class="spin" viewBox="0 0 24 24" aria-hidden="true">
@@ -178,7 +182,9 @@
               id="subject"
               placeholder="按实体 ID 筛选画像"
               aria-label="实体 ID"
-            /><select id="category" aria-label="记忆维度">
+            /><label class="check"
+              ><input type="checkbox" id="factContent" />按内容搜</label
+            ><select id="category" aria-label="记忆维度">
               <option value="">全部维度</option></select
             ><button id="filterFacts">筛选</button>
           </div>

@@ -9,6 +9,9 @@
   --soft: #efebfc;
   --shadow: 0 12px 35px #24234308;
   --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  /* 星尘/流星：同色系随机色相，亮色主题用较深的紫 */
+  --fx-sat: 82%;
+  --fx-lum: 58%;
 }
 [data-theme="dark"] {
   color-scheme: dark;
@@ -20,6 +23,8 @@
   --accent: #b19afa;
   --soft: #302944;
   --shadow: none;
+  --fx-sat: 88%;
+  --fx-lum: 74%;
 }
 * {
   box-sizing: border-box;
@@ -78,6 +83,19 @@ textarea:focus-visible {
 }
 .quiet {
   background: transparent;
+}
+.field .restore {
+  font-size: 11px;
+  padding: 2px 6px;
+  margin-left: 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+}
+.field .restore:hover {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 h1,
 h2,
@@ -825,6 +843,93 @@ button:active:not(:disabled) {
   opacity: 0.08;
   animation-duration: 96s;
   animation-delay: -24s;
+}
+
+/* ---- 星尘与流星：背景一层、前景一层 ---- */
+.fx-stars {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+.fx-stars i {
+  position: absolute;
+  display: block;
+  border-radius: 50%;
+  background: hsl(var(--fx-hue) var(--fx-sat) var(--fx-lum));
+  box-shadow: 0 0 7px hsl(var(--fx-hue) var(--fx-sat) calc(var(--fx-lum) + 6%) / 0.8);
+  animation: twinkle var(--fx-dur) ease-in-out var(--fx-delay) infinite;
+}
+@keyframes twinkle {
+  0%,
+  100% {
+    opacity: 0.1;
+    transform: scale(0.8);
+  }
+  35% {
+    opacity: 0.95;
+    transform: scale(1.2);
+  }
+  62% {
+    opacity: 0.3;
+    transform: scale(1);
+  }
+}
+.meteor {
+  position: absolute;
+  animation: fx-fly var(--fx-fly) linear forwards;
+  will-change: transform, opacity;
+}
+.meteor span {
+  display: block;
+  width: var(--fx-len);
+  height: var(--fx-thick);
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    hsl(var(--fx-hue) var(--fx-sat) var(--fx-lum) / 0.85)
+  );
+  filter: drop-shadow(0 0 6px hsl(var(--fx-hue) var(--fx-sat) var(--fx-lum) / 0.85));
+}
+@keyframes fx-fly {
+  0% {
+    transform: translate3d(0, 0, 0) rotate(var(--fx-angle));
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  75% {
+    opacity: 0.9;
+  }
+  100% {
+    transform: translate3d(var(--fx-dx), var(--fx-dy), 0) rotate(var(--fx-angle));
+    opacity: 0;
+  }
+}
+.fx-front {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  overflow: hidden;
+  pointer-events: none;
+}
+.fx-front .meteor span {
+  height: 3px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    hsl(var(--fx-hue) var(--fx-sat) calc(var(--fx-lum) + 8%))
+  );
+  filter: drop-shadow(0 0 12px hsl(var(--fx-hue) 95% var(--fx-lum) / 0.95));
+}
+html[data-fx="off"] .fx-stars,
+html[data-fx="off"] .fx-front {
+  display: none;
+}
+html[data-fx-paused] .fx-stars i,
+html[data-fx-paused] .meteor {
+  animation-play-state: paused;
 }
 .shell {
   position: relative;

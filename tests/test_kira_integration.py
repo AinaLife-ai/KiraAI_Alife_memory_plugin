@@ -1442,3 +1442,59 @@ async def test_notice_messages_are_not_captured_as_user_talk(tmp_path):
         assert not any("主动感知" in text for text in summaries)
     finally:
         await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_fact_keyword_search_and_config_labels(tmp_path):
+    """事实页能按内容搜；配置项中文名由后端给出，前端不会再显示英文键名。"""
+    ctx = types.SimpleNamespace(
+        get_plugin_data_dir=lambda: tmp_path,
+        plugin_mgr=types.SimpleNamespace(plugin_configs={}),
+    )
+    plugin = module.AlifeMemoryPlugin(
+        ctx, {"alife": {"probability": 0.0, "audit_enabled": False}}
+    )
+    await plugin.initialize()
+    try:
+        store = plugin.store
+        store.capture(
+            "test:dm:u",
+            "t",
+            [{"role": "user", "content": "原料", "users": ["test:u"], "time": 1.0}],
+        )
+        record = store.active("test:dm:u")[-1]
+        store.observe_name("test:u", "萤火", source="admin")
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for category, content in (
+                ("preference", "喜欢周末去宠物店看猫"),
+                ("event", "今天加班到十点"),
+            ):
+                store._add_fact(
+                    db,
+                    "test:dm:u",
+                    {
+                        "category": category,
+                        "subject": "test:u",
+                        "content": content,
+                        "reason": "用户说的",
+                        "scenario": "",
+                        "tags": [],
+                        "relations": [],
+                        "source_ids": [record["id"]],
+                    },
+                )
+
+        found = await plugin.api_facts(keyword="宠物店")
+        assert [row["content"] for row in found] == ["喜欢周末去宠物店看猫"]
+        assert found[0]["display_name"] == "萤火"
+        assert await plugin.api_facts(keyword="查不到的词") == []
+        # 不传 keyword 时保持原来的列表行为
+        assert len(await plugin.api_facts()) == 2
+
+        labels = (await plugin.api_config())["labels"]
+        assert labels["proactive_jitter"] == "主动感知随机偏移（秒）"
+        assert labels["inject_mode"] == "注入形态"
+        assert set(labels) == set(module.Settings.model_fields)
+    finally:
+        await plugin.terminate()

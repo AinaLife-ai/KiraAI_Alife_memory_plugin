@@ -490,8 +490,10 @@ async function loadArchives() {
   $("#next").disabled = offset + 20 >= total;
 }
 async function loadFacts() {
+  const byContent = $("#factContent").checked;
   const q = new URLSearchParams({
-    subject: $("#subject").value,
+    subject: byContent ? "" : $("#subject").value,
+    keyword: byContent ? $("#subject").value : "",
     category: $("#category").value,
     offset: factOffset,
   });
@@ -836,9 +838,9 @@ function renderConfig(values) {
         '<label class="field ' +
         (wide ? "wide" : "") +
         '"><span>' +
-        esc(fields[key] || key) +
+        esc(config.labels?.[key] || fields[key] || key) +
         (restorable
-          ? '<button type="button" class="quiet" data-default="' + key + '">恢复默认</button>'
+          ? '<button type="button" class="restore" data-default="' + key + '">恢复默认</button>'
           : "") +
         "</span>" +
         input +
@@ -947,6 +949,103 @@ $("#motion").onclick = () => {
   applyMotion();
 };
 applyMotion();
+/* ---- 星尘与流星：背景一层、前景一层，同色系随机变色 ---- */
+const FX_HUES = [240, 252, 262, 272, 282, 294, 306];
+let fxEnabled = localStorage.getItem("alife-fx") !== "off";
+let fxTimers = [];
+const fxReduce = window.matchMedia("(prefers-reduced-motion: reduce)");
+const fxAllowed = () =>
+  fxEnabled && !(fxReduce.matches && !forceMotion);
+function buildStars() {
+  const layer = $("#fxStars");
+  if (!layer) return;
+  layer.innerHTML = "";
+  const count = window.innerWidth < 720 ? 36 : 72;
+  for (let i = 0; i < count; i += 1) {
+    const star = document.createElement("i");
+    const size = 1 + Math.random() * 1.9;
+    star.style.cssText =
+      "left:" + (Math.random() * 100).toFixed(2) + "%;" +
+      "top:" + (Math.random() * 100).toFixed(2) + "%;" +
+      "width:" + size.toFixed(2) + "px;height:" + size.toFixed(2) + "px;" +
+      "--fx-hue:" + FX_HUES[Math.floor(Math.random() * FX_HUES.length)] + ";" +
+      "--fx-dur:" + (2.2 + Math.random() * 4.6).toFixed(2) + "s;" +
+      "--fx-delay:" + (-Math.random() * 7).toFixed(2) + "s;";
+    layer.appendChild(star);
+  }
+}
+function spawnMeteor(front) {
+  const layer = front ? $("#fxFront") : $("#fxStars");
+  if (!layer) return;
+  const hue = FX_HUES[Math.floor(Math.random() * FX_HUES.length)];
+  const angle = 16 + Math.random() * 20;
+  const travelX = 45 + Math.random() * 45;
+  const travelY = travelX * Math.tan((angle * Math.PI) / 180) * 0.55;
+  const node = document.createElement("div");
+  node.className = "meteor";
+  node.style.cssText =
+    "left:" + (-12 + Math.random() * 66).toFixed(1) + "vw;" +
+    "top:" + (-12 + Math.random() * 44).toFixed(1) + "vh;" +
+    "--fx-hue:" + hue + ";" +
+    "--fx-angle:" + angle.toFixed(1) + "deg;" +
+    "--fx-dx:" + travelX.toFixed(1) + "vw;" +
+    "--fx-dy:" + travelY.toFixed(1) + "vh;" +
+    "--fx-len:" +
+    (front ? 150 + Math.random() * 110 : 80 + Math.random() * 90).toFixed(0) +
+    "px;--fx-thick:" + (front ? 3 : 2) + "px;" +
+    "--fx-fly:" +
+    (front ? 1.05 + Math.random() * 0.75 : 1.35 + Math.random() * 1.1).toFixed(2) +
+    "s;";
+  node.innerHTML = "<span></span>";
+  node.addEventListener("animationend", () => node.remove());
+  layer.appendChild(node);
+}
+function fxLoop(front, min, max) {
+  const tick = () => {
+    fxTimers.push(
+      setTimeout(() => {
+        if (fxAllowed() && !document.hidden) spawnMeteor(front);
+        tick();
+      }, (min + Math.random() * (max - min)) * 1000),
+    );
+  };
+  tick();
+}
+function applyFx() {
+  document.documentElement.dataset.fx = fxEnabled ? "on" : "off";
+  const button = $("#fx");
+  if (button) {
+    button.setAttribute("aria-pressed", String(fxEnabled));
+    button.classList.toggle("on", fxEnabled);
+    button.title = fxEnabled
+      ? "星尘与流星：开 · 点击关闭"
+      : "星尘与流星：关 · 点击开启";
+  }
+  fxTimers.forEach(clearTimeout);
+  fxTimers = [];
+  const back = $("#fxStars"),
+    front = $("#fxFront");
+  if (fxAllowed()) {
+    buildStars();
+    fxLoop(false, 5, 12); // 背景流星
+    fxLoop(true, 14, 30); // 前景流星：偶尔从卡片上掠过
+  } else {
+    if (back) back.innerHTML = "";
+    if (front) front.innerHTML = "";
+  }
+}
+$("#fx").onclick = () => {
+  fxEnabled = !fxEnabled;
+  localStorage.setItem("alife-fx", fxEnabled ? "on" : "off");
+  applyFx();
+};
+document.addEventListener("visibilitychange", () =>
+  document.documentElement.toggleAttribute("data-fx-paused", document.hidden),
+);
+window.addEventListener("resize", () => {
+  if (fxAllowed()) buildStars();
+});
+applyFx();
 const BOOT_QUOTES = [
   "和谁的记忆，我都不想忘记",
   "每段记忆，都有来处",
@@ -1064,6 +1163,15 @@ for (const id of ["#session", "#level", "#includeGlobal"])
       offset = 0;
       return loadArchives();
     });
+$("#factContent").onchange = () =>
+  guard(() => {
+    factOffset = 0;
+    $("#subject").placeholder = $("#factContent").checked
+      ? "搜索事实内容，比如「猫粮」「加班」"
+      : "按实体 ID 筛选画像";
+    clearGraphFocus();
+    return loadFacts();
+  });
 $("#category").onchange = () =>
   guard(() => {
     factOffset = 0;
