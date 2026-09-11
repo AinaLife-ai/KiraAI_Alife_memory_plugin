@@ -505,6 +505,34 @@ def squeeze(text):
     return _MULTI_SPACE.sub(" ", out).strip()
 
 
+def bigram_body(text):
+    """把文本切成「与 query_tokens 完全一致」的词元串，用于 FTS5 索引。
+
+    汉字按 2 字滑窗（中文双字词是常态，而 trigram 分词器要求 ≥3 字符、命中不了），
+    字母数字整段保留（否则 "iphone" 会被切成 "ip ph ho …"，查询侧就对不上 ✗）。
+    索引前走同一个 squeeze()，保证与打分侧口径一致。
+    """
+    squeezed = squeeze(text or "")
+    out = []
+    for chunk in re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", squeezed.casefold()):
+        if len(chunk) >= 2 and re.match(r"[\u3400-\u9fff]", chunk):
+            out.extend(chunk[i : i + 2] for i in range(len(chunk) - 1))
+        else:
+            out.append(chunk)
+    return " ".join(out)
+
+
+def fts_match_query(tokens):
+    """把词元拼成安全的 FTS5 MATCH 表达式（一律当短语、内部引号双写）。"""
+    quoted = []
+    for token in tokens:
+        value = str(token or "").strip()
+        if not value:
+            continue
+        quoted.append('"%s"' % value.replace('"', '""'))
+    return " OR ".join(quoted)
+
+
 def query_tokens(query):
     """查询侧词元（与 relevance 口径完全一致），供 SQL 粗筛复用。"""
     chunks = re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", squeeze(query).casefold())

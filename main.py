@@ -324,6 +324,7 @@ class AlifeMemoryPlugin(BasePlugin):
         )
         # 后台迁移：不阻塞插件加载；迁移期间记忆功能由 migration_blocked 暂停。
         self.migration_task = asyncio.create_task(self.migrate())
+        asyncio.create_task(self.build_search_index())
         self.migration_task.add_done_callback(_log_migration_failure)
         try:
             await self.refresh_bootstrap_review()
@@ -577,6 +578,15 @@ class AlifeMemoryPlugin(BasePlugin):
             for key in sorted(self._access_seen, key=self._access_seen.get)[:256]:
                 self._access_seen.pop(key, None)
         return fresh
+
+    async def build_search_index(self):
+        """后台把检索索引补齐（存量用户首次升级时用；不阻塞启动）。"""
+        try:
+            while not await self.store.call("index_backfill"):
+                await asyncio.sleep(0.05)
+            logger.debug("[记忆·Z] 检索索引已就绪")
+        except Exception as exc:  # 索引只是加速层，失败不影响任何功能
+            logger.debug("[记忆·Z] 检索索引回填失败，继续走全表检索：%s", exc)
 
     async def queue_tidy_all(self, fallback_sid=""):
         """把所有有意久记忆的会话都排上整理（去重/提炼/归档都按归属会话执行）。"""
@@ -2144,6 +2154,7 @@ class AlifeMemoryPlugin(BasePlugin):
         names = await self.store.call("entities", ids=status["sessions"], limit=1000)
         status["session_names"] = {n["id"]: n["name"] for n in names if n["name"]}
         status["version"] = await asyncio.to_thread(self._plugin_version)
+        status["search_index"] = await self.store.call("search_index_state")
         status["assets"] = await asyncio.to_thread(
             lambda: hashlib.sha256(
                 b"".join(

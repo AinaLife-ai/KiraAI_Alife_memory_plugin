@@ -424,3 +424,56 @@ async def test_memo_cache_hits_until_write(tmp_path):
     finally:
         store.call = original
         await plugin.terminate()
+
+
+def test_fts_path_matches_full_scan(tmp_path):
+    """检索索引只是加速：两条路径结果必须完全一致（含未进索引的行）。"""
+    import importlib
+    import types
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    package = types.ModuleType("alife_fts_parity")
+    package.__path__ = [str(root)]
+    sys.modules.setdefault("alife_fts_parity", package)
+    storage = importlib.import_module("alife_fts_parity.storage")
+
+    store = storage.Store(tmp_path / "db")
+    store.initialize()
+    texts = [
+        "主人喜欢喝乌龙茶，每天都喝一壶",
+        "星月最喜欢吃草莓蛋糕",
+        "上次说 iPhone 15 的事",
+        "香菇和落尘是两个人",
+        "翅 膀被人处刑了",
+    ]
+    for i, text in enumerate(texts):
+        store.capture("qq:gm:A", f"ev{i}", [
+            {"role": "user", "content": text, "users": ["u:1"], "time": float(i)}
+        ])
+    # 再塞一条「绕过本模块写入」的行（模拟外部/旧版工具写库）：它不会进索引
+    with store.connect() as db:
+        db.execute(
+            "INSERT INTO records(id,sid,role,level,start,end,summary,content,users,"
+            "position,created) VALUES ('bypass','qq:gm:A','user',0,9.0,9.0,"
+            "'主人喜欢喝乌龙茶吗','x','[]',0,9.0)"
+        )
+
+    if store.search_index_state() == "unavailable":
+        pytest.skip("本机 SQLite 无 FTS5")
+
+    for query in ("乌龙茶", "草莓蛋糕", "iphone", "翅膀", "师傅", "两个人"):
+        store._fts_state = "ready"
+        indexed = store.search("qq:gm:A", lexical=query, scope="global",
+                               users=["u:1"], limit=10, exclude_sid="")
+        store._fts_state = "building"
+        scanned = store.search("qq:gm:A", lexical=query, scope="global",
+                               users=["u:1"], limit=10, exclude_sid="")
+        assert [i["id"] for i in indexed["items"]] == [
+            i["id"] for i in scanned["items"]
+        ], query
+    # 未进索引的那条也必须能被检索到
+    store._fts_state = "ready"
+    hits = store.search("qq:gm:A", lexical="乌龙茶", scope="global",
+                        users=["u:1"], limit=10, exclude_sid="")
+    assert any(i["id"] == "bypass" for i in hits["items"]), "未索引的行被漏掉了"
