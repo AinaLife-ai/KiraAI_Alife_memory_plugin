@@ -179,9 +179,8 @@ class Store:
               rewrite_attempts INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS fact_identity ON facts(sid,subject,fingerprint,deleted);
             CREATE INDEX IF NOT EXISTS fact_subject ON facts(sid,subject,category,deleted);
-            -- 降级拼接、等着重做的事实（正常情况下一行都没有）
-            CREATE INDEX IF NOT EXISTS fact_rewrite ON facts(rewrite_pending)
-              WHERE rewrite_pending=1;
+            -- 注意：依赖新增列的索引必须放在下面的 ALTER 迁移**之后**建，
+            -- 否则老库（还没有那一列）会在这一步直接报 no such column ✗
             CREATE TABLE IF NOT EXISTS short_ids (
               short TEXT PRIMARY KEY, real TEXT NOT NULL UNIQUE, created REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS short_id_real ON short_ids(real);
@@ -295,6 +294,12 @@ class Store:
                     "UPDATE facts SET created=coalesce((SELECT max(r.start) FROM records r,"
                     " json_each(facts.sources) s WHERE r.id=s.value),0)"
                 )
+            # 依赖新增列的索引要放在迁移**之后**建：老库要先补齐列，
+            # 否则这一步直接 `no such column`（v2.13.0 的线上事故就出在这）
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS fact_rewrite ON facts(rewrite_pending) "
+                "WHERE rewrite_pending=1"
+            )
             db.execute(
                 "UPDATE jobs SET state='queued',detail='resumed after restart' WHERE state='running'"
             )

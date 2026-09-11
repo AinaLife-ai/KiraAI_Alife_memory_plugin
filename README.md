@@ -307,6 +307,28 @@ python tools/web_audit.py                 # 前端静态审计：属性读写配
 <details>
 <summary><b>📝 更新日志（点击展开）</b></summary>
 
+### v2.13.1 (2026-09-12) — 修 v2.13.0 的启动事故：老库升级失败 🚑
+
+**现象**：合并 v2.13.0 后插件直接起不来 ——
+`Failed to initialize plugin alife_memory_z: no such column: rewrite_pending` ✗
+
+**根因**：v2.13.0 把「依赖新列的部分索引」建在了**建表脚本**里，而补列（`ALTER TABLE
+facts ADD COLUMN rewrite_pending`）在**后面的迁移块**里 —— 全新库没事（建表时就带列），
+但**老库**执行到 `CREATE INDEX ... WHERE rewrite_pending=1` 时那一列还不存在 → `no such column`
+→ `initialize()` 抛错 → 插件初始化失败 ✗
+
+**为什么测试没拦住**：当时的测试**全都建全新的库**，迁移路径一次都没跑过 ✗
+（这正是「老库升级」和「新装」的分叉点。）
+
+**修复**：把该索引移到事实列表迁移**之后**创建（并把这条规矩写成注释留在代码里）。
+
+**新增 `tests/test_schema_upgrade.py`**（4 项）：先手工造一个**老 schema 的 facts 表**，
+再跑 `initialize()`，断言
+① 不抛错、② 两列被补上、③ 依赖新列的索引也建出来了、④ 老数据一个字不动、⑤ 重复 initialize 幂等。
+**反向验证**：把索引挪回建表脚本里，这 4 项立刻全红 ✓（说明它真的能拦住这次的事故）。
+
+数据安全：事故发生在 schema 阶段，**没有丢任何数据**；升级到本版本即可自愈。
+
 ### v2.13.0 (2026-09-12) — 降级拼接的事实可以重做了 🔁
 
 **问题**：事实合并时如果模型输出不可用，会走降级"按时间拼接"（`engine.py:973-1005`）。
@@ -341,7 +363,7 @@ python tools/web_audit.py                 # 前端静态审计：属性读写配
   写死了 `#ffffff96`** ✗ 暗色下白得刺眼 → 改成 `--sheen` 变量（亮色 `#ffffff96` / 暗色 `#ffffff33`）。
 - 新增 `tests/test_theme.py`：主题必须持久化、恢复脚本必须在样式表之前、开屏样式里不许有写死的颜色。
 
-测试：默认 287 passed 10 skipped；KIRA_CORE 333 passed；web_audit 0。
+测试：默认 291 passed 10 skipped；KIRA_CORE 337 passed；web_audit 0。
 
 ### v2.12.1 (2026-09-12) — 清洗后只剩空外壳的历史记录移入回收站 🗑
 
