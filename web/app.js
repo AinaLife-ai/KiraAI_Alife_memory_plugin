@@ -265,16 +265,7 @@ function tasksHtml(jobs) {
         .map(
           (j) =>
             '<div class="task"><div><strong>' +
-            esc(
-              {
-                compress: "分层压缩",
-                audit: "事实审计",
-                reindex: "语义索引",
-                classify: "记忆归类",
-                dedupe: "永久记忆合并",
-                proactive: "主动感知",
-              }[j.kind] || j.kind,
-            ) +
+            esc(JOB_KINDS[j.kind] || j.kind) +
             '</strong><div class="muted">' +
             esc(j.sid) +
             "</div><small>" +
