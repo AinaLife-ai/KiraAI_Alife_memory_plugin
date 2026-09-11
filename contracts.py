@@ -460,7 +460,9 @@ class NewMemory(Strict):
 
 
 class Job(Strict):
-    kind: Literal["compress", "audit", "reindex", "dedupe"]
+    # tidy 也允许手动排队：Bot 用 CorrectMemory(action=tidy) 触发，
+    # 工作台的这个按钮走同一条链路。
+    kind: Literal["compress", "audit", "reindex", "dedupe", "tidy"]
     sid: Short
 
 

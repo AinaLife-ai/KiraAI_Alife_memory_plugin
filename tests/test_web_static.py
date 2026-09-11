@@ -4,6 +4,7 @@
 """
 
 import re
+import sys
 from pathlib import Path
 
 WEB = Path(__file__).resolve().parents[1] / "web"
@@ -95,3 +96,25 @@ def test_job_kind_labels_cover_every_queued_kind():
     # 只允许一份 kind→中文 映射：按「键: "标签"」的形式数，避免误伤配置帮助文案
     for entry in ('compress: "分层压缩"', 'audit: "事实审计"', 'fact_merge: "事实合并"'):
         assert js.count(entry) == 1, f"重复的任务名映射：{entry} 出现 {js.count(entry)} 次"
+
+
+def test_manual_job_buttons_match_backend_contract():
+    """工作台每个手动按钮的 kind，后端契约都必须接受（否则点了就是 422）。"""
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    buttons = set(re.findall(r'data-job="([a-z_]+)"', html))
+    assert buttons, "没找到手动排队按钮"
+
+    import importlib
+    import types
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1]
+    package = types.ModuleType("alife_btn_test")
+    package.__path__ = [str(root)]
+    sys.modules.setdefault("alife_btn_test", package)
+    contracts = importlib.import_module("alife_btn_test.contracts")
+    allowed = set(contracts.Job.model_fields["kind"].annotation.__args__)
+    missing = buttons - allowed
+    assert not missing, f"按钮 kind 未被后端接受：{sorted(missing)}"
+    # 「整理永久记忆」必须真的在
+    assert "tidy" in buttons, "工作台缺少「整理永久记忆」按钮"
