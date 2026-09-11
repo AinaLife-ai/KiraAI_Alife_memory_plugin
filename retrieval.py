@@ -505,31 +505,53 @@ def squeeze(text):
     return _MULTI_SPACE.sub(" ", out).strip()
 
 
-def bigram_body(text):
-    """把文本切成「与 query_tokens 完全一致」的词元串，用于 FTS5 索引。
+def index_grams(text):
+    """把文本切成「与 query_tokens 完全一致口径」的 n-gram 串，用于 FTS5 索引。
 
-    汉字按 2 字滑窗（中文双字词是常态，而 trigram 分词器要求 ≥3 字符、命中不了），
-    字母数字整段保留（否则 "iphone" 会被切成 "ip ph ho …"，查询侧就对不上 ✗）。
-    索引前走同一个 squeeze()，保证与打分侧口径一致。
+    唯一的硬性要求：**索引候选集必须是打分结果的超集**——打分侧是子串匹配
+    （``instr``，见 ``_lexical_sql``），任何"打分能命中、索引查不到"的行都会被
+    静默漏召回（实测：单字查询「猫」查不到「…欢猫」，就是索引里只留了双字
+    滑窗、没有单字）。
+
+    于是收录：每个字/字符本身（覆盖单字词元），以及每一对相邻字/字符
+    （覆盖 ≥2 字词元——它若出现在文本里，它的每一对相邻字也都在文本里，
+    词元之间是 OR，命中一对即入选）。查询侧对 ≥3 字的词元做同样的拆对
+    （见 fts_match_query），所以「iph」能查到「iphone」这种跨词边界的子串。
+    汉字必须留双字滑窗：trigram 分词器对中文双字词命中不了（实测）。
+    索引前走同一个 squeeze()/casefold，保证与打分侧口径一致。
     """
     squeezed = squeeze(text or "")
     out = []
     for chunk in re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", squeezed.casefold()):
-        if len(chunk) >= 2 and re.match(r"[\u3400-\u9fff]", chunk):
+        out.extend(chunk)  # 单字：单字查询词元唯一的命中机会
+        if len(chunk) >= 2:
             out.extend(chunk[i : i + 2] for i in range(len(chunk) - 1))
-        else:
-            out.append(chunk)
     return " ".join(out)
 
 
+# 旧名（v2.11.0）：索引体只含双字滑窗，现已补齐单字，保留别名避免外部引用失效
+bigram_body = index_grams
+
+
 def fts_match_query(tokens):
-    """把词元拼成安全的 FTS5 MATCH 表达式（一律当短语、内部引号双写）。"""
+    """把词元拼成安全的 FTS5 MATCH 表达式（一律当短语、内部引号双写）。
+
+    ≥3 字的词元再拆成二元组：打分侧是**子串**匹配，原文里的词可能更长
+    （"iph" ⊂ "iphone"），整词在索引里查不到，但它的二元组一定在
+    （``index_grams`` 收录了每个相邻对）→ 候选集不会漏。
+    词元之间是 OR：只放宽候选，绝不收窄。
+    """
     quoted = []
     for token in tokens:
         value = str(token or "").strip()
         if not value:
             continue
-        quoted.append('"%s"' % value.replace('"', '""'))
+        pieces = (
+            [value]
+            if len(value) <= 2
+            else [value[i : i + 2] for i in range(len(value) - 1)]
+        )
+        quoted.extend('"%s"' % piece.replace('"', '""') for piece in pieces)
     return " OR ".join(quoted)
 
 

@@ -17,9 +17,22 @@ from contextlib import contextmanager, closing
 from pathlib import Path
 from .contracts import dump, relation_issue
 from .output_validation import validate_audit
-from .retrieval import bigram_body, identity_info
+from .retrieval import index_grams, identity_info
 
 logger = logging.getLogger(__name__)
+
+# 索引体占位符：摘要里没有任何可检索文字（空串、只有标点/空格）时用它。
+# 必须是**非空**的，因为 search_body='' 的语义是「还没进索引」（召回侧靠这个条件
+# 兜底，保证绕过本模块写入的行也不会被漏掉）；这类摘要若也写空串，回填每批都会
+# 再把它们捞出来 → 后台回填永不结束（界面会一直停在「索引 回填中」）。
+# "-" 在 FTS5 默认分词器下不产生任何词元，因此永远不会被查询命中——
+# 而这些行的词面得分本来恒为 0，本来就不会被召回，所以没有召回损失。
+NO_TOKENS = "-"
+
+# 索引体口径版本：口径一变，旧索引体必须重算，否则会静默漏召回。
+#   1 = v2.11.0，只有双字滑窗（单字查询查不到 → 漏）
+#   2 = v2.11.1，补上单字 + 查询侧 ≥3 字词元拆对（候选集 = 打分结果的超集）
+SEARCH_INDEX_SCHEME = "2"
 
 
 class Conflict(ValueError):
@@ -28,6 +41,15 @@ class Conflict(ValueError):
 
 def uid():
     return uuid.uuid4().hex
+
+
+def search_body_of(summary):
+    """与查询侧同口径的索引体；没有可检索文字时退化为占位符。
+
+    所有写 summary 的地方都必须用它算 search_body：
+    漏掉一处，那条记录就会在「编辑/新增后」悄悄离开 FTS 候选集 → 静默漏召回。
+    """
+    return index_grams(summary) or NO_TOKENS
 
 
 def _lexical_sql(column, tokens):
@@ -63,6 +85,8 @@ def _lexical_scorer(query):
 class Store:
     def __init__(self, path: Path):
         self._fts_state = "unknown"  # unknown/ready/building/unavailable
+        self._fts_stats = {"filled": 0, "plain": 0}  # 本次补齐 / 其中无可检索文字
+        self._fts_stale = False  # 索引体口径与当前代码不同（需后台重算）
         self.path = path
 
     async def call(self, method, *args, **kwargs):
@@ -89,9 +113,9 @@ class Store:
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
         # FTS 触发器要用到它（连接级注册，成本可忽略）
-        from .retrieval import bigram_body
+        from .retrieval import index_grams
 
-        db.create_function("bigram_body", 1, bigram_body)
+        db.create_function("index_grams", 1, index_grams)
         try:
             with db:
                 yield db
@@ -294,27 +318,81 @@ class Store:
                    BEGIN INSERT INTO records_fts(records_fts,rowid,body)
                    VALUES('delete', old.rowid, old.search_body); END"""
             )
+            # 召回时每次都要点一遍「还没进索引的行」（正常情况下一条都没有），
+            # 给它一个部分索引：索引扫描 0 行，成本可忽略；
+            # 没有它的话这个探测就是全表扫描（12k 条 ≈ 18ms，比索引省的还多）。
+            # 注意不能写 ON records(rowid)——CREATE INDEX 不认 rowid 这个别名
+            # （no such column: rowid）；普通索引本来就隐含 rowid，够用。
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS record_unindexed ON records(id) "
+                "WHERE search_body=''"
+            )
         with self.connect() as db:
             missing = db.execute(
                 "SELECT 1 FROM records WHERE search_body='' LIMIT 1"
             ).fetchone()
-        self._fts_state = "building" if missing else "ready"
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='search_index_scheme'"
+            ).fetchone()
+            stored = row["value"] if row else None
+            if stored is None and not db.execute(
+                "SELECT 1 FROM records LIMIT 1"
+            ).fetchone():
+                # 空库：没有旧索引体要作废，直接把口径记下（新装用户不会看到「回填中」）
+                db.execute(
+                    "INSERT OR REPLACE INTO meta(key,value) "
+                    "VALUES ('search_index_scheme',?)",
+                    (SEARCH_INDEX_SCHEME,),
+                )
+                stored = SEARCH_INDEX_SCHEME
+        # 口径不同 = 旧索引体不可用（单字查询会漏），后台重算（见 prepare_search_index）
+        self._fts_stale = stored != SEARCH_INDEX_SCHEME
+        self._fts_state = (
+            "building" if (missing or self._fts_stale) else "ready"
+        )
+        return True
+
+    def prepare_search_index(self):
+        """索引体口径升级时作废旧索引体；返回是否作了废（后台回填会重算）。
+
+        用 UPDATE 而不是 DROP：AFTER UPDATE OF search_body 触发器会把 FTS 里的
+        旧词元删掉，避免外部内容表"与索引时不一致"（那会直接报 SQL logic error）。
+        在后台任务里跑，不阻塞插件加载。
+        """
+        if not getattr(self, "_fts_stale", False):
+            return False
+        with self.connect() as db:
+            db.execute("UPDATE records SET search_body=''")
+            db.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES ('search_index_scheme',?)",
+                (SEARCH_INDEX_SCHEME,),
+            )
+        self._fts_stale = False
         return True
 
     def index_backfill(self, batch=500):
-        """补齐 search_body 列与索引；返回是否已全部覆盖（供后台分批调用）。"""
+        """补齐 search_body 列与索引；返回是否已全部覆盖（供后台分批调用）。
+
+        每批都必须让候选集**真的变小**，否则循环永不结束：没有可检索文字的摘要
+        写占位符（见 search_body_of），所以它们处理完就不再是「未进索引」的行。
+        """
         with self.connect() as db:
             rows = db.execute(
                 "SELECT rowid, summary FROM records WHERE search_body='' LIMIT ?",
                 (batch,),
             ).fetchall()
             if not rows:
-                self._fts_state = "ready"
+                # 索引本机不可用时不要"修好"状态：那会让召回每次白试一遍。
+                if self._fts_state != "unavailable":
+                    self._fts_state = "ready"
                 return True
+            bodies = [search_body_of(row["summary"]) for row in rows]
             db.executemany(
                 "UPDATE records SET search_body=? WHERE rowid=?",
-                [(bigram_body(row["summary"]), row["rowid"]) for row in rows],
+                [(body, row["rowid"]) for body, row in zip(bodies, rows)],
             )
+        self._fts_stats["filled"] += len(bodies)
+        self._fts_stats["plain"] += sum(1 for body in bodies if body == NO_TOKENS)
         return False
 
     def rebuild_search_index(self):
@@ -323,7 +401,7 @@ class Store:
             for row in db.execute("SELECT rowid, summary FROM records").fetchall():
                 db.execute(
                     "UPDATE records SET search_body=? WHERE rowid=?",
-                    (bigram_body(row["summary"]), row["rowid"]),
+                    (search_body_of(row["summary"]), row["rowid"]),
                 )
             db.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')")
         self._fts_state = "ready"
@@ -333,11 +411,29 @@ class Store:
         """索引状态：unavailable / ready / building（供界面显示，不查库）。"""
         return self._fts_state
 
+    def search_index_stats(self):
+        """本次补齐的条数（供日志说明「到底好没好」）。"""
+        return dict(self._fts_stats)
+
+    def abandon_search_index(self):
+        """回填失败时降级：索引不再参与检索（全表路径始终是正确的那个）。
+
+        绝不能把状态留在 building —— 那会让界面永远显示「索引 回填中」，
+        却既没有在回填、也不会好。
+        """
+        self._fts_state = "unavailable"
+        return self._fts_state
+
     def _fts_hits(self, tokens, cap=1200):
         """用 FTS 索引取候选 rowid；索引不可用/命中过宽时返回 None（走全表）。
 
         返回 None 只表示"不优化"，不表示"没有命中"——调用方必须退回全表路径，
         这样两条路径的结果始终一致。
+
+        候选里**一定**要带上「还没进索引的行」（外部工具直接写库的老记录）：
+        它们在 SQL 里若用 ``search_body='' OR …`` 表达，SQLite 会因为 OR 放弃
+        rowid 索引、退化成全表扫描（实测 0.3ms → 18ms，索引等于白建）。
+        所以这里直接把它们的 rowid 并进候选列表。
         """
         if not tokens or self._fts_state != "ready":
             return None
@@ -352,12 +448,16 @@ class Store:
                     "SELECT rowid FROM records_fts WHERE records_fts MATCH ? LIMIT ?",
                     (match, cap + 1),
                 ).fetchall()
+                missing = db.execute(
+                    "SELECT rowid FROM records WHERE search_body='' LIMIT ?",
+                    (cap + 1,),
+                ).fetchall()
         except sqlite3.Error:
             self._fts_state = "unavailable"
             return None
-        if len(rows) > cap:
+        if len(rows) > cap or len(missing) > cap:
             return None
-        return [row["rowid"] for row in rows]
+        return [row["rowid"] for row in rows] + [row["rowid"] for row in missing]
 
     def revision(self):
         """当前库版本号（写入即 +1，供进程内缓存判失效）。"""
@@ -689,23 +789,27 @@ class Store:
             ).fetchone()[0]
             for index, msg in enumerate(messages):
                 pos += 1
+                # The summary is what reaches the model; content keeps the full text.
+                summary = msg.get("summary") or msg["content"]
                 db.execute(
                     """INSERT OR IGNORE INTO records
-                  (id,sid,role,level,start,end,summary,content,users,position,event_key,created)
-                  VALUES (?,?,?,0,?,?,?,?,?,?,?,?)""",
+                  (id,sid,role,level,start,end,summary,content,users,position,event_key,created,search_body)
+                  VALUES (?,?,?,0,?,?,?,?,?,?,?,?,?)""",
                     (
                         uid(),
                         sid,
                         msg["role"],
                         msg["time"],
                         msg["time"],
-                        # The summary is what reaches the model; content keeps the full text.
-                        msg.get("summary") or msg["content"],
+                        summary,
                         msg["content"],
                         dump(msg["users"]),
                         pos,
                         f"{sid}:{event_key}:{index}",
                         time.time(),
+                        # 建索引体：否则新记录要等到下次启动回填才进索引，
+                        # 加速会随会话进行而失效（且编辑后可能静默漏召回）。
+                        search_body_of(summary),
                     ),
                 )
             self.bump(db)
@@ -1223,7 +1327,7 @@ class Store:
                 db.execute(
                     "UPDATE records SET summary=?,search_body=?,"
                     "revision=revision+1 WHERE id=?",
-                    (new_summary, bigram_body(new_summary), row["id"]),
+                    (new_summary, search_body_of(new_summary), row["id"]),
                 )
                 report["rewritten"] += 1
                 report["freed_chars"] += max(0, len(summary) - len(new_summary))
@@ -1448,8 +1552,8 @@ class Store:
             )
             users = sorted({u for r in candidates for u in r["users"]})
             db.execute(
-                """INSERT INTO records(id,sid,role,level,start,end,summary,content,users,position,created)
-               VALUES (?,?,'assistant',?,?,?,?,?,?,?,?)""",
+                """INSERT INTO records(id,sid,role,level,start,end,summary,content,users,position,created,search_body)
+               VALUES (?,?,'assistant',?,?,?,?,?,?,?,?,?)""",
                 (
                     archive_id,
                     sid,
@@ -1461,6 +1565,7 @@ class Store:
                     dump(users),
                     min(r["position"] for r in candidates),
                     time.time(),
+                    search_body_of(output["summary"]),
                 ),
             )
             visibility = {r.get("visibility", "session") for r in candidates}
@@ -1496,8 +1601,8 @@ class Store:
             record_id = f"100-{int(start * 1000)}-{int(end * 1000)}-{uid()[:12]}"
             db.execute(
                 """INSERT INTO records(id,sid,role,level,start,end,summary,content,users,
-              permanent,position,created,importance,category)
-              VALUES (?,?,'assistant',100,?,?,?,?,?,1,0,?,?,?)""",
+              permanent,position,created,importance,category,search_body)
+              VALUES (?,?,'assistant',100,?,?,?,?,?,1,0,?,?,?,?)""",
                 (
                     record_id,
                     sid,
@@ -1509,6 +1614,7 @@ class Store:
                     time.time(),
                     int(importance),
                     str(category or ""),
+                    search_body_of(content),
                 ),
             )
             self.bump(db)
@@ -1674,7 +1780,7 @@ class Store:
             db.execute(
                 "UPDATE records SET summary=?,search_body=?,"
                 "revision=revision+1 WHERE id=?",
-                (content, bigram_body(content), target_id),
+                (content, search_body_of(content), target_id),
             )
             folded_at = time.time()
             for record_id in ids:
@@ -1723,6 +1829,11 @@ class Store:
                 (kind, target, dump(dict(old)), reason, time.time()),
             )
             updates = dict(patch)
+            if kind == "record" and "summary" in updates:
+                # 摘要改了，索引体必须跟着改：否则 FTS 里留的还是旧文字，
+                # 这条记录既不会出现在命中集里、又不满足 search_body='' 的兜底条件
+                # → 之后词面检索会静默漏掉它（直到下次启动回填）。
+                updates["search_body"] = search_body_of(updates["summary"])
             if kind == "record" and "active" in patch:
                 # Forget means "keep the archive but stop surfacing it"; restore revives it.
                 if patch["active"]:
@@ -1776,7 +1887,7 @@ class Store:
             if kind == "record" and "summary" in updates:
                 # 恢复的是旧快照，索引体必须按恢复后的摘要重算，
                 # 否则 FTS 外部内容表会因"与索引时不一致"报错
-                updates["search_body"] = bigram_body(updates["summary"])
+                updates["search_body"] = search_body_of(updates["summary"])
             values = [dump(v) if isinstance(v, (list, dict)) else v for v in updates.values()]
             db.execute(
                 f"UPDATE {table} SET {','.join(k + '=?' for k in updates)},"
@@ -1983,10 +2094,12 @@ class Store:
                 hits = self._fts_hits(tokens)
                 if hits is not None:
                     # 先用 FTS 索引取候选（命中太宽返回 None → 退回全表）。
-                    # 关键：search_body 为空的行 = 还没进索引的行，必须一并参与，
-                    # 否则任何绕过本模块写入的记录都会被静默漏掉 → 召回减少。
+                    # 这里**只能**是纯 rowid 约束：一旦写成
+                    # ``(search_body='' OR rowid IN …)``，SQLite 就会放弃 rowid
+                    # 索引、退化成全表扫描 → 索引白建（实测 0.3ms → 18ms）。
+                    # 「还没进索引的行」由 _fts_hits 直接并进候选列表（见那里）。
                     clauses.append(
-                        "(search_body='' OR rowid IN (SELECT value FROM json_each(?)))"
+                        "rowid IN (SELECT value FROM json_each(?))"
                     )
                     args.append(dump(hits))
             # 归档也参与召回时，同分让常驻的排在前面：

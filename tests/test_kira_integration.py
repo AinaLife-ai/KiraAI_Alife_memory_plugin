@@ -23,7 +23,8 @@ from core.agent.message import OpenAIMessage
 from core.prompt_manager import Prompt
 from core.chat import MessageChain
 from core.chat.message_elements import Text
-from core.chat.message_utils import KiraIMMessage, KiraMessageBatchEvent
+from core.chat.message_utils import KiraIMMessage, KiraMessageBatchEvent, KiraMessageEvent
+from core.adapter.adapter_info import AdapterInfo
 from core.chat.session import User, Session
 
 
@@ -1662,5 +1663,54 @@ async def test_trash_lists_cold_and_restores(tmp_path):
                 json_request({"kind": "fact", "target": "missing"})
             )
         assert error.value.status_code == 404
+    finally:
+        await plugin.terminate()
+
+
+def make_single_event():
+    """on.im_message 收到的是**单条消息**事件（KiraMessageEvent），只有 .message。"""
+    session = Session(adapter_name="test", session_type="dm", session_id="u")
+    msg = KiraIMMessage(
+        message_id="single",
+        self_id="bot",
+        chain=MessageChain([Text("我喜欢猫")]),
+        timestamp=100,
+        sender=User(user_id="u", nickname="小明"),
+    )
+    msg.message_str = "[小明] 我喜欢猫"
+    return KiraMessageEvent(
+        message_types=[],
+        timestamp=100,
+        message=msg,
+        adapter=AdapterInfo(enabled=True, adapter_id="test", name="test", platform="QQ"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_prewarm_hook_accepts_single_message_event(tmp_path):
+    """回归：预热钩子把单条消息事件当批量事件读 → AttributeError 刷屏（线上已报）。"""
+    from test_helpers_plugin import build_plugin
+
+    plugin, store = await build_plugin(tmp_path)
+    try:
+        event = make_single_event()
+        await plugin.on_message_prewarm(event)  # 修复前这里抛 AttributeError
+        # 预热键必须落在真实会话上（单条事件没有 .sid，得走 .session.sid）
+        assert plugin._prewarm_seen.get(event.session.sid)
+        assert not plugin._prewarm_seen.get("")
+        # 预热是后台任务：给它一点时间跑完（最多 0.5 秒，通常一两轮就够）
+        for _ in range(50):
+            if plugin._memo:
+                break
+            await asyncio.sleep(0.01)
+        # 预热必须真的预热到「注入时用的那个键」，否则只是一次白算
+        assert (
+            "context",
+            event.session.sid,
+            ("test:u",),
+            plugin.settings.recall_scope,
+        ) in plugin._memo
+        # 两种事件形态取到同一份用户 id（预热缓存键要对得上注入时的键）
+        assert module.user_ids(event) == module.user_ids(make_event()) == ["test:u"]
     finally:
         await plugin.terminate()
