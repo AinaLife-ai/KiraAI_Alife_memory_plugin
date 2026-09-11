@@ -118,3 +118,22 @@ def test_manual_job_buttons_match_backend_contract():
     assert not missing, f"按钮 kind 未被后端接受：{sorted(missing)}"
     # 「整理永久记忆」必须真的在
     assert "tidy" in buttons, "工作台缺少「整理永久记忆」按钮"
+
+
+def test_asset_change_uses_versioned_reload():
+    """插件更新后要带版本参数跳转，否则 WebView 会拿缓存，用户看不到新功能。"""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "location.replace(url)" in js or "location.replace(" in js, "更新后应带版本跳转"
+    assert "?v=" in js and "next.assets" in js, "跳转要带上资源指纹"
+    # 旧的裸 reload 在资源变化分支里必须已经不存在
+    segment = js[js.index("asset && asset !== next.assets") :]
+    segment = segment[: segment.index("return;")]
+    assert "location.reload();" not in segment, "不要再用裸 reload（会吃缓存）"
+
+
+def test_status_reports_version_for_self_check():
+    """界面要能显示当前插件版本，便于用户自查是不是旧版。"""
+    source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+    assert '_plugin_version' in source and 'status["version"]' in source
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "next.version" in js, "前端要显示版本号"
