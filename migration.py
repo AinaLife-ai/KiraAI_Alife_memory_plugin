@@ -20,6 +20,7 @@ except ImportError:
 
 from .contracts import Fact, dump
 from . import identity
+from .storage import search_body_of
 
 SIMPLE = "kira_plugin_simple_memory"
 KIRAOS = "kira_plugin_kiraos"
@@ -420,8 +421,8 @@ def import_snapshot(store, snapshot):
                         }
                     )
                     db.execute(
-                        """INSERT INTO records (id,sid,role,level,start,end,summary,content,users,position,created,visibility)
-                        VALUES (?,?,'user',0,?,?,?,?,?,?,?,?)""",
+                        """INSERT INTO records (id,sid,role,level,start,end,summary,content,users,position,created,visibility,search_body)
+                        VALUES (?,?,'user',0,?,?,?,?,?,?,?,?,?)""",
                         (
                             record_id,
                             item["sid"],
@@ -433,6 +434,7 @@ def import_snapshot(store, snapshot):
                             position,
                             time.time(),
                             item["visibility"],
+                            search_body_of(item["content"]),
                         ),
                     )
                     item["fact"]["source_ids"] = [record_id]

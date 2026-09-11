@@ -120,12 +120,41 @@ def _log_migration_failure(task):
         )
 
 
+def event_messages(event):
+    """取事件里的消息列表。
+
+    框架有两种事件：批量事件（KiraMessageBatchEvent）有 `.messages`，
+    而单条消息事件（KiraMessageEvent，on.im_message 收到的就是它）只有 `.message`。
+    只认 `.messages` 会在 im_message 钩子里直接 AttributeError（实测踩过）。
+    """
+    messages = getattr(event, "messages", None)
+    if messages is None:
+        single = getattr(event, "message", None)
+        return [] if single is None else [single]
+    return messages
+
+
+def event_sid(event):
+    """事件所属会话 id。
+
+    批量事件（KiraMessageBatchEvent）自带 `.sid`；单条消息事件
+    （KiraMessageEvent，on.im_message 收到的那个）**没有 sid 属性**，
+    只有 `.session` —— 直接 getattr(event, "sid", "") 会拿到空串，
+    预热就会把缓存算到 "" 这个假会话上，等真正注入时永远命中不了。
+    """
+    value = getattr(event, "sid", None)
+    if value:
+        return value
+    session = getattr(event, "session", None)
+    return getattr(session, "sid", "") or ""
+
+
 def user_ids(event):
     adapter = getattr(getattr(event, "session", None), "adapter_name", "")
     return sorted(
         {
             f"{adapter}:{m.sender.user_id}"
-            for m in event.messages
+            for m in event_messages(event)
             if getattr(m, "sender", None)
             # 通知类消息的发送者是占位符（群聊里是 unknown），不能当成人
             and str(getattr(m.sender, "user_id", "") or "").strip()
@@ -581,12 +610,31 @@ class AlifeMemoryPlugin(BasePlugin):
 
     async def build_search_index(self):
         """后台把检索索引补齐（存量用户首次升级时用；不阻塞启动）。"""
+        if self.store.search_index_state() == "unavailable":
+            logger.info("[记忆·Z] 本机 SQLite 无 FTS5，检索走全表（功能不受影响）")
+            return
         try:
+            if await self.store.call("prepare_search_index"):
+                logger.info("[记忆·Z] 检索索引口径已升级，正在后台重算…")
             while not await self.store.call("index_backfill"):
                 await asyncio.sleep(0.05)
-            logger.debug("[记忆·Z] 检索索引已就绪")
         except Exception as exc:  # 索引只是加速层，失败不影响任何功能
-            logger.debug("[记忆·Z] 检索索引回填失败，继续走全表检索：%s", exc)
+            # 降级必须显式标记：状态留在 building 会让界面永远显示「索引 回填中」，
+            # 既没在回填、也不会好。
+            await self.store.call("abandon_search_index")
+            logger.warning(
+                "[记忆·Z] 检索索引回填失败，改用全表检索（召回不受影响）：%s", exc
+            )
+            return
+        stats = self.store.search_index_stats()
+        if stats["filled"] or stats["plain"]:
+            logger.info(
+                "[记忆·Z] 检索索引已就绪：本次补齐 %s 条（其中 %s 条没有任何可检索文字）",
+                stats["filled"],
+                stats["plain"],
+            )
+        else:
+            logger.info("[记忆·Z] 检索索引已就绪（无待补齐记录）")
 
     async def queue_tidy_all(self, fallback_sid=""):
         """把所有有意久记忆的会话都排上整理（去重/提炼/归档都按归属会话执行）。"""
@@ -1014,7 +1062,7 @@ class AlifeMemoryPlugin(BasePlugin):
         cfg = self.runtime_settings()
         if not cfg.enabled or not cfg.auto_inject:
             return
-        sid = getattr(event, "sid", "")
+        sid = event_sid(event)
         now = time.time()
         if now - self._prewarm_seen.get(sid, 0) < 2:
             return  # 同一会话 2 秒内只预热一次，避免连发消息时重复计算
