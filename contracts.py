@@ -315,6 +315,7 @@ class Settings(Strict):
     permanent_tidy_days: int = Field(default=14, ge=0, le=3650)
     fact_merge_cross_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
     fact_merge_evidence: bool = True
+    inject_budget_ms: int = Field(default=0, ge=0, le=10000)
     permanent_dedupe_cross_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
     permanent_dedupe: bool = True
     dedupe_force_merge: bool = True

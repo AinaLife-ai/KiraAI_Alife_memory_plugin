@@ -505,17 +505,25 @@ def squeeze(text):
     return _MULTI_SPACE.sub(" ", out).strip()
 
 
-def relevance(query, text):
+def query_tokens(query):
+    """查询侧词元（与 relevance 口径完全一致），供 SQL 粗筛复用。"""
     chunks = re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", squeeze(query).casefold())
-    tokens = {
-        t
-        for c in chunks
-        for t in (
-            [c]
-            if len(c) < 2 or not re.match(r"[\u3400-\u9fff]", c)
-            else [c[i : i + 2] for i in range(len(c) - 1)]
-        )
-    } - STOP
+    return sorted(
+        {
+            t
+            for chunk in chunks
+            for t in (
+                [chunk]
+                if len(chunk) < 2 or not re.match(r"[\u3400-\u9fff]", chunk)
+                else [chunk[i : i + 2] for i in range(len(chunk) - 1)]
+            )
+        }
+        - STOP
+    )
+
+
+def relevance(query, text):
+    tokens = query_tokens(query)
     lowered = squeeze(text).casefold()
     return sum(len(t) * (t in lowered) for t in tokens)
 

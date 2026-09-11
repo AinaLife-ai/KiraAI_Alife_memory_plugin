@@ -27,6 +27,36 @@ def uid():
     return uuid.uuid4().hex
 
 
+def _lexical_sql(column, tokens):
+    """把「词元命中 × 词长」的求和写成 SQL 表达式（纯 C 层，无 Python 回调）。
+
+    与 relevance() 口径完全一致：score = Σ len(token)（命中即计入）。
+    tokens 来自 query_tokens（只含字母数字与汉字），这里转义单引号后安全内联。
+    """
+    parts = []
+    for token in tokens:
+        literal = "'" + str(token).replace("'", "''") + "'"
+        parts.append("(instr(%s,%s)>0)*%d" % (column, literal, len(str(token))))
+    return " + ".join(parts) if parts else "0"
+
+
+def _lexical_scorer(query):
+    """返回一个「词元只算一次」的打分函数，供 SQLite 逐行调用。
+
+    relevance() 每次调用都会重新切查询词元——在全表打分时等于每行重切一遍，
+    是 1 秒级的开销来源。这里把词元提到闭包外，逐行只做一次子串计数。
+    """
+    from .retrieval import query_tokens, squeeze
+
+    tokens = query_tokens(query)
+
+    def score(text):
+        lowered = squeeze(text).casefold()
+        return sum(len(token) * (token in lowered) for token in tokens)
+
+    return score
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = path
@@ -99,6 +129,10 @@ class Store:
             CREATE TABLE IF NOT EXISTS short_ids (
               short TEXT PRIMARY KEY, real TEXT NOT NULL UNIQUE, created REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS short_id_real ON short_ids(real);
+            -- 全局词面扫描与永久记忆整理都按这两个条件筛
+            CREATE INDEX IF NOT EXISTS fact_scan ON facts(deleted,merge_pending);
+            CREATE INDEX IF NOT EXISTS record_permanent ON records(permanent)
+              WHERE permanent=1;
             CREATE TABLE IF NOT EXISTS versions (
               id INTEGER PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL,
               snapshot TEXT NOT NULL, reason TEXT NOT NULL, created REAL NOT NULL);
@@ -205,6 +239,14 @@ class Store:
             db.execute(
                 "INSERT OR IGNORE INTO entities(id,kind,name,updated) SELECT DISTINCT subject,'user','',0 FROM facts WHERE subject LIKE 'legacy:%'"
             )
+
+    def revision(self):
+        """当前库版本号（写入即 +1，供进程内缓存判失效）。"""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='revision'"
+            ).fetchone()
+        return int(row[0]) if row else 0
 
     @staticmethod
     def bump(db):
@@ -1804,14 +1846,14 @@ class Store:
 
             db.create_function("squeeze", 1, squeeze)
             if lexical and not vector:
-                from .retrieval import relevance
+                from .retrieval import query_tokens, relevance
 
-                db.create_function(
-                    "lexical_score",
-                    1,
-                    lambda text: relevance(lexical, text),
-                )
-                clauses.append("lexical_score(summary)>0")
+                # 打分整段下推到 SQL：与逐行 Python 打分口径完全一致
+                # （score = Σ 命中词元的长度），但全程在 C 层跑——
+                # 此前 relevance() 每行都要重切一次查询词元，是秒级开销的来源。
+                tokens = query_tokens(lexical)[:24]
+                lexical_sql = _lexical_sql("lower(summary)", tokens)
+                clauses.append("(%s)>0" % lexical_sql)
             # 归档也参与召回时，同分让常驻的排在前面：
             # 旧原文和新摘要词面打平时，先给模型看「还在上下文里」的那条。
             active_tier = "" if active else "CASE WHEN active=1 THEN 0 ELSE 1 END,"
@@ -1861,7 +1903,7 @@ class Store:
                     "SELECT * FROM records WHERE "
                     + where
                     + (
-                        f" ORDER BY {tier_sql}lexical_score(summary) DESC,{active_tier}end,id LIMIT ? OFFSET ?"
+                        f" ORDER BY {tier_sql}{lexical_sql} DESC,{active_tier}end,id LIMIT ? OFFSET ?"
                         if lexical
                         else f" ORDER BY {tier_sql}end,id LIMIT ? OFFSET ?"
                     ),
@@ -1882,9 +1924,7 @@ class Store:
 
         from .retrieval import relevance
 
-        db.create_function(
-            "lexical_score", 1, lambda text: relevance(lexical, text)
-        )
+        db.create_function("lexical_score", 1, _lexical_scorer(lexical))
         norm = math.sqrt(sum(x * x for x in vector))
 
         def cosine(raw):
@@ -2004,26 +2044,22 @@ class Store:
         tier_sql = (", ".join(tier_parts) + ", ") if tier_parts else ""
         with self.connect() as db:
             if lexical:
-                from .retrieval import relevance
+                from .retrieval import query_tokens, relevance
 
-                db.create_function(
-                    "fact_score", 1, lambda text: relevance(lexical, text)
-                )
+                # 同样下推到 SQL（含 min_score 门槛），全程 C 层
+                tokens = query_tokens(lexical)[:24]
+                fact_sql = _lexical_sql("lower(content)", tokens)
                 # min_score 是「内容匹配」门槛：中文按 2 字切分，任一双字片段命中 = 2 分。
                 # 默认只要求 >0；调用方（被动召回）用更高门槛挡掉「今天/喜欢」这类常见词。
                 threshold = max(1, int(min_score or 0))
-                if threshold > 1:
-                    where.append("fact_score(content)>=?")
-                    args.append(threshold)
-                else:
-                    where.append("fact_score(content)>0")
+                where.append("(%s)>=%d" % (fact_sql, threshold))
             return [
                 self.row(r)
                 for r in db.execute(
                     "SELECT * FROM facts WHERE "
                     + " AND ".join(where)
                     + (
-                        f" ORDER BY {tier_sql}fact_score(content) DESC,"
+                        f" ORDER BY {tier_sql}{fact_sql} DESC,"
                         f"{'importance DESC,created DESC,' if importance_first else 'audited,'}id LIMIT ? OFFSET ?"
                         if lexical
                         else f" ORDER BY {tier_sql}"
