@@ -62,3 +62,28 @@ def test_clusters_allow_cross_category_but_never_cross_subject():
     assert [sorted(g["id"] for g in group) for group in groups] == [["1", "2"]]
     # 关掉跨类别 → 不再成组
     assert e.Engine._fact_clusters(rows, 0.25, 0.0) == []
+
+
+def test_length_feedback_reports_soft_limits_and_real_lengths(tmp_path):
+    """硬上限被触发时，重试反馈要给出「实际写了多少」+「按软上限重写」。"""
+    import importlib
+    import types
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    package = types.ModuleType("alife_feedback_test")
+    package.__path__ = [str(Path(__file__).resolve().parents[1])]
+    sys.modules.setdefault("alife_feedback_test", package)
+    engine = importlib.import_module("alife_feedback_test.engine")
+    contracts = importlib.import_module("alife_feedback_test.contracts")
+
+    cfg = contracts.Settings()
+    assert cfg.fact_merge_soft_chars == 80, "软上限默认应为 80"
+
+    groups = [{"content": "字" * 180, "reason": "理" * 52}]
+    msg = engine.length_feedback(groups, cfg, ValueError("content exceeds 150 chars"))
+    assert "180" in msg and "80 字以内" in msg, msg
+    assert "150" not in msg, "提示里不该出现硬上限数字"
+
+    msg2 = engine.length_feedback(groups, cfg, ValueError("reason exceeds 40 chars"))
+    assert "52" in msg2 and "15 字以内" in msg2, msg2

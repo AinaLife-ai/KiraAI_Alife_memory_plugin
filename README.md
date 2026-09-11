@@ -169,7 +169,7 @@ L100 永久记忆（不参与自动压缩，只能由 Bot 主动 Memorize 或你
 | `audit_daily_calls` | 24 | 审计模型每日调用上限，用完停到第二天（0=不限） |
 | `compress_persona` / `audit_persona` | 开 / 关 | 压缩与审计请求是否带 Bot 人设。人设很长（数千字）时，关掉能省下每次调用的大头 |
 | `fact_merge_enabled` / `fact_merge_threshold` | 开 / 0.25 | 写入时合并开关与触发阈值 |
-| `fact_merge_soft_chars` / `fact_merge_max_chars` | 100 / 150 | 合并后事实的提示词字数与硬上限 |
+| `fact_merge_soft_chars` / `fact_merge_max_chars` | 80 / 150 | 合并后事实的提示词字数与硬上限 |
 | `fact_merge_soft_reason_chars` / `fact_merge_reason_chars` | 15 / 40 | 合并理由的提示词字数与硬上限 |
 | `fact_merge_batch_clusters` | 5 | 一次模型调用最多合并几组 |
 | `fact_merge_prompt` / `record_merge_prompt` | 内置 | 两个合并提示词，可用 `{content_max}` / `{reason_max}` 占位符 |
@@ -318,7 +318,12 @@ python tools/web_audit.py                 # 前端静态审计：属性读写配
 - **顺带**：任务详情不再恒为同一句话——「该会话还没有永久记忆」「N 条都在整理间隔内」「本次没有需要调整的」
   会给出具体原因；新增回归测试锁住"容量未超时手动整理也必须请模型看一遍"。
 
-测试：默认 205 passed 3 skipped；KIRA_CORE 243 passed。
+- **事实合并软上限默认 100 → 80 字**（提示词里给模型的目标字数）；硬上限仍是 150 字。
+- **硬上限触发时改为「带反馈重试」**：以前是原样再问一遍（模型很可能再超一次），现在会动态告诉它
+  「上次有 content 写到 180 字，超过上限；请压到 80 字以内重写」——**目标值一律用软上限**，
+  既不会再次撞墙，也给模型明确目标；reason 同理（软 15 / 硬 40）。
+
+测试：默认 206 passed 3 skipped；KIRA_CORE 244 passed。
 
 ### v2.9.0 (2026-09-11) — 永久记忆不再"只进不出" + 召回去重 + 工具收敛到 4 个 🧹
 

@@ -323,7 +323,7 @@ class Settings(Strict):
     cold_after_days: int = Field(default=180, ge=0, le=3650)
     fact_merge_enabled: bool = True
     fact_merge_threshold: float = Field(default=0.25, ge=0.1, le=0.95)
-    fact_merge_soft_chars: int = Field(default=100, ge=10, le=2000)
+    fact_merge_soft_chars: int = Field(default=80, ge=10, le=2000)
     fact_merge_max_chars: int = Field(default=150, ge=10, le=4000)
     fact_merge_soft_reason_chars: int = Field(default=15, ge=2, le=200)
     fact_merge_reason_chars: int = Field(default=40, ge=2, le=500)
