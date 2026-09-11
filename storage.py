@@ -34,6 +34,9 @@ NO_TOKENS = "-"
 #   2 = v2.11.1，补上单字 + 查询侧 ≥3 字词元拆对（候选集 = 打分结果的超集）
 SEARCH_INDEX_SCHEME = "2"
 
+# 存量净化口径版本：一升级就再跑一次（老库里的空壳记录要移进回收站）
+CAPTURE_SCRUB_VERSION = "2"
+
 
 class Conflict(ValueError):
     pass
@@ -102,7 +105,7 @@ class Store:
         self._fts_stats = {"filled": 0, "plain": 0}  # 本次补齐 / 其中无可检索文字
         self._fts_stale = False  # 索引体口径与当前代码不同（需后台重算）
         self._scrub_cursor = 0  # 存量清洗的扫描游标
-        self._scrub_stats = {"changed": 0}
+        self._scrub_stats = {"changed": 0, "emptied": 0}
         self.path = path
 
     async def call(self, method, *args, **kwargs):
@@ -373,23 +376,33 @@ class Store:
 
         分批扫（``LIMIT batch``），返回是否扫完；改动条数记在
         :meth:`scrub_stats`。**幂等**：只改真的变了的行。
-        只扫含 ``<`` 的行——没有尖括号就没有标签/思考块，不必惊动。
+        扫两类行：含 ``<`` 的（可能是外壳）、以及本来就空的（可能是只有外壳的残骸）。
+
+        **清洗后什么都不剩的行移进回收站**（软删，可还原）：那种记录本来就只是
+        一层空外壳（``<msg/>`` 之类），留着只会变成一张张空卡片，还白占压缩额度。
         """
         with self.connect() as db:
             rows = db.execute(
-                "SELECT rowid, level, role, summary, content FROM records "
-                "WHERE rowid > ? AND (instr(content,'<')>0 OR instr(summary,'<')>0) "
+                "SELECT rowid, id, level, permanent, role, summary, content FROM records "
+                "WHERE rowid > ? AND (instr(content,'<')>0 OR instr(summary,'<')>0 "
+                "OR (trim(content)='' AND trim(summary)='')) "
                 "ORDER BY rowid LIMIT ?",
                 (self._scrub_cursor, batch),
             ).fetchall()
             if not rows:
                 return True
             self._scrub_cursor = rows[-1]["rowid"]
-            updates = []
+            updates, emptied = [], []
             for row in rows:
                 content = scrub_row_text(row["level"], row["role"], row["content"])
                 summary = scrub_row_text(row["level"], row["role"], row["summary"])
                 if content == row["content"] and summary == row["summary"]:
+                    # 本来就空、且不是可回收的 L0（永久记忆/存档不动）：保持原样
+                    if row["level"] == 0 and not row["permanent"] and not summary:
+                        emptied.append(row)
+                    continue
+                if not content and not summary and row["level"] == 0 and not row["permanent"]:
+                    emptied.append(row)
                     continue
                 updates.append(
                     (
@@ -405,21 +418,41 @@ class Store:
                     "WHERE rowid=?",
                     updates,
                 )
+            for row in emptied:
+                db.execute(
+                    "INSERT INTO versions(kind,target,snapshot,reason,created) "
+                    "VALUES ('record',?,?,?,?)",
+                    (
+                        row["id"],
+                        dump(dict(row)),
+                        "清洗后为空：这条原始记录只有协议外壳（如 <msg/>），已移入回收站",
+                        time.time(),
+                    ),
+                )
+                db.execute(
+                    "UPDATE records SET deleted=1,revision=revision+1 WHERE id=?",
+                    (row["id"],),
+                )
         self._scrub_stats["changed"] += len(updates)
+        self._scrub_stats["emptied"] += len(emptied)
         return False
 
     def prepare_capture_scrub(self):
-        """是否还需要跑一次存量清洗（跑过就记在 meta 里，只跑一次）。"""
+        """是否还需要跑一次存量清洗（口径版本记在 meta 里，升级后会自动再跑一次）。
+
+        注意 meta.value 可能被 SQLite 存成整数（"2" → 2），所以按字符串比。
+        """
         with self.connect() as db:
             row = db.execute(
                 "SELECT value FROM meta WHERE key='capture_scrub'"
             ).fetchone()
-        return not (row and row["value"])
+        return str(row["value"] if row else "") != CAPTURE_SCRUB_VERSION
 
     def finish_capture_scrub(self):
         with self.connect() as db:
             db.execute(
-                "INSERT OR REPLACE INTO meta(key,value) VALUES ('capture_scrub','1')"
+                "INSERT OR REPLACE INTO meta(key,value) VALUES ('capture_scrub',?)",
+                (CAPTURE_SCRUB_VERSION,),
             )
         return True
 
