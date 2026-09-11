@@ -303,7 +303,7 @@
       "fact_merge_soft_chars": {
         "type": "integer",
         "name": "事实合并字数（提示词）",
-        "default": 100,
+        "default": 80,
         "description": "提示词里要求模型写多长；修改会同步替换提示词里的数字。",
         "minimum": 10,
         "maximum": 2000
