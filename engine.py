@@ -291,8 +291,11 @@ def enforce_limits(result, content_limit, reason_limit):
         raise ValueError("reason exceeds %d chars" % reason_limit)
 
 
-def permanent_clusters(rows, threshold, size=5):
-    """Connected components of similar permanent memories (newest first)."""
+def permanent_clusters(rows, threshold, size=5, cross_threshold=0.0):
+    """Connected components of similar permanent memories (newest first).
+
+    同会话用 threshold；跨会话用更保守的 cross_threshold（<=0 表示不跨）。
+    """
     from .retrieval import similarity
 
     parent = {row["id"]: row["id"] for row in rows}
@@ -310,7 +313,11 @@ def permanent_clusters(rows, threshold, size=5):
 
     for index, left in enumerate(rows):
         for right in rows[index + 1 :]:
-            if similarity(left["summary"], right["summary"]) >= threshold:
+            same_session = left.get("sid", "") == right.get("sid", "")
+            limit = threshold if same_session else cross_threshold
+            if limit <= 0:
+                continue
+            if similarity(left["summary"], right["summary"]) >= limit:
                 union(left["id"], right["id"])
     groups = {}
     for row in rows:
@@ -1320,7 +1327,10 @@ class Engine:
         if not cfg.permanent_dedupe:
             report["note"] = "自动合并已关闭"
             return report
-        rows = await self.store.call("permanent_records", sid)
+        global_scope = cfg.recall_scope == "global"
+        rows = await self.store.call(
+            "permanent_records", sid, all_sessions=global_scope
+        )
         report["permanent"] = len(rows)
         if len(rows) < 2:
             stats = await self.store.call("permanent_stats", sid)
@@ -1329,7 +1339,17 @@ class Engine:
                 % (stats["live"], stats["archived"])
             )
             return report
-        for group in permanent_clusters(rows, cfg.dedupe_threshold):
+        for group in permanent_clusters(
+            rows,
+            cfg.dedupe_threshold,
+            cross_threshold=(
+                cfg.permanent_dedupe_cross_threshold if global_scope else 0.0
+            ),
+        ):
+            # 全局池时，每个簇交给「拥有最新那条的会话」处理，避免每个会话
+            # 都对着同一批簇重复调用模型。
+            if global_scope and group[0]["sid"] != sid:
+                continue
             report["clusters"] += 1
             ids = {item["id"] for item in group}
             dedupe_aliases = {
@@ -1398,16 +1418,29 @@ class Engine:
                     "note": "",
                 }
             )
+            cross_session = any(item["sid"] != sid for item in group)
+            labels = (
+                await self.name_map({item["sid"] for item in group})
+                if cross_session
+                else {}
+            )
             for item in group:
                 if item["id"] == result["target"] or item["id"] not in sources:
                     continue
+                before = item.get("summary", "")
+                if cross_session:
+                    # 来源标多个：被并入的条目仍留在各自会话，这里标出来源会话便于回溯
+                    before = "【来自 %s】%s" % (
+                        labels.get(item["sid"]) or item["sid"],
+                        before,
+                    )
                 dedupe_items.append(
                     {
                         "kind": "record",
                         "target": item["id"],
                         "action": "merged",
                         "note": result["target"],
-                        "before": item.get("summary", ""),
+                        "before": before,
                     }
                 )
         if report["clusters"] == 0:
@@ -1636,6 +1669,6 @@ class Engine:
                         await self.enqueue("tidy", sid, automatic=True)
             if cfg.permanent_dedupe and now - self.last_dedupe >= cfg.audit_interval:
                 self.last_dedupe = now
-                for sid in await self.store.call("sessions_with_permanents"):
+                for sid in await self.store.call("sessions_with_any_permanent"):
                     await self.enqueue("dedupe", sid, automatic=True)
             await self.proactive_tick(now, cfg)

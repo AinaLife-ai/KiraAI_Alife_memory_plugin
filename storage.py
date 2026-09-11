@@ -1367,15 +1367,34 @@ class Store:
                     return self.row(row)
         return None
 
-    def permanent_records(self, sid):
-        """Active permanent memories of one session, newest first."""
+    def permanent_records(self, sid="", all_sessions=False):
+        """Active permanent memories, newest first.
+
+        ``all_sessions`` 用于 recall_scope=global：注入本来就是全局的
+        （任何会话都在付所有会话的永久记忆），去重与整理也应看到同一个池子。
+        """
+        clause = "permanent=1 AND deleted=0 AND active=1"
+        args = ()
+        if not all_sessions:
+            clause += " AND sid=?"
+            args = (sid,)
         with self.connect() as db:
             return [
                 self.row(row)
                 for row in db.execute(
-                    "SELECT * FROM records WHERE sid=? AND permanent=1 AND deleted=0 "
-                    "AND active=1 ORDER BY end DESC,id",
-                    (sid,),
+                    "SELECT * FROM records WHERE " + clause + " ORDER BY end DESC,id",
+                    args,
+                )
+            ]
+
+    def sessions_with_any_permanent(self):
+        """有意久记忆的会话（哪怕只有一条）——跨会话去重需要它们都能被扫到。"""
+        with self.connect() as db:
+            return [
+                row[0]
+                for row in db.execute(
+                    "SELECT DISTINCT sid FROM records WHERE permanent=1 AND deleted=0 "
+                    "AND active=1"
                 )
             ]
 

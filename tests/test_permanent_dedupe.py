@@ -209,3 +209,43 @@ def test_consolidate_reports_why_nothing_happened(tmp_path):
     asyncio.run(merged.consolidate(SID))
     again = asyncio.run(merged.consolidate(SID))
     assert again["permanent"] == 1 and "已归档 2 条" in again["note"]
+
+
+def test_cross_session_clusters_only_with_higher_threshold(tmp_path):
+    """跨会话重复：同会话 0.25 能凑簇，跨会话要 0.35 才凑（更保守）。"""
+    a = "主人喜欢乌龙茶，每天都要喝一壶"
+    b = "主人喜欢喝乌龙茶，每天都喝一壶"       # 高相似（跨会话同一件事）
+    c = "主人喜欢喝茶，口味偏清淡"            # 中等相似（不该跨会话合并）
+    rows = [
+        {"id": "1", "sid": "qq:dm:A", "summary": a},
+        {"id": "2", "sid": "qq:gm:B", "summary": b},
+        {"id": "3", "sid": "qq:gm:B", "summary": c},
+    ]
+    high = e.permanent_clusters(rows[:2], 0.25, cross_threshold=0.35)
+    assert high and len(high[0]) == 2, "高相似跨会话应该能凑成簇"
+
+    # c 与 a 的相似度落在 0.25~0.35 之间时，跨会话不该合并
+    score = r.similarity(a, c)
+    assert 0.0 <= score < 0.35
+    mixed = e.permanent_clusters([rows[0], rows[2]], 0.25, cross_threshold=0.35)
+    assert mixed == [], "跨会话低于 0.35 不该凑簇"
+    # 同一对换成同会话（阈值 0.25 生效）时行为一致由 score 决定
+    same = e.permanent_clusters(
+        [{"id": "1", "sid": "qq:dm:A", "summary": a},
+         {"id": "3", "sid": "qq:dm:A", "summary": c}],
+        0.25,
+        cross_threshold=0.35,
+    )
+    assert bool(same) == (score >= 0.25)
+
+
+def test_cross_session_pool_includes_other_sessions(tmp_path):
+    """recall_scope=global 时，永久记忆去重要看到所有会话的池子。"""
+    store = s.Store(tmp_path / "db")
+    store.initialize()
+    store.memorize("qq:dm:A", "主人喜欢乌龙茶", ["u:1"], 1.0, 1.0)
+    store.memorize("qq:gm:B", "主人喜欢喝乌龙茶", ["u:2"], 2.0, 2.0)
+    one = store.permanent_records("qq:dm:A")
+    alls = store.permanent_records("qq:dm:A", all_sessions=True)
+    assert len(one) == 1 and len(alls) == 2
+    assert sorted(store.sessions_with_any_permanent()) == ["qq:dm:A", "qq:gm:B"]

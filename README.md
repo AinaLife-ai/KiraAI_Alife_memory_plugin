@@ -320,7 +320,13 @@ python tools/web_audit.py                 # 前端静态审计：属性读写配
 - **工作台按钮改为「整理所有会话」**（与 Bot 一致）：默认 `recall_scope=global` 时成本是全局的，
   所以按钮也按所有有意久记忆的会话排队（按钮上有 tooltip 说明；`recall_scope=session` 时仍是当前会话）。
 
-测试：默认 209 passed 5 skipped；KIRA_CORE 249 passed。
+- **永久记忆去重也跨会话了**：候选池跟随 `recall_scope`（默认 global → 所有会话），
+  跨会话阈值更保守（**0.35**，同会话仍 0.25，配置 `permanent_dedupe_cross_threshold`）；
+  每个簇交给「拥有最新那条的会话」处理，避免每个会话都对同一批簇重复调用模型；
+  被并入的条目仍在各自会话归档，**明细里标出来源会话**（`【来自 绿岛酒吧】…`）。
+  *（事实那边保持现状：跨会话合并仍只限 `profile / preference / relationship`，跨主体一律不合并。）*
+
+测试：默认 211 passed 5 skipped；KIRA_CORE 251 passed。
 
 ### v2.9.2 (2026-09-11) — 前端更新后能真正生效（绕开 WebView 缓存）🔁
 
