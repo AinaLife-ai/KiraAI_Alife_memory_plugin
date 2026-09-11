@@ -58,6 +58,10 @@ AUDIT_INSTRUCTION = (
     "软删除后不再进入上下文，但原文与版本都保留、可以恢复；reason 写清为什么该删。"
 )
 
+# 降级拼接事实的重做策略（v2.13.0）
+REWRITE_MAX_ATTEMPTS = 3  # 自动重试次数上限（手动排队不受限）
+REWRITE_PER_TICK = 3  # 每轮审计最多自动重做几组，避免一次烧太多模型调用
+
 # 后台任务的显示名（日志用；前端有一份同名映射，保持措辞一致）
 JOB_LABELS = {
     "compress": "分层压缩",
@@ -67,6 +71,7 @@ JOB_LABELS = {
     "dedupe": "永久记忆合并",
     "fact_merge": "事实合并",
     "proactive": "主动感知",
+    "rewrite": "重整理事实",
 }
 
 
@@ -962,6 +967,7 @@ class Engine:
                     }
                 )
             payload = {"groups": groups_view}
+            fallback = False
             try:
                 output = await self.structured(FactMerge, "fact_merge", payload, cfg)
                 output = restore_group_ids(output, group_aliases)
@@ -978,6 +984,9 @@ class Engine:
             except Exception as exc:
                 # Force-merge policy: never leave near-duplicates behind, so a
                 # rejected/timed-out model falls back to a plain text union.
+                # 拼接只是权宜之计 → 打 rewrite_pending，之后由重做流程还原来源再试一次
+                # （审计契约里没有"新增事实"，改写只能压成一句、会丢信息）。
+                fallback = True
                 logger.warning(
                     "[记忆·Z] 事实合并模型输出不可用，改用原文拼接：%s",
                     failure_detail(exc),
@@ -1089,6 +1098,12 @@ class Engine:
                         verdict["reason"],
                         new_sid,
                     )
+                    if fallback:
+                        # 这次是"模型不可用 → 按时间拼接"：留个待重做标记，
+                        # 之后由 redo_pending_rewrites() 还原来源再试一次。
+                        await self.store.call(
+                            "mark_rewrite_pending", [verdict["target_id"]], 1
+                        )
                     merged += 1
                     items.append(
                         {
@@ -1128,6 +1143,47 @@ class Engine:
             if job_id and items:
                 await self.store.call("add_job_items", job_id, items)
         return merged
+
+    async def redo_pending_rewrites(self, limit=3, job_id=None):
+        """把「模型输出不可用 → 按时间拼接」的事实**重做一遍**。
+
+        做法是**还原那次合并**（来源从回收站取回、目标回退到合并前的快照），
+        再把这一簇重新排进合并流水线——而不是让审计去改写那句拼接：
+        审计契约里没有"新增事实"的动作，改写只能把 N 句压成 1 句、会丢信息。
+
+        还原后立刻合并（方案 A）：而且 `merge_pending=1` 期间这些事实本来就不会被注入，
+        所以"重复内容可见"的窗口实际是零。
+
+        自动重试最多 `REWRITE_MAX_ATTEMPTS` 次，之后停下、标记留给界面；
+        手动排队（带 job_id）不受次数限制。
+        """
+        cfg = self.settings()
+        if not cfg.enabled or not cfg.fact_merge_enabled:
+            return 0
+        limit = max(1, int(limit))
+        cap = 10**6 if job_id else REWRITE_MAX_ATTEMPTS
+        rows = await self.store.call("pending_rewrites", limit, cap)
+        if not rows:
+            return 0
+        sids, done = set(), 0
+        for row in rows:
+            if await self.store.call("unmerge_fact", row["id"]):
+                sids.add(row["sid"])
+                done += 1
+            else:
+                # 被人改过 / 来源已被彻底删除：不再自动重试，标记留着给界面
+                await self.store.call("mark_rewrite_pending", [row["id"]], 1)
+                logger.debug(
+                    "[记忆·Z] 事实 %s 无法重做合并（已改动或来源缺失），跳过",
+                    await self.store.call("short_id", row["id"]),
+                )
+        for sid in sids:
+            await self.merge_facts(sid, None)
+        if done:
+            logger.info(
+                "[记忆·Z] 重做合并 %s 组（上次模型输出不可用，已还原来源重试）", done
+            )
+        return done
 
     async def tidy_permanents(self, sid, job_id=None):
         """整理永久记忆：逐条 keep / extract / archive / split（只归档不删除）。"""
@@ -1519,6 +1575,12 @@ class Engine:
                             await self.queue_fact_merges(
                                 row["sid"], job_started
                             )
+                elif job["kind"] == "rewrite":
+                    counts = await self.redo_pending_rewrites(10**6, job["id"])
+                    detail = (
+                        "重做合并 %d 组（上次模型输出不可用 → 已还原来源重试）"
+                        % counts
+                    )
                 elif job["kind"] == "reindex":
                     if not cfg.semantic_enabled:
                         await self.store.call(
@@ -1644,6 +1706,9 @@ class Engine:
             if cfg.audit_enabled and now - self.last_audit >= cfg.audit_interval:
                 self.last_audit = now
                 if self.audit_budget_ok(cfg):
+                    # 顺手把「模型输出不可用 → 按时间拼接」的事实重做一遍
+                    # （每轮最多 REWRITE_PER_TICK 组，避免一次烧太多模型调用）
+                    await self.redo_pending_rewrites(REWRITE_PER_TICK)
                     # Audit only a few of the stalest sessions per interval, so a big
                     # imported backlog cannot keep the queue permanently busy.
                     sessions = await self.store.call(

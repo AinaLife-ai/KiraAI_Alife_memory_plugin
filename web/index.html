@@ -6,6 +6,22 @@
     <meta http-equiv="Cache-Control" content="no-cache" />
     <title>Alife 记忆 · Z</title>
     <link rel="preload" as="image" href="brand.png" />
+    <script>
+      // 主题必须在首帧之前定下来：先按用户上次的选择，没选过就跟系统。
+      // 放在样式表之前是为了连开屏动画都不闪一下。
+      (function () {
+        try {
+          var saved = localStorage.getItem("alife-theme");
+          var system =
+            window.matchMedia &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches;
+          document.documentElement.dataset.theme =
+            saved === "dark" || saved === "light" ? saved : system ? "dark" : "light";
+        } catch (err) {
+          /* 隐私模式下 localStorage 会抛错：保持默认亮色即可 */
+        }
+      })();
+    </script>
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
@@ -262,6 +278,7 @@
               ><button data-job="audit">审计与合并</button
               ><button data-job="dedupe">合并相似永久记忆</button
               ><button data-job="tidy" title="整理所有会话的永久记忆（不受上方会话选择限制）">整理永久记忆</button
+              ><button data-job="rewrite" title="把「模型输出不可用 → 按时间拼接」的事实还原来源、重新合并（手动不受自动重试次数限制）">重整理待处理事实</button
               ><button data-job="reindex">重建向量索引（可选）</button>
             </div>
             <p class="muted" style="margin-top: 14px">

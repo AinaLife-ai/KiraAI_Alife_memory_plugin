@@ -174,9 +174,14 @@ class Store:
               relations TEXT NOT NULL, sources TEXT NOT NULL, fingerprint TEXT NOT NULL,
               deleted INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1,
               audited REAL NOT NULL DEFAULT 0, importance INTEGER NOT NULL DEFAULT 5,
-              merge_pending INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL DEFAULT 0);
+              merge_pending INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL DEFAULT 0,
+              rewrite_pending INTEGER NOT NULL DEFAULT 0,
+              rewrite_attempts INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS fact_identity ON facts(sid,subject,fingerprint,deleted);
             CREATE INDEX IF NOT EXISTS fact_subject ON facts(sid,subject,category,deleted);
+            -- 降级拼接、等着重做的事实（正常情况下一行都没有）
+            CREATE INDEX IF NOT EXISTS fact_rewrite ON facts(rewrite_pending)
+              WHERE rewrite_pending=1;
             CREATE TABLE IF NOT EXISTS short_ids (
               short TEXT PRIMARY KEY, real TEXT NOT NULL UNIQUE, created REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS short_id_real ON short_ids(real);
@@ -272,6 +277,15 @@ class Store:
             if "merge_pending" not in fact_columns:
                 db.execute(
                     "ALTER TABLE facts ADD COLUMN merge_pending INTEGER NOT NULL DEFAULT 0"
+                )
+            if "rewrite_pending" not in fact_columns:
+                # 降级拼接（模型输出不可用 → 按时间拼接）出来的事实：等着重做
+                db.execute(
+                    "ALTER TABLE facts ADD COLUMN rewrite_pending INTEGER NOT NULL DEFAULT 0"
+                )
+            if "rewrite_attempts" not in fact_columns:
+                db.execute(
+                    "ALTER TABLE facts ADD COLUMN rewrite_attempts INTEGER NOT NULL DEFAULT 0"
                 )
             if "created" not in fact_columns:
                 db.execute(
@@ -2852,6 +2866,130 @@ class Store:
                 )
             ]
 
+    def mark_rewrite_pending(self, fact_ids, pending=1):
+        """给「降级拼接」出来的事实打/清待重做标记（不动其它任何字段）。"""
+        ids = [str(fid) for fid in (fact_ids or []) if fid]
+        if not ids:
+            return 0
+        with self.connect() as db:
+            db.executemany(
+                "UPDATE facts SET rewrite_pending=? WHERE id=?",
+                [(1 if pending else 0, fid) for fid in ids],
+            )
+        return len(ids)
+
+    def pending_rewrites(self, limit=3, max_attempts=3):
+        """等着重做的降级拼接事实（自动重试次数未超上限的）。"""
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM facts WHERE rewrite_pending=1 AND deleted=0 "
+                "AND rewrite_attempts < ? ORDER BY audited ASC, created ASC LIMIT ?",
+                (int(max_attempts), int(limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def rewrite_backlog(self):
+        """还有多少条待重做（含已经放弃自动重试的），给界面用。"""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT count(*) AS n FROM facts WHERE rewrite_pending=1 AND deleted=0"
+            ).fetchone()
+        return int(row["n"] if row else 0)
+
+    def unmerge_fact(self, fact_id):
+        """把一次「降级拼接」的合并**还原回去**，并把这一簇重新排进合并队列。
+
+        只用版本快照，不发任何模型请求；任何一步对不上就整体放弃（绝不半还原）。
+        返回是否真的还原了。
+
+        为什么是「还原重做」而不是「让审计改写那句话」：审计契约里没有"新增事实"
+        的动作（只有 keep/correct/merge/retract），改写只能把 N 句压成 1 句、会丢信息；
+        而 ``merge_facts`` 当时给组里**每一条**都写了合并前的完整快照，所以可以原样退回。
+        """
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            target = self.row(
+                db.execute("SELECT * FROM facts WHERE id=?", (fact_id,)).fetchone()
+            )
+            if target is None or target["deleted"] or not target["rewrite_pending"]:
+                return False
+            latest = self.row(
+                db.execute(
+                    "SELECT * FROM versions WHERE kind='fact' AND target=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (fact_id,),
+                ).fetchone()
+            )
+            if latest is None:
+                return False
+            # 那次合并给组里每条都写了同一 reason + 同一时间戳的版本
+            group = db.execute(
+                "SELECT snapshot FROM versions WHERE kind='fact' AND reason=? AND created=?",
+                (latest["reason"], latest["created"]),
+            ).fetchall()
+            snapshots = {}
+            for row in group:
+                try:
+                    snapshot = json.loads(row["snapshot"])
+                except (TypeError, ValueError):
+                    return False
+                if snapshot.get("id"):
+                    snapshots[snapshot["id"]] = snapshot
+            base = snapshots.get(fact_id)
+            if base is None or len(snapshots) < 2:
+                return False
+            # 目标自那次合并后必须没被人动过（合并只 +1；再改过就放弃）
+            if int(target["revision"]) != int(base.get("revision") or 1) + 1:
+                return False
+            sources = [snap for fid, snap in snapshots.items() if fid != fact_id]
+            alive = {
+                row["id"]: row["deleted"]
+                for row in db.execute(
+                    "SELECT id,deleted FROM facts WHERE id IN (%s)"
+                    % ",".join("?" * len(sources)),
+                    [snap["id"] for snap in sources],
+                ).fetchall()
+            }
+            if len(alive) != len(sources):
+                return False  # 有条来源被彻底删了：不还原，保持现状
+            for snap in sources:  # 1) 来源从回收站取回
+                db.execute(
+                    "UPDATE facts SET deleted=0, revision=revision+1 WHERE id=?",
+                    (snap["id"],),
+                )
+            # 2) 目标回退到合并前，并重新排队（merge_pending=1 期间不会被注入）
+            db.execute(
+                "UPDATE facts SET sid=?, content=?, reason=?, scenario=?, tags=?,"
+                " relations=?, sources=?, importance=?, fingerprint=?,"
+                " merge_pending=1, rewrite_pending=0,"
+                " rewrite_attempts=rewrite_attempts+1, revision=revision+1"
+                " WHERE id=?",
+                (
+                    base.get("sid") or target["sid"],
+                    base["content"],
+                    base.get("reason") or "",
+                    base.get("scenario") or "",
+                    base.get("tags") or "[]",
+                    base.get("relations") or "[]",
+                    base.get("sources") or "[]",
+                    int(base.get("importance") or 5),
+                    base.get("fingerprint") or "",
+                    fact_id,
+                ),
+            )
+            # 3) 留个痕迹：界面「最近审校」会显示这行
+            db.execute(
+                "INSERT INTO versions(kind,target,snapshot,reason,created) "
+                "VALUES ('fact',?,?,?,?)",
+                (
+                    fact_id,
+                    dump(dict(target)),
+                    "重做合并：上次模型输出不可用，已还原来源重试",
+                    time.time(),
+                ),
+            )
+        return True
+
     def merge_facts(self, target_id, source_ids, content, reason, new_sid=""):
         """Fold near-duplicate facts into ``target_id``; the rest are soft-deleted.
 
@@ -2886,11 +3024,14 @@ class Store:
                 dump(rel): rel for k in group for rel in json.loads(rows[k]["relations"])
             }
             importance = max(rows[k]["importance"] for k in group)
+            # 同一次合并的版本必须共用同一个时间戳：这样「重做合并」才能靠
+            # (reason, created) 把整组快照找回来（见 unmerge_fact）。
+            merged_at = time.time()
             for k in group:
                 db.execute(
                     "INSERT INTO versions(kind,target,snapshot,reason,created) "
                     "VALUES ('fact',?,?,?,?)",
-                    (k, dump(dict(rows[k])), reason, time.time()),
+                    (k, dump(dict(rows[k])), reason, merged_at),
                 )
             db.execute(
                 "UPDATE facts SET sid=?,content=?,sources=?,tags=?,relations=?,"

@@ -12,6 +12,8 @@
   /* 星尘/流星：同色系随机色相，亮色主题用较深的紫 */
   --fx-sat: 82%;
   --fx-lum: 58%;
+  /* 开屏图标上的扫光：暗色主题下要柔和得多，否则白得刺眼 */
+  --sheen: #ffffff96;
 }
 [data-theme="dark"] {
   color-scheme: dark;
@@ -25,6 +27,7 @@
   --shadow: none;
   --fx-sat: 88%;
   --fx-lum: 74%;
+  --sheen: #ffffff33;
 }
 * {
   box-sizing: border-box;
@@ -1436,7 +1439,7 @@ button.primary:hover::after {
   left: -130%;
   width: 55%;
   height: 180%;
-  background: linear-gradient(100deg, transparent, #ffffff96, transparent);
+  background: linear-gradient(100deg, transparent, var(--sheen), transparent);
   transform: skewX(-18deg);
   animation: boot-sheen 1s var(--ease) 1.15s both;
 }
