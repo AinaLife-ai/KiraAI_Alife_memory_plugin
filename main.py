@@ -573,6 +573,15 @@ class AlifeMemoryPlugin(BasePlugin):
                 self._access_seen.pop(key, None)
         return fresh
 
+    async def queue_tidy_all(self, fallback_sid=""):
+        """把所有有意久记忆的会话都排上整理（去重/提炼/归档都按归属会话执行）。"""
+        owners = set(await self.store.call("sessions_with_permanents"))
+        if fallback_sid:
+            owners.add(fallback_sid)
+        for owner in sorted(owners):
+            await self.engine.enqueue("tidy", owner, automatic=True)
+        return sorted(owners)
+
     async def queue_recall_merges(self, sid, facts):
         """召回时顺手发现重复事实：本地判定 → 只标记 → 后台合并（不阻塞回复）。
 
@@ -1881,12 +1890,14 @@ class AlifeMemoryPlugin(BasePlugin):
             # global（默认）→ 所有有意久记忆的会话；session → 仅当前会话
             if not owners:
                 if cfg.recall_scope == "global":
-                    owners = set(
-                        await self.store.call("sessions_with_permanents")
-                    )
-                owners.add(event.sid)
-            for owner in sorted(owners):
-                await self.engine.enqueue("tidy", owner, automatic=True)
+                    owners = set(await self.queue_tidy_all(event.sid))
+                else:
+                    owners.add(event.sid)
+                    for owner in sorted(owners):
+                        await self.engine.enqueue("tidy", owner, automatic=True)
+            else:
+                for owner in sorted(owners):
+                    await self.engine.enqueue("tidy", owner, automatic=True)
             return self.recall_result(
                 event,
                 {
@@ -2374,6 +2385,16 @@ class AlifeMemoryPlugin(BasePlugin):
         value = await self.body(request, Job)
         if value.kind == "reindex" and not self.settings.semantic_enabled:
             raise HTTPException(409, "optional vector search is disabled")
+        if value.kind == "tidy":
+            # 永久记忆的成本是全局的（默认 recall_scope=global 时，
+            # 任何会话都在付所有会话的永久记忆），所以工作台的这个按钮
+            # 也按「所有有意久记忆的会话」排队，与 Bot 的 tidy 一致。
+            owners = await self.queue_tidy_all(value.sid)
+            return {
+                "id": "",
+                "state": "queued",
+                "sessions": len(owners),
+            }
         return {
             "id": await self.engine.enqueue(value.kind, value.sid),
             "state": "queued",

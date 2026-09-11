@@ -317,7 +317,10 @@ python tools/web_audit.py                 # 前端静态审计：属性读写配
   默认 global → 覆盖所有有意久记忆的会话；设为 `session` → 只整理当前会话；
   带 `ids` 时按那些条目的**归属会话**排队，并让它们立刻可被整理。
 
-测试：默认 209 passed 4 skipped；KIRA_CORE 248 passed。
+- **工作台按钮改为「整理所有会话」**（与 Bot 一致）：默认 `recall_scope=global` 时成本是全局的，
+  所以按钮也按所有有意久记忆的会话排队（按钮上有 tooltip 说明；`recall_scope=session` 时仍是当前会话）。
+
+测试：默认 209 passed 5 skipped；KIRA_CORE 249 passed。
 
 ### v2.9.2 (2026-09-11) — 前端更新后能真正生效（绕开 WebView 缓存）🔁
 
