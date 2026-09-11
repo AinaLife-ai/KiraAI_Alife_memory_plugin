@@ -358,6 +358,46 @@
         "default": true,
         "description": "检测到重复的新事实在合并完成前不进入检索与注入，避免对话中同时看到重复记忆。默认开启。"
       },
+      "memorize_cover_check": {
+        "type": "switch",
+        "name": "保存永久记忆前先查事实覆盖",
+        "default": true,
+        "description": "开启后，Bot 保存永久记忆时会先看这条信息是否已被事实覆盖——能被事实覆盖的就不再占一个每轮常驻的席位，直接返回既有事实。默认开启。"
+      },
+      "permanent_tidy_enabled": {
+        "type": "switch",
+        "name": "永久记忆定期整理",
+        "default": true,
+        "description": "开启后，永久记忆超过条数上限或字符预算时，后台会请模型逐条判断：留下、提炼成事实后归档、或直接归档。只归档不删除，原文与版本都保留、可一键取回。默认开启。"
+      },
+      "permanent_cap": {
+        "type": "integer",
+        "name": "永久记忆条数上限",
+        "default": 10,
+        "minimum": 1,
+        "description": "常驻的永久记忆超过这个条数就触发整理（条数触发时会一次排空积压，不受每轮条数限制）。"
+      },
+      "permanent_budget_chars": {
+        "type": "integer",
+        "name": "永久记忆字符预算",
+        "default": 3000,
+        "minimum": 200,
+        "description": "常驻永久记忆的总字符超过这个数就触发整理。按字符更贴近实际 token 成本，默认 3000。"
+      },
+      "permanent_tidy_batch": {
+        "type": "integer",
+        "name": "每次整理条数",
+        "default": 10,
+        "minimum": 1,
+        "description": "一次整理最多交给模型几条永久记忆（条数上限触发时会一次排空积压）。"
+      },
+      "permanent_tidy_days": {
+        "type": "integer",
+        "name": "同一条整理间隔（天）",
+        "default": 14,
+        "minimum": 0,
+        "description": "同一条永久记忆多久内不重复整理，避免反复打扰模型。"
+      },
       "permanent_dedupe": {
         "type": "switch",
         "name": "自动合并相似永久记忆",

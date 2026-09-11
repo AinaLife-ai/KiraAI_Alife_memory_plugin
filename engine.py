@@ -21,6 +21,7 @@ from .output_validation import (
     validate_audit,
 )
 from .contracts import (
+    PermanentTidy,
     Audit,
     Compression,
     FactMerge,
@@ -105,6 +106,17 @@ def build_instruction(purpose, cfg):
             "不要把 predicate/object 平铺在事实里；谓词要表达具体关系"
             "（如 朋友/姐姐/喜欢），不要用 认为/觉得/说。"
             + cfg.compress_instruction
+        )
+    if purpose == "tidy":
+        return (
+            "整理输出只含 items，每条给一个处置："
+            "keep=继续常驻（可顺带修正 category/importance）；"
+            "extract=这条信息已能被事实覆盖 → 用 facts 提炼出来，原条移出常驻；"
+            "archive=不再需要常驻（过期、一次性、已被取代）→ 直接移出常驻；"
+            "split=一条里既有必须留下的约束、又有可转事实的内容 → 给 facts + keep_content（只留约束那段）。"
+            "判断标准：能按需召回的信息不该占每轮的席位，只有必须每轮在场的约束才 keep。"
+            "facts[].subject 用 who 表里的稳定实体 ID；每条都要写 reason。"
+            "不要为了省事整批 archive：留下真正约束性的内容。"
         )
     if purpose == "fact_merge":
         return render_prompt(
@@ -346,6 +358,8 @@ class Engine:
         # Write-time fact merging gets its own lane too: it must not wait behind
         # long compression jobs, otherwise a duplicate stays visible for minutes.
         self.tasks.append(asyncio.create_task(self.fact_merge_worker()))
+        # Permanent-memory tidy-up likewise gets its own lane.
+        self.tasks.append(asyncio.create_task(self.tidy_worker()))
         self.tasks.append(asyncio.create_task(self.scheduler()))
         for row in await self.store.call("pending_facts"):
             await self.enqueue("fact_merge", row["sid"])
@@ -974,6 +988,144 @@ class Engine:
                 await self.store.call("add_job_items", job_id, items)
         return merged
 
+    async def tidy_permanents(self, sid, job_id=None):
+        """整理永久记忆：逐条 keep / extract / archive / split（只归档不删除）。"""
+        cfg = self.settings()
+        if not cfg.permanent_tidy_enabled:
+            return 0
+        live = await self.store.call("permanent_records", sid)
+        if len(live) < 2:
+            return 0
+        over_cap = len(live) > cfg.permanent_cap
+        over_budget = sum(len(row.get("summary") or "") for row in live) > cfg.permanent_budget_chars
+        if not (over_cap or over_budget):
+            return 0
+        wanted = len(live) if over_cap else cfg.permanent_tidy_batch
+        candidates = await self.store.call(
+            "tidy_candidates", sid, cfg.permanent_tidy_days, max(wanted, 1)
+        )
+        if not candidates:
+            return 0
+        candidates = candidates[:wanted]
+        aliases = {"p%d" % (i + 1): row["id"] for i, row in enumerate(candidates)}
+        names = await self.name_map(
+            {u for row in candidates for u in (row.get("users") or [])}
+        )
+        keep = await self.store.call("spaced_names")
+        output = await self.structured(
+            PermanentTidy,
+            "tidy",
+            {
+                "cap": cfg.permanent_cap,
+                "budget": cfg.permanent_budget_chars,
+                "who": {name: entity for entity, name in names.items()},
+                "items": [
+                    {
+                        "id": "p%d" % (i + 1),
+                        "s": model_text(row.get("summary") or "", keep),
+                        "cat": row.get("category") or "",
+                        "imp": row.get("importance") or 5,
+                        "t": short_time(row.get("start")),
+                        "used": row.get("access_count") or 0,
+                    }
+                    for i, row in enumerate(candidates)
+                ],
+            },
+            cfg,
+        )
+        return await self.apply_tidy(sid, candidates, aliases, names, output, job_id)
+
+    async def apply_tidy(self, sid, candidates, aliases, names, output, job_id=None):
+        """执行整理结论：keep 顺手修正字段；其余一律归档（原文保留、可回滚）。"""
+        known = {row["id"] for row in candidates}
+        by_id = {row["id"]: row for row in candidates}
+        items, applied, touched = [], 0, []
+        for verdict in output.get("items", []):
+            record_id = aliases.get(verdict.get("id", ""))
+            if record_id not in known:
+                raise ValueError("unknown tidy target")
+            row = by_id[record_id]
+            action = verdict["action"]
+            reason = "[整理] " + str(verdict.get("reason") or "").strip()[:200]
+            patch = {}
+            if verdict.get("category"):
+                patch["category"] = str(verdict["category"])[:40]
+            if verdict.get("importance"):
+                patch["importance"] = int(verdict["importance"])
+            if action in ("extract", "archive", "split"):
+                patch["active"] = False
+            if action == "split" and verdict.get("keep_content"):
+                patch["summary"] = verdict["keep_content"]
+            if action == "split" and patch.get("summary"):
+                patch.pop("active")  # split：约束那段留在常驻
+            if patch:
+                await self.store.call("edit", "record", record_id, row["revision"], patch, reason)
+            facts = []
+            for fact in verdict.get("facts", []):
+                facts.append(
+                    {
+                        "category": fact["category"],
+                        "subject": await self.id_for_subject(fact.get("subject", ""), names),
+                        "content": fact["content"],
+                        "reason": str(fact.get("reason") or "")[:2000],
+                        "scenario": str(fact.get("scenario") or "")[:2000],
+                        "tags": list(fact.get("tags") or []),
+                        "relations": [
+                            rel.model_dump() if hasattr(rel, "model_dump") else dict(rel)
+                            for rel in (fact.get("relations") or [])
+                        ],
+                        "importance": fact.get("importance", 5),
+                        "source_ids": [record_id],
+                    }
+                )
+            if facts:
+                await self.store.call("add_facts", sid, facts)
+            items.append(
+                {
+                    "kind": "record",
+                    "target": record_id,
+                    "action": action,
+                    "note": (reason + ("；提炼 %d 条事实" % len(facts)) if facts else reason),
+                    "before": (row.get("summary") or "")[:400],
+                }
+            )
+            touched.append(record_id)
+            applied += 1 if action != "keep" else 0
+        if job_id and items:
+            await self.store.call("add_job_items", job_id, items)
+        if touched:
+            await self.store.call("touch_tidy", touched)
+        return applied
+
+    async def tidy_worker(self):
+        """Dedicated lane for permanent-memory tidy-up."""
+        while not self.stopping:
+            cfg = self.settings()
+            if not cfg.enabled or not cfg.permanent_tidy_enabled:
+                await asyncio.sleep(1)
+                continue
+            job = await self.store.call("claim", kind="tidy")
+            if not job:
+                await asyncio.sleep(1)
+                continue
+            started = time.monotonic()
+            try:
+                applied = await self.tidy_permanents(job["sid"], job["id"])
+                detail = (
+                    "整理 %s 条永久记忆" % applied
+                    if applied
+                    else "没有需要移出常驻的永久记忆"
+                )
+                await self.store.call("finish", job["id"], "completed", detail)
+                logger.info(
+                    "[记忆·Z] 永久记忆整理完成（%s），耗时 %.1f 秒",
+                    detail,
+                    time.monotonic() - started,
+                )
+            except Exception as exc:
+                await self.store.call("finish", job["id"], "failed", failure_detail(exc))
+                logger.warning("[记忆·Z] 永久记忆整理失败：%s", failure_detail(exc))
+
     async def fact_merge_worker(self):
         """Dedicated lane so fresh duplicates never wait behind compression."""
         while not self.stopping:
@@ -1125,7 +1277,9 @@ class Engine:
             if not cfg.enabled or index >= cfg.worker_count:
                 await asyncio.sleep(0.5)
                 continue
-            job = await self.store.call("claim", exclude=("dedupe", "fact_merge"))
+            job = await self.store.call(
+                "claim", exclude=("dedupe", "fact_merge", "tidy")
+            )
             if not job:
                 self.wake.clear()
                 try:
@@ -1325,6 +1479,14 @@ class Engine:
                             break
                         if await self.enqueue("audit", sid, automatic=True):
                             self.audit_calls += 1
+            if cfg.permanent_tidy_enabled:
+                for sid in await self.store.call("sessions_with_permanents"):
+                    live = await self.store.call("permanent_records", sid)
+                    heavy = len(live) > cfg.permanent_cap or sum(
+                        len(row.get("summary") or "") for row in live
+                    ) > cfg.permanent_budget_chars
+                    if heavy:
+                        await self.enqueue("tidy", sid, automatic=True)
             if cfg.permanent_dedupe and now - self.last_dedupe >= cfg.audit_interval:
                 self.last_dedupe = now
                 for sid in await self.store.call("sessions_with_permanents"):

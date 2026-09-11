@@ -142,6 +142,22 @@ class FactMerge(Strict):
     groups: list[FactMergeGroup] = Field(max_length=20)
 
 
+class TidyItem(Strict):
+    """永久记忆整理：一条记忆的处置结论。"""
+
+    id: Short
+    action: Literal["keep", "extract", "archive", "split"]
+    category: str = Field(default="", max_length=40)
+    importance: int | None = Field(default=None, ge=1, le=10)
+    facts: list[Fact] = Field(default_factory=list, max_length=6)
+    keep_content: str = Field(default="", max_length=16000)
+    reason: Short
+
+
+class PermanentTidy(Strict):
+    items: list[TidyItem] = Field(max_length=50)
+
+
 class Compression(Strict):
     summary: Text
     facts: list[Fact] = Field(max_length=100)
@@ -273,6 +289,12 @@ class Settings(Strict):
     boot_enabled: bool = True
     boot_replay_seconds: int = Field(default=90, ge=0, le=86400)
     session_affinity: bool = False
+    memorize_cover_check: bool = True
+    permanent_tidy_enabled: bool = True
+    permanent_cap: int = Field(default=10, ge=1, le=200)
+    permanent_budget_chars: int = Field(default=3000, ge=200, le=100000)
+    permanent_tidy_batch: int = Field(default=10, ge=1, le=100)
+    permanent_tidy_days: int = Field(default=14, ge=0, le=3650)
     permanent_dedupe: bool = True
     dedupe_force_merge: bool = True
     dedupe_threshold: float = Field(default=0.25, ge=0.1, le=0.95)
@@ -374,7 +396,13 @@ class Edit(Strict):
     @model_validator(mode="after")
     def validate_patch(self):
         if self.kind == "record":
-            if not set(self.patch) <= {"summary", "active", "deleted"}:
+            if not set(self.patch) <= {
+                "summary",
+                "active",
+                "deleted",
+                "category",
+                "importance",
+            }:
                 raise ValueError("invalid fields")
             if "summary" in self.patch and (
                 not isinstance(self.patch["summary"], str)
@@ -404,6 +432,7 @@ class Restore(Strict):
 class NewMemory(Strict):
     sid: Short
     content: Text
+    category: str = Field(default="", max_length=40)
     users: list[Short] = Field(default_factory=list, max_length=100)
     start: float | None = None
     end: float | None = None
