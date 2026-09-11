@@ -669,9 +669,14 @@ class AlifeMemoryPlugin(BasePlugin):
             while not await self.store.call("scrub_capture_text"):
                 await asyncio.sleep(0.05)
             await self.store.call("finish_capture_scrub")
-            changed = self.store.scrub_stats()["changed"]
-            if changed:
-                logger.info("[记忆·Z] 存量记录已清理协议外壳/思考块：%s 条", changed)
+            stats = self.store.scrub_stats()
+            if stats["changed"] or stats["emptied"]:
+                logger.info(
+                    "[记忆·Z] 存量记录清理：改写 %s 条（剥协议外壳/思考块）、"
+                    "移入回收站 %s 条（只剩空外壳的原始记录，可还原）",
+                    stats["changed"],
+                    stats["emptied"],
+                )
         except Exception as exc:  # 清理只是让老数据更好用，失败不影响任何功能
             logger.warning("[记忆·Z] 存量记录清理失败（下次启动会重试）：%s", exc)
 

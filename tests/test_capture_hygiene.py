@@ -310,6 +310,94 @@ def test_two_text_blocks_never_merge_into_one_message():
     assert out != "A</text><text>B"
 
 
+def test_scrub_moves_empty_shell_records_to_trash(tmp_path):
+    """清洗后只剩空外壳的原始记录要进回收站，而不是留在列表里当空卡片。"""
+    store = _store(tmp_path / "db")
+    with store.connect() as db:
+        for rid, text in (
+            ("shell", "<msg />"),
+            ("blank", "   "),
+            ("empty_pair", "<msg></msg>"),
+            ("real", "<msg><text>正文</text></msg>"),
+        ):
+            db.execute(
+                "INSERT INTO records(id,sid,role,level,start,end,summary,content,"
+                "users,position,created,search_body) "
+                "VALUES (?,?,'user',0,0.0,0.0,?,?,'[]',0,0.0,'')",
+                (rid, "qq:gm:A", text, text),
+            )
+    while not store.scrub_capture_text():
+        pass
+
+    with store.connect() as db:
+        deleted = {
+            row["id"]: row["deleted"]
+            for row in db.execute("SELECT id,deleted FROM records")
+        }
+    assert deleted["shell"] == 1 and deleted["blank"] == 1 and deleted["empty_pair"] == 1
+    assert deleted["real"] == 0
+    assert store.scrub_stats()["emptied"] == 3
+    # 有内容的那条只剥外壳、正文留下
+    assert store.get("real")["content"] == "正文"
+    # 空壳记录不再占 L0 席位（压缩计数不受影响），并能在回收站看到、可还原
+    assert [r["id"] for r in store.active("qq:gm:A")] == ["real"]
+    assert store.trash(kind="records")["total"] == 3
+    store.undelete("record", "shell")
+    assert store.get("shell")["deleted"] == 0
+
+
+def test_scrub_version_bump_reruns_cleanup(tmp_path):
+    """净化口径升级后要再跑一次（老库里已经留下的空卡片才会被收走）。"""
+    store = _store(tmp_path / "db")
+    assert store.prepare_capture_scrub() is True
+    store.finish_capture_scrub()
+    assert store.prepare_capture_scrub() is False
+    with store.connect() as db:  # 模拟老版本留下的标记
+        db.execute("UPDATE meta SET value='1' WHERE key='capture_scrub'")
+    assert store.prepare_capture_scrub() is True
+
+
+def test_scrub_never_recycles_records_that_still_carry_information(tmp_path):
+    """只有「清洗后一个字都不剩」的记录才会被回收——有媒体/表情/引用的必须留下。
+
+    宿主把图片渲染成 `[Image ...]`、语音 `[Record ...]`，协议里的表情/图片会变成
+    `[表情8]`/`[图片...]`，引用会变成 `↩123`——这些都不是空，所以不会被回收。
+    """
+    store = _store(tmp_path)
+    keep = {
+        "media": "[Image , file_path: /data/a.jpg]",
+        "voice": "[Record , file_path: /data/b.mp3]",
+        "sticker_reply": "<msg><sticker>8</sticker></msg>",
+        "image_quote": "<msg><reply>123</reply></msg>",
+        "text_reply": "<msg><reply>7</reply><text>好</text></msg>",
+    }
+    with store.connect() as db:
+        for rid, text in keep.items():
+            db.execute(
+                "INSERT INTO records(id,sid,role,level,start,end,summary,content,"
+                "users,position,created,search_body) "
+                "VALUES (?,?,'user',0,0.0,0.0,?,?,'[]',0,0.0,'')",
+                (rid, "qq:gm:A", text, text),
+            )
+        db.execute(
+            "INSERT INTO records(id,sid,role,level,start,end,summary,content,"
+            "users,position,created,search_body) "
+            "VALUES ('shell','qq:gm:A','user',0,0.0,0.0,'<msg />','<msg />','[]',0,0.0,'')"
+        )
+    while not store.scrub_capture_text():
+        pass
+
+    with store.connect() as db:
+        rows = {r["id"]: r for r in db.execute("SELECT id,deleted,content FROM records")}
+    assert rows["shell"]["deleted"] == 1, "空外壳应当进回收站"
+    for rid in keep:
+        assert rows[rid]["deleted"] == 0, rid
+        assert rows[rid]["content"], rid
+    assert "表情8" in rows["sticker_reply"]["content"]
+    assert rows["image_quote"]["content"].startswith("↩123")
+    assert store.scrub_stats()["emptied"] == 1
+
+
 def test_model_facing_text_drops_reasoning_but_stored_text_keeps_it():
     """给模型的出口比落库多剥一层思考块——用户可能真的引用过它。
 
