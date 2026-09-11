@@ -7,6 +7,8 @@ import sys
 import types
 from pathlib import Path
 
+import os
+
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -155,3 +157,44 @@ def test_correct_memory_exposes_full_action_set():
     rules = source[source.index("MEMORY_RULES = ("):source.index("\n)", source.index("MEMORY_RULES = ("))]
     for gone in ("ReadMemoryArchive", "MemoryOverview", "MemoryNames", "CorrectMemoryName"):
         assert gone not in rules, gone
+
+
+@pytest.mark.asyncio
+async def test_manual_tidy_runs_even_below_capacity(tmp_path):
+    """被手动叫起来的整理必须真的看一遍——容量闸门只该拦住自动触发。
+
+    线上踩过：3 条永久记忆（没超上限也没超预算），Bot 主动整理却只回
+    「整理完成（没有需要移出常驻的永久记忆）」，什么都没做。
+    """
+    if not os.environ.get("KIRA_CORE"):
+        pytest.skip("set KIRA_CORE for host integration")
+
+    import json as _json
+    import sys as _sys
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_helpers_plugin import build_plugin
+
+    plugin, store = await build_plugin(tmp_path)
+    try:
+        for text in ("主人喜欢乌龙茶", "主人喜欢喝乌龙茶加冰"):
+            store.memorize("qq:dm:1", text, ["test:u"], 1.0, 1.0)
+        called = []
+
+        async def model(_, purpose, instruction, schema, payload):
+            called.append(payload)
+            return _json.dumps(
+                {"items": [{"id": item["id"], "action": "keep", "reason": "长期有效"}
+                           for item in payload["items"]]},
+                ensure_ascii=False,
+            )
+
+        plugin.engine.model_call = model
+        job = store.enqueue("tidy", "qq:dm:1")
+        store.claim(kind="tidy")
+        plugin.engine.last_tidy_note = ""
+        await plugin.engine.tidy_permanents("qq:dm:1", job)
+        assert called, "没有超容量时，手动整理也必须真的请模型看一遍"
+        assert called[0]["items"], "候选不该为空"
+    finally:
+        await plugin.terminate()
