@@ -1255,9 +1255,38 @@ function applyRefreshMode() {
       }, 2500)
     : null;
 }
-$("#theme").onclick = () =>
-  (document.documentElement.dataset.theme =
-    document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+// ---- 主题：选择要记住（首帧前的兜底在 index.html 的内联脚本里）----
+function savedTheme() {
+  try {
+    const value = localStorage.getItem("alife-theme");
+    return value === "dark" || value === "light" ? value : "";
+  } catch (err) {
+    return "";
+  }
+}
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  const button = $("#theme");
+  if (button) {
+    button.textContent = theme === "dark" ? "☾" : "☀";
+    button.title =
+      theme === "dark" ? "当前：黑夜主题（点击切到明亮）" : "当前：明亮主题（点击切到黑夜）";
+    button.setAttribute("aria-label", button.title);
+  }
+}
+function initTheme() {
+  // 内联脚本已经设过一次；这里兜底 + 让按钮图标反映当前状态
+  applyTheme(document.documentElement.dataset.theme || savedTheme() || "light");
+}
+$("#theme").onclick = () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  applyTheme(next);
+  try {
+    localStorage.setItem("alife-theme", next);
+  } catch (err) {
+    /* 记不住就只在本次会话生效 */
+  }
+};
 let forceMotion = localStorage.getItem("alife-motion") === "force";
 function applyMotion() {
   if (forceMotion) document.documentElement.dataset.motion = "force";
@@ -1377,6 +1406,7 @@ window.addEventListener("resize", () => {
   if (fxAllowed()) buildStars();
 });
 applyFx();
+initTheme();
 const BOOT_QUOTES = [
   "和谁的记忆，我都不想忘记",
   "每段记忆，都有来处",

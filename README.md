@@ -332,7 +332,16 @@ python tools/web_audit.py                 # 前端静态审计：属性读写配
 另修：`merge_facts` 同组版本现在共用同一个时间戳（原来逐条取 `time.time()`，
 导致按「同一 reason + 同一时间戳」找回整组快照会漏）——重做就是靠这个把组找回来的。
 
-测试：默认 284 passed 10 skipped；KIRA_CORE 330 passed；web_audit 0。
+**前端两处顺手修（同一 PR）**
+- **主题选择会记住了**：黑夜/明亮按钮以前只改 `document.documentElement.dataset.theme`，
+  既没存、也没在启动时恢复 → 刷新就回到默认 ✗。现在写入 `localStorage.alife-theme`，
+  并在 `index.html` 的**样式表之前**用内联脚本恢复（先按上次选择，没选过就跟系统
+  `prefers-color-scheme`），所以连开屏动画都不会闪一下；按钮图标也跟着变 ☀ / ☾。
+- **开屏动画本来就适配黑夜**（背景、星点、文字、光环全走 CSS 变量），**只有图标上那道扫光
+  写死了 `#ffffff96`** ✗ 暗色下白得刺眼 → 改成 `--sheen` 变量（亮色 `#ffffff96` / 暗色 `#ffffff33`）。
+- 新增 `tests/test_theme.py`：主题必须持久化、恢复脚本必须在样式表之前、开屏样式里不许有写死的颜色。
+
+测试：默认 287 passed 10 skipped；KIRA_CORE 333 passed；web_audit 0。
 
 ### v2.12.1 (2026-09-12) — 清洗后只剩空外壳的历史记录移入回收站 🗑
 
