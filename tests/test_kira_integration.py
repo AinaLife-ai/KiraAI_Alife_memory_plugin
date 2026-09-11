@@ -1698,11 +1698,11 @@ async def test_prewarm_hook_accepts_single_message_event(tmp_path):
         # 预热键必须落在真实会话上（单条事件没有 .sid，得走 .session.sid）
         assert plugin._prewarm_seen.get(event.session.sid)
         assert not plugin._prewarm_seen.get("")
-        # 预热是后台任务：给它一点时间跑完（最多 0.5 秒，通常一两轮就够）
-        for _ in range(50):
+        # 预热是后台任务：给它一点时间跑完（最多 5 秒，全量跑时机器会慢）
+        for _ in range(250):
             if plugin._memo:
                 break
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.02)
         # 预热必须真的预热到「注入时用的那个键」，否则只是一次白算
         assert (
             "context",

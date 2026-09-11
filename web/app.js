@@ -298,6 +298,7 @@ const JOB_KINDS = {
   reindex: "语义索引",
   classify: "记忆归类",
   dedupe: "永久记忆合并",
+  rewrite: "重整理事实",
   fact_merge: "事实合并",
   tidy: "永久记忆整理",
   proactive: "主动感知",
@@ -827,7 +828,7 @@ function renderFactCards(list) {
     ? list
         .map(
           (f, i) =>
-            `<article class="card"><div class="row"><span class="tag">${esc(labels[f.category])}</span><strong>${esc(displayLabel(f.subject))}</strong></div><p>${esc(f.content)}</p><small>${esc(f.tags.join(" · "))}</small>${f.relation_warnings?.length ? '<div class="notice">待审校：' + esc(f.relation_warnings.map((w) => w.reason).join("；")) + "。该连线未用于关系召回。</div>" : ""}<p class="muted">${esc(f.reason ? "事实依据：" + f.reason : "")}${esc(f.scenario ? " · 场景：" + f.scenario : "")}</p>${f.edit_history?.length ? '<p class="muted">最近审校：' + esc(f.edit_history[0].reason) + " · " + date(f.edit_history[0].created) + "</p>" : ""}<footer><small>${f.sources.length} 个来源</small><button data-fact="${i}">编辑事实</button></footer></article>`,
+            `<article class="card"><div class="row"><span class="tag">${esc(labels[f.category])}</span><strong>${esc(displayLabel(f.subject))}</strong></div><p>${esc(f.content)}</p><small>${esc(f.tags.join(" · "))}</small>${f.rewrite_pending ? '<div class="notice">待整理 ' + esc(String(f.rewrite_attempts || 0)) + '/3：这条是「模型输出不可用 → 按时间拼接」的产物。下一轮审计会还原来源、重新合并；也可以点维护面板的「重整理待处理事实」立刻排队。</div>' : ""}${f.relation_warnings?.length ? '<div class="notice">待审校：' + esc(f.relation_warnings.map((w) => w.reason).join("；")) + "。该连线未用于关系召回。</div>" : ""}<p class="muted">${esc(f.reason ? "事实依据：" + f.reason : "")}${esc(f.scenario ? " · 场景：" + f.scenario : "")}</p>${f.edit_history?.length ? '<p class="muted">最近审校：' + esc(f.edit_history[0].reason) + " · " + date(f.edit_history[0].created) + "</p>" : ""}<footer><small>${f.sources.length} 个来源</small><button data-fact="${i}">编辑事实</button></footer></article>`,
         )
         .join("")
     : empty("画像还在形成");
