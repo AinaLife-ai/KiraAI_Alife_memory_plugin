@@ -1133,11 +1133,15 @@ class AlifeMemoryPlugin(BasePlugin):
                 -(r.get("start") or 0),
             )
         )
-        # 永久记忆的成本压力在注入处就能看见：超条数或超字符预算就排队整理
+        # 永久记忆的成本压力在注入处就能看见：超条数或超字符预算就排队整理。
+        # 注意：recall_scope=global 时这里看到的是**所有会话**的永久记忆，
+        # 所以整理要按「归属会话」分别排队——否则膨胀在别的会话时，
+        # 只清当前会话永远清不掉，每轮都会重新排队。
         if cfg.permanent_tidy_enabled:
             perm_chars = sum(len(row.get("summary") or "") for row in perms)
             if len(perms) > cfg.permanent_cap or perm_chars > cfg.permanent_budget_chars:
-                await self.engine.enqueue("tidy", sid, automatic=True)
+                for owner in sorted({row["sid"] for row in perms if row["sid"]}):
+                    await self.engine.enqueue("tidy", owner, automatic=True)
         fresh = self._mark_access([row["id"] for row in perms])
         if fresh:
             await self.store.call("touch_accessed", fresh)
@@ -1863,16 +1867,37 @@ class AlifeMemoryPlugin(BasePlugin):
         kind = str(kind or "record").strip()
 
         if action == "tidy":
+            cfg = self.runtime_settings()
             reset = [await self.store.call("real_id", value) for value in targets]
+            owners = set()
             if reset:
-                await self.store.call("touch_tidy_at", reset, 0)  # 让它们立刻可被整理
-            await self.engine.enqueue("tidy", event.sid, automatic=True)
+                # 指定了条目：按它们各自的归属会话排队（让这几条立刻可被整理）
+                await self.store.call("touch_tidy_at", reset, 0)
+                for record_id in reset:
+                    row = await self.store.call("get", record_id)
+                    if row and row["permanent"]:
+                        owners.add(row["sid"])
+            # 没指定条目时，范围跟随 access scope：
+            # global（默认）→ 所有有意久记忆的会话；session → 仅当前会话
+            if not owners:
+                if cfg.recall_scope == "global":
+                    owners = set(
+                        await self.store.call("sessions_with_permanents")
+                    )
+                owners.add(event.sid)
+            for owner in sorted(owners):
+                await self.engine.enqueue("tidy", owner, automatic=True)
             return self.recall_result(
                 event,
                 {
                     "ok": True,
                     "queued": True,
-                    "scope": "指定的 %d 条" % len(reset) if reset else "按保留度自动挑候选",
+                    "sessions": len(owners),
+                    "scope": (
+                        "指定的 %d 条（%d 个会话）" % (len(reset), len(owners))
+                        if reset
+                        else "按保留度自动挑候选 · %d 个会话" % len(owners)
+                    ),
                 },
             )
 
