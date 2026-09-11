@@ -265,12 +265,14 @@ _WRAPPER_RE = {
     for tag in WRAPPER_TAGS
 }
 
-# 带语义的标签：压缩成短记号，但保留信息
+# 带语义的标签：压缩成短记号，但保留信息。
+# 内容用 [^<\n]*?（不吃标签、不跨行）：万一某条消息写了未闭合的 <sticker>，
+# 配对规则也绝不会一路吃到后面某条消息的 </sticker> 上去（内容安全优先）。
 _INLINE_RE = [
-    (re.compile(r"<reply>(.*?)</reply>", re.S | re.I), lambda m: "↩" + m.group(1).strip()),
-    (re.compile(r"<at>(.*?)</at>", re.S | re.I), lambda m: "@" + m.group(1).strip()),
-    (re.compile(r"<sticker>(.*?)</sticker>", re.S | re.I), lambda m: "[表情" + m.group(1).strip() + "]"),
-    (re.compile(r"<image>(.*?)</image>", re.S | re.I), lambda m: "[图片" + m.group(1).strip() + "]"),
+    (re.compile(r"<reply>([^<\n]*?)</reply>", re.S | re.I), lambda m: "↩" + _inner(m)),
+    (re.compile(r"<at>([^<\n]*?)</at>", re.S | re.I), lambda m: "@" + _inner(m)),
+    (re.compile(r"<sticker>([^<\n]*?)</sticker>", re.S | re.I), lambda m: "[表情" + _inner(m) + "]"),
+    (re.compile(r"<image>([^<\n]*?)</image>", re.S | re.I), lambda m: "[图片" + _inner(m) + "]"),
 ]
 
 _CJK = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
@@ -284,29 +286,126 @@ _LEADING_INDENT = re.compile(r"\n[ \t]+")
 _BAD_CHARS = re.compile(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffd]")
 
 
-_MSG_OPEN = re.compile(r"<msg(?:\s[^>]*)?>", re.I)
-_MSG_CLOSE = re.compile(r"</msg\s*>", re.I)
-_OTHER_WRAPPERS = re.compile(r"</?(?:forward|quote|message)(?:\s[^>]*)?>", re.I)
-# 一个消息块：以 <text> 开头、</text> 收尾（允许前面有气泡/换行）。
-# 用「锚定 + 非贪婪」而不是数配对，这样正文里真的写了 <text> 也不会被吃掉。
-_BLOCK = re.compile(
-    r"(?:^|\n)[ \t]*<text(?:\s[^>]*)?>(.*?)</text\s*>(?=[ \t]*(?:\n|$))",
+def _inner(match):
+    return match.group(1).strip()
+
+
+# ---- 协议外壳 ---------------------------------------------------------------
+# LLM 实际会写出各种形态：<msg> <msg/> <msg /> <msg attr="1"/> <MSG/> </msg>
+#   </msg > <text/> <text></text> ……
+# 所以这里的匹配一律写成「名字前后允许空白 + 属性任意 + 结尾 / 可有可无」。
+# 底线：**只吃标签本身，绝不碰标签以外的任何字符**（\b 保证 <msg_id> 这类
+# 名字更长的标签不会被误伤；标签里不允许跨行，避免吃到大段正文）。
+def _open_re(name):
+    return re.compile(rf"<\s*(?!/)\s*{name}\b[^>\n]*?>", re.I)
+
+
+def _close_re(name):
+    return re.compile(rf"<\s*/\s*{name}\b[^>\n]*?>", re.I)
+
+
+_MSG_OPEN = _open_re("msg")
+_MSG_CLOSE = _close_re("msg")
+_OTHER_OPEN = re.compile(r"<\s*(?!/)\s*(?:forward|quote|message)\b[^>\n]*?>", re.I)
+_OTHER_CLOSE = re.compile(r"<\s*/\s*(?:forward|quote|message)\b[^>\n]*?>", re.I)
+# 抠完配对后的残留（自闭合 / 孤立开闭）：<reply/> <sticker> </image> 之类
+_INLINE_BARE = re.compile(r"<\s*/?\s*(?:reply|at|sticker|image)\b[^>\n]*?>", re.I)
+
+# 一个消息块：以 <text> 开头、</text> 收尾。
+# 用「锚定 + 非贪婪」而不是数配对，这样正文里真的写了 <text> 也不会被吃掉：
+# 只有当 <text> 前面是行首（或只剩 ↩/@/[表情] 这类标记）时才当外壳剥。
+# 模型经常把整条回复写在一行里（<msg><reply>…</reply><text>…</text><sticker>…</sticker></msg>），
+# 所以标记前缀/后缀也要允许，否则行内那块 <text> 会原样留在记忆里。
+_MARKER = r"(?:↩[^\s<]*|@[^\s<]*|\[(?:表情|图片)[^\]]*\])"
+_TEXT_OPEN = r"<\s*text\b[^>\n]*?>"
+_TEXT_CLOSE = r"<\s*/\s*text\b[^>\n]*?>"
+_BLOCK_STRICT = re.compile(
+    rf"(?P<lead>(?:^|\n)[ \t]*(?:{_MARKER}[ \t]*)*){_TEXT_OPEN}"
+    # 正文里不允许再出现 text 标签：否则非贪婪匹配会跨过后一个 </text> 回溯，
+    # 把两条消息合成一条、并留下半截标签（实测踩到）。
+    rf"(?P<body>(?:(?!<\s*/?\s*text\b).)*?)"
+    rf"{_TEXT_CLOSE}(?P<tail>[ \t]*(?:{_MARKER}[ \t]*)*)"
+    # 同一行可能还有下一个块（<text>A</text><text>B</text>），所以结尾也允许 '<'
+    rf"(?=[ \t]*(?:{_MARKER}[ \t]*)*(?:\n|$|<))",
     re.S | re.I,
 )
+# 正文里**字面写了** <text> 的（「他说 3<5 且提到 <text> 这个词」）上面那条匹配不到，
+# 用这条兜底：允许正文含同类标签，代价是极端输入（同一行两个块）可能留下标签——
+# 宁可留下标签，也不能把两段正文合成一段、或吃掉正文（内容安全优先）。
+_BLOCK_LOOSE = re.compile(
+    rf"(?P<lead>(?:^|\n)[ \t]*(?:{_MARKER}[ \t]*)*){_TEXT_OPEN}(?P<body>.*?)"
+    rf"{_TEXT_CLOSE}(?P<tail>[ \t]*(?:{_MARKER}[ \t]*)*)"
+    rf"(?=[ \t]*(?:{_MARKER}[ \t]*)*(?:\n|$|<))",
+    re.S | re.I,
+)
+# 空文本块（<text/>、<text />、<text></text>、只有空白的 <text>  </text>）：
+# 里面没有任何内容，所以**任何位置**都可以直接删——删掉不丢字，也就不需要锚定。
+# （非空块才需要行级锚定来保护正文里的字面 <text>，见 _BLOCK_STRICT/_BLOCK_LOOSE。）
+_TEXT_EMPTY = re.compile(
+    rf"(?:{_TEXT_OPEN}\s*{_TEXT_CLOSE}|<\s*text\b[^>\n]*?/\s*>)", re.I
+)
+
+
+def _block_repl(match):
+    """剥掉 <text>/</text> 标签本身，里面的内容一个字不动。
+
+    前缀里的标记（``↩7``/``[表情8]``）必须原样带回去——只吃掉标签。
+    """
+    lead = match.group("lead")
+    if not lead.strip():
+        lead = "\n"  # 纯行首空白：留一个换行当消息边界
+    return lead + match.group("body") + match.group("tail")
+
+
+# 思考块：连内容一起丢（它是协议内部推理，不是"说过的话"）
+_REASONING_PAIR = re.compile(
+    r"<\s*reasoning\b[^>\n]*?>(.*?)<\s*/\s*reasoning\b[^>\n]*?>", re.S | re.I
+)
+_REASONING_OPEN = re.compile(r"<\s*(?!/)\s*reasoning\b[^>\n]*?>", re.I)
+_REASONING_BARE = re.compile(r"<\s*/?\s*reasoning\b[^>\n]*?>", re.I)
+_MSG_HEAD = re.compile(r"<\s*(?!/)\s*msg\b", re.I)
+
+
+def strip_reasoning(text):
+    """去掉思考块（``<reasoning>…</reasoning>``）。
+
+    - 成对：跨行、带属性、大小写都认，整段删掉。
+    - 未闭合 ``<reasoning>``：**只截到下一个 ``<msg`` 之前**（协议上推理在消息
+      之前）；找不到 ``<msg`` 就只删标签、正文一个字不动——宁可留下思考，
+      也不丢正文（内容安全优先）。
+    - ``<reasoning/>``、孤立的 ``</reasoning>``：删标签。
+    """
+    if not text:
+        return ""
+    out = _REASONING_PAIR.sub("", str(text))
+    while True:
+        match = _REASONING_OPEN.search(out)
+        if not match:
+            break
+        nxt = _MSG_HEAD.search(out, match.end())
+        if not nxt:
+            break  # 后面没有 <msg：只删标签，保留正文
+        out = out[: match.start()] + out[nxt.start() :]
+    return _REASONING_BARE.sub("", out)
 
 
 def _strip_wrappers(text):
     """剥掉 message_str 的最外层容器，保留消息之间的边界（换行）。"""
-    out = _MSG_OPEN.sub("", text)
+    out = text
+    for pattern, repl in _INLINE_RE:
+        out = pattern.sub(repl, out)
+    out = _TEXT_EMPTY.sub("", out)
+    out = _MSG_OPEN.sub("", out)
     out = _MSG_CLOSE.sub("\n", out)
-    out = _OTHER_WRAPPERS.sub("", out)
+    out = _OTHER_OPEN.sub("", out)
+    out = _OTHER_CLOSE.sub("", out)
     for _ in range(3):  # 少数情况会套两层
-        # 保留消息边界：匹配时吃掉了前导换行，这里补回来
-        new_out = _BLOCK.sub(lambda m: "\n" + m.group(1), out)
+        new_out = _BLOCK_STRICT.sub(_block_repl, out)
+        new_out = _BLOCK_LOOSE.sub(_block_repl, new_out)
         if new_out == out:
             break
         out = new_out
-    return out
+    return _INLINE_BARE.sub("", out)
 
 
 def clean_text(text, keep=()):
@@ -389,8 +488,12 @@ def trim_nested(text, reply_chars=40, desc_chars=100):
 
 
 def model_text(text, keep=(), reply_chars=40, desc_chars=100):
-    """统一入口：剥包裹 + 压空白 + 截断嵌套长描述（只影响模型看到的样子）。"""
-    return trim_nested(clean_text(text, keep), reply_chars, desc_chars)
+    """统一入口：剥思考块 + 剥包裹 + 压空白 + 截断嵌套长描述（只影响模型看到的样子）。
+
+    这里**比落库多剥一层思考块**：落库要保原文（用户可能真的引用了 Bot 的思考块），
+    但发给模型的东西不该带内部推理——存量清理万一没跑到，模型也不会被污染。
+    """
+    return trim_nested(clean_text(strip_reasoning(text), keep), reply_chars, desc_chars)
 
 
 def _scan_bracket(text, start):

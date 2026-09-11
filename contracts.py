@@ -265,9 +265,9 @@ class Settings(Strict):
     bootstrap_seed: Literal["auto", "always", "off"] = "auto"
     inject_recent_raw: bool = False
     auto_inject: bool = True
-    threshold: int = Field(default=100, ge=4, le=10000)
-    batch_size: int = Field(default=70, ge=2, le=9999)
-    probability: float = Field(default=0.4, ge=0, le=1)
+    threshold: int = Field(default=50, ge=4, le=10000)
+    batch_size: int = Field(default=40, ge=2, le=9999)
+    probability: float = Field(default=0.8, ge=0, le=1)
     max_level: int = Field(default=8, ge=1, le=32)
     compress_model: str = ""
     audit_model: str = ""

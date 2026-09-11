@@ -862,7 +862,7 @@ function renderRecord() {
     date(r.start) +
     " — " +
     date(r.end);
-  $("#editLabel").textContent = "可编辑摘要（原始内容始终保留）";
+  $("#editLabel").textContent = "可编辑摘要（原文保留：只剥掉协议外壳与思考块）";
   $("#editText").value = r.summary;
   $("#factFields").classList.add("hide");
   $("#sources").classList.remove("hide");

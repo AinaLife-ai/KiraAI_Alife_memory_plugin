@@ -17,7 +17,7 @@ from contextlib import contextmanager, closing
 from pathlib import Path
 from .contracts import dump, relation_issue
 from .output_validation import validate_audit
-from .retrieval import index_grams, identity_info
+from .retrieval import clean_text, index_grams, identity_info, strip_reasoning
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,20 @@ class Conflict(ValueError):
 
 def uid():
     return uuid.uuid4().hex
+
+
+def scrub_row_text(level, role, text):
+    """存量清洗的单行规则（与落库同口径）。
+
+    L0 走落库那套（剥协议外壳 + 思考块）；L1+ 是模型写的散文摘要、本就不该有
+    外壳，所以**只剥思考块**——避免把摘要里正常出现的尖括号内容误伤掉。
+    """
+    text = str(text or "")
+    if role == "assistant":
+        text = strip_reasoning(text)
+    if int(level or 0) == 0:
+        text = clean_text(text)
+    return text.strip()
 
 
 def search_body_of(summary):
@@ -87,6 +101,8 @@ class Store:
         self._fts_state = "unknown"  # unknown/ready/building/unavailable
         self._fts_stats = {"filled": 0, "plain": 0}  # 本次补齐 / 其中无可检索文字
         self._fts_stale = False  # 索引体口径与当前代码不同（需后台重算）
+        self._scrub_cursor = 0  # 存量清洗的扫描游标
+        self._scrub_stats = {"changed": 0}
         self.path = path
 
     async def call(self, method, *args, **kwargs):
@@ -351,6 +367,64 @@ class Store:
             "building" if (missing or self._fts_stale) else "ready"
         )
         return True
+
+    def scrub_capture_text(self, batch=200):
+        """存量清洗：把早期版本混进原文/摘要里的协议外壳与思考块清一遍。
+
+        分批扫（``LIMIT batch``），返回是否扫完；改动条数记在
+        :meth:`scrub_stats`。**幂等**：只改真的变了的行。
+        只扫含 ``<`` 的行——没有尖括号就没有标签/思考块，不必惊动。
+        """
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT rowid, level, role, summary, content FROM records "
+                "WHERE rowid > ? AND (instr(content,'<')>0 OR instr(summary,'<')>0) "
+                "ORDER BY rowid LIMIT ?",
+                (self._scrub_cursor, batch),
+            ).fetchall()
+            if not rows:
+                return True
+            self._scrub_cursor = rows[-1]["rowid"]
+            updates = []
+            for row in rows:
+                content = scrub_row_text(row["level"], row["role"], row["content"])
+                summary = scrub_row_text(row["level"], row["role"], row["summary"])
+                if content == row["content"] and summary == row["summary"]:
+                    continue
+                updates.append(
+                    (
+                        content,
+                        summary,
+                        search_body_of(summary or content),
+                        row["rowid"],
+                    )
+                )
+            if updates:
+                db.executemany(
+                    "UPDATE records SET content=?, summary=?, search_body=? "
+                    "WHERE rowid=?",
+                    updates,
+                )
+        self._scrub_stats["changed"] += len(updates)
+        return False
+
+    def prepare_capture_scrub(self):
+        """是否还需要跑一次存量清洗（跑过就记在 meta 里，只跑一次）。"""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='capture_scrub'"
+            ).fetchone()
+        return not (row and row["value"])
+
+    def finish_capture_scrub(self):
+        with self.connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES ('capture_scrub','1')"
+            )
+        return True
+
+    def scrub_stats(self):
+        return dict(self._scrub_stats)
 
     def prepare_search_index(self):
         """索引体口径升级时作废旧索引体；返回是否作了废（后台回填会重算）。
