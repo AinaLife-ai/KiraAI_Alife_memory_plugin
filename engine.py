@@ -12,6 +12,7 @@ from .retrieval import (
     full_time,
     model_text,
     named_pair,
+    short_time,
     squeeze,
 )
 from .output_validation import (
@@ -784,8 +785,11 @@ class Engine:
         return total
 
     @staticmethod
-    def _fact_clusters(rows, threshold):
-        """Connected components of similar facts sharing subject+category."""
+    def _fact_clusters(rows, threshold, cross_threshold=0.0):
+        """Connected components of similar facts sharing the same subject.
+
+        同类别用 threshold；跨类别用更保守的 cross_threshold（<=0 表示不跨）。
+        """
         from .retrieval import similarity
 
         parent = {row["id"]: row["id"] for row in rows}
@@ -803,12 +807,16 @@ class Engine:
 
         for index, left in enumerate(rows):
             for right in rows[index + 1 :]:
-                if (left["subject"], left["category"]) != (
-                    right["subject"],
-                    right["category"],
-                ):
+                if left["subject"] != right["subject"]:
+                    continue  # 跨主体不合并：合并后归谁是个新问题
+                limit = (
+                    threshold
+                    if left["category"] == right["category"]
+                    else cross_threshold
+                )
+                if limit <= 0:
                     continue
-                if similarity(left["content"], right["content"], min_overlap=2) >= threshold:
+                if similarity(left["content"], right["content"], min_overlap=2) >= limit:
                     union(left["id"], right["id"])
         groups = {}
         for row in rows:
@@ -857,6 +865,7 @@ class Engine:
             # fact hidden forever.
             await self.store.call("mark_merge_pending", leftovers, 0)
         merged = 0
+        keep_names = await self.store.call("spaced_names")
         items = []  # 明细累计（跨批次），最后一次性写入任务
         for start in range(0, len(clusters), max(1, cfg.fact_merge_batch_clusters)):
             batch = clusters[start : start + max(1, cfg.fact_merge_batch_clusters)]
@@ -878,11 +887,32 @@ class Engine:
                             "time": full_time(row["time"]),
                         }
                     )
+                evidence, seen = [], set()
+                for row in (group if cfg.fact_merge_evidence else []):
+                    for source in row["sources"]:
+                        if source in seen or len(evidence) >= 6:
+                            continue
+                        seen.add(source)
+                        record = await self.store.call("get", source)
+                        if not record:
+                            continue
+                        evidence.append(
+                            {
+                                "t": short_time(
+                                    record.get("end") or record.get("start")
+                                ),
+                                "s": model_text(
+                                    record.get("summary") or "", keep_names
+                                ),
+                            }
+                        )
                 groups_view.append(
                     {
                         "subject": group[0]["subject"],
                         "category": group[0]["category"],
                         "facts": facts_view,
+                        # 判定依据：这组事实各自的来源原文（有证据才敢「必动作」）
+                        "evidence": evidence,
                     }
                 )
             payload = {"groups": groups_view}
@@ -922,6 +952,7 @@ class Engine:
                                     )
                                 )
                             )[: cfg.fact_merge_max_chars],
+                            "action": "merge",
                             "reason": "模型输出不可用，按时间拼接",
                         },
                     )
@@ -940,6 +971,70 @@ class Engine:
                     else ""
                 )
                 try:
+                    action = verdict.get("action", "merge")
+                    # 跨类别时先把全组统一到目标类别（合并本身要求同主体同类别）
+                    unified = str(verdict.get("category") or "").strip()
+                    if unified and any(r["category"] != unified for r in group):
+                        for row in group:
+                            await self.store.call(
+                                "edit",
+                                "fact",
+                                row["id"],
+                                row["revision"],
+                                {"category": unified},
+                                "%s（统一类别：%s）" % (verdict["reason"], unified),
+                            )
+                    if action == "drop":
+                        # 只软删冗余的那几条，保留 target（回收站可还原）
+                        for row in group:
+                            if row["id"] == verdict["target_id"]:
+                                continue
+                            await self.store.call(
+                                "edit",
+                                "fact",
+                                row["id"],
+                                row["revision"] + (1 if unified else 0),
+                                {"deleted": True},
+                                verdict["reason"],
+                            )
+                            items.append(
+                                {
+                                    "kind": "fact",
+                                    "target": row["id"],
+                                    "action": "retract",
+                                    "note": verdict["target_id"],
+                                    "before": row["content"],
+                                }
+                            )
+                        items.append(
+                            {
+                                "kind": "fact",
+                                "target": verdict["target_id"],
+                                "action": "keep",
+                                "note": "",
+                            }
+                        )
+                        logger.info(
+                            "[记忆·Z] 去重删除 %s 条冗余事实（保留 %s）",
+                            len(group) - 1,
+                            await self.store.call("short_id", verdict["target_id"]),
+                        )
+                        continue
+                    if action == "relabel":
+                        items.append(
+                            {
+                                "kind": "fact",
+                                "target": verdict["target_id"],
+                                "action": "keep",
+                                "note": "",
+                            }
+                        )
+                        logger.info(
+                            "[记忆·Z] 统一 %s 条事实的类别 → %s",
+                            len(group),
+                            unified or "（未给类别）",
+                        )
+                        continue
                     await self.store.call(
                         "merge_facts",
                         verdict["target_id"],
@@ -1162,6 +1257,14 @@ class Engine:
                 raise
             except Exception as exc:
                 detail = failure_detail(exc)
+                # 失败就把待合并标记清掉，别让这些事实因为一次失败而长期不进上下文
+                stuck = await self.store.call(
+                    "facts_for_merge", job["sid"], pending_only=True
+                )
+                if stuck:
+                    await self.store.call(
+                        "mark_merge_pending", [row["id"] for row in stuck], 0
+                    )
                 await self.store.call("finish", job["id"], "failed", detail)
                 logger.warning("[记忆·Z] 事实合并失败：%s", detail)
 

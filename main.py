@@ -587,41 +587,21 @@ class AlifeMemoryPlugin(BasePlugin):
             "flag_similar_pairs",
             [fact["id"] for fact in facts],
             cfg.fact_merge_threshold,
+            cfg.fact_merge_cross_threshold,
         )
         if not flagged:
             return set()
         await self.store.call("mark_merge_pending", flagged, 1)
         await self.engine.enqueue("fact_merge", sid)
-        # 每一对里留下「更重要、更新」的那条，另一条本轮不再注入
-        dropped = set()
-        by_id = {fact["id"]: fact for fact in facts if fact["id"] in set(flagged)}
-        seen = set()
-        for left in by_id.values():
-            if left["id"] in seen:
-                continue
-            for right in by_id.values():
-                if right["id"] == left["id"] or right["id"] in seen:
-                    continue
-                if (left["subject"], left["category"]) != (
-                    right["subject"],
-                    right["category"],
-                ):
-                    continue
-                keep, drop = (
-                    (left, right)
-                    if (left.get("importance", 5), left.get("created", 0))
-                    >= (right.get("importance", 5), right.get("created", 0))
-                    else (right, left)
-                )
-                dropped.add(drop["id"])
-                seen.update({keep["id"], drop["id"]})
+        # 只标记、不当轮隐藏：本轮模型照常看到完整信息（判定有误也不会凭空少一条），
+        # 从下一轮起 merge_pending 生效，重复的那条不再注入。
         logger.debug(
-            "[记忆·Z] 召回时发现 %d 条疑似重复事实（阈值 %.2f），已排队合并，本轮少注入 %d 条",
+            "[记忆·Z] 召回时发现 %d 条疑似重复事实（%s），已排入合并队列",
             len(flagged),
-            cfg.fact_merge_threshold,
-            len(dropped),
+            sid,
         )
-        return dropped
+        return set()
+
 
     async def shortmap(self, values):
         """批量生成短码映射 {真实 id: 短码}，供渲染时替换。"""

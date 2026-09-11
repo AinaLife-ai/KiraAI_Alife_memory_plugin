@@ -2127,11 +2127,13 @@ class Store:
             self.bump(db)
         return ids
 
-    def flag_similar_pairs(self, ids, threshold):
-        """在给定事实集合内找出「同主体 + 同类别 + 相似」的重复项（零模型）。
+    def flag_similar_pairs(self, ids, threshold, cross_threshold=0.0):
+        """在给定事实集合内找出「同主体且相似」的重复项（零模型）。
 
         召回时调用：那一瞬间候选正好都在手里，判定几乎是白送的。
-        范围与写入侧一致——跨主体/跨类别的合并本来就会被拒绝，所以这里不比。
+        同主体、同类别用写入侧阈值；同主体、跨类别用更保守的 cross_threshold
+        （跨类型常常是「同一件事被记成了不同类别」，但也可能是两件不同性质的事，
+        所以门槛更高，且最终处置交给带原文证据的模型）。跨主体一律不参与。
         """
         from .retrieval import similarity
 
@@ -2151,12 +2153,13 @@ class Store:
         flagged = set()
         for index, left in enumerate(rows):
             for right in rows[index + 1 :]:
-                if (left["subject"], left["category"]) != (
-                    right["subject"],
-                    right["category"],
-                ):
+                if left["subject"] != right["subject"]:
+                    continue  # 跨主体：合并后归谁是个新问题，不在这里处理
+                same_scope = left["category"] == right["category"]
+                limit = threshold if same_scope else cross_threshold
+                if limit <= 0:
                     continue
-                if similarity(left["content"], right["content"], min_overlap=2) >= threshold:
+                if similarity(left["content"], right["content"], min_overlap=2) >= limit:
                     flagged.add(left["id"])
                     flagged.add(right["id"])
         return sorted(flagged)

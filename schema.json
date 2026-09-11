@@ -343,7 +343,7 @@
       "fact_merge_prompt": {
         "type": "string",
         "name": "事实合并提示词",
-        "default": "输入是若干组待合并的事实（groups[]）：每组 subject 与 category 相同，组内 facts 按时间从新到旧排列，facts[0] 是最新的。\n为每一组输出一条结果，数量与顺序与输入完全一致，只做 merge（不允许 keep）。\n以该组 facts[0] 为基准：先保留它的结论，再把其余事实里独有的人名、数字、日期、否定、条件、状态补充进去。\n冲突之处以时间较晚的说法为准，不保留已被推翻的旧结论。\n涉及不同对象时必须在同一条 content 里分别写明，不得丢弃任何主体或任何独有信息。\ncontent 必须自包含：不写“同上”，不引用任何 ID，不写“以上”“根据记录”之类的元话，不重复原文措辞。\n不得编造原文没有的信息。\n硬性字数：每条 content ≤ {content_max} 字，reason ≤ {reason_max} 字；超出即判定失败。\n只输出 JSON：{\"groups\":[{\"target_id\":\"…\",\"source_ids\":[\"…\"],\"content\":\"…\",\"reason\":\"…\"}]}\ntarget_id 取该组最新那条的 id；source_ids 为该组全部 id（至少两条），逐字复制。",
+        "default": "输入是若干组相似事实（groups[]）：同组同主体，类别可能相同也可能不同；组内 facts 按时间从新到旧排列，facts[0] 最新；若附了 evidence，那是这些事实的来源原文，用它核对。\n为每一组输出一条结果，数量与顺序与输入完全一致。【必须给出动作，没有 keep】三种动作：\n- merge：确认是同一件事 → 以 facts[0] 为基准合并，把其余事实独有的人名、数字、日期、否定、条件、状态补进去；冲突以时间较晚者为准；不同对象要分别写明，不得丢弃独有信息。content 必须自包含，不写“同上”、不引用 ID、不写“根据记录”之类元话，不得编造。\n- relabel：确实是同一件事，但两边内容各自都成立、无需合并 → 只统一类别（给 category）。\n- drop：其中若干条是纯冗余或错误记录 → 保留 target_id，其余进 source_ids 被删除（可恢复）。\n跨类别时（组内 category 不一致）必须给 category，写明统一后的类别；合并前会先把整组统一到该类别。\n硬性字数：每条 content ≤ {content_max} 字，reason ≤ {reason_max} 字；超出即判定失败。\n只输出 JSON：{\"groups\":[{\"target_id\":\"…\",\"source_ids\":[\"…\"],\"action\":\"merge|relabel|drop\",\"category\":\"…\",\"content\":\"…\",\"reason\":\"…\"}]}\ntarget_id 取要保留的那条 id；source_ids 至少一条，逐字复制。",
         "description": "可用 {content_max} 与 {reason_max} 占位符，保存后替换成上面的字数设置。；改乱了可点旁边的「恢复默认」"
       },
       "cross_session_merge": {
@@ -397,6 +397,18 @@
         "default": 14,
         "minimum": 0,
         "description": "同一条永久记忆多久内不重复整理，避免反复打扰模型。"
+      },
+      "fact_merge_cross_threshold": {
+        "type": "number",
+        "name": "跨类别重复阈值",
+        "default": 0.4,
+        "description": "同主体但类别不同的两条事实，相似度达到多少才进入去重判定。同一件事被记成不同类别（例如偏好 vs 经历）时靠它发现；比同类别的 0.25 更保守。"
+      },
+      "fact_merge_evidence": {
+        "type": "switch",
+        "name": "去重判定附原文证据",
+        "default": true,
+        "description": "开启后，交给模型判定的每组重复事实会附带它们的来源原文，判定从「文本猜测」变成「查证」，更准但更费 token；关闭可省成本（此时请把阈值调高一些更稳妥）。"
       },
       "permanent_dedupe": {
         "type": "switch",
