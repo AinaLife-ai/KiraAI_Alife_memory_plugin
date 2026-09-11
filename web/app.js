@@ -265,16 +265,7 @@ function tasksHtml(jobs) {
         .map(
           (j) =>
             '<div class="task"><div><strong>' +
-            esc(
-              {
-                compress: "分层压缩",
-                audit: "事实审计",
-                reindex: "语义索引",
-                classify: "记忆归类",
-                dedupe: "永久记忆合并",
-                proactive: "主动感知",
-              }[j.kind] || j.kind,
-            ) +
+            esc(JOB_KINDS[j.kind] || j.kind) +
             '</strong><div class="muted">' +
             esc(j.sid) +
             "</div><small>" +
@@ -308,6 +299,7 @@ const JOB_KINDS = {
   classify: "记忆归类",
   dedupe: "永久记忆合并",
   fact_merge: "事实合并",
+  tidy: "永久记忆整理",
   proactive: "主动感知",
 };
 const JOB_ACTIONS = {
@@ -319,6 +311,9 @@ const JOB_ACTIONS = {
   merge: "合并",
   retract: "撤回",
   classify: "分类",
+  keep: "保留",
+  extract: "提炼成事实",
+  split: "拆分保留",
 };
 function bindJobButtons() {
   // 注意：只绑明细按钮。手动排队按钮用的是 data-job，混用会把它们的点击覆盖掉。

@@ -362,3 +362,33 @@ def test_fact_merge_records_job_items_for_detail_view(tmp_path):
     assert folded[0]["before"] == "萤火对花生过敏"
     assert folded[0]["note"] == target["target"]
     assert store.facts_by_ids([target["target"]])[0]["deleted"] == 0
+
+
+def test_merge_payload_evidence_switch(tmp_path):
+    """去重判定默认附原文证据；关掉开关后不再附（省 token）。"""
+    for flag in (True, False):
+        store = s.Store(tmp_path / f"db{flag}")
+        store.initialize()
+        case = MergeCase("seed")
+        case.store = store
+        case.calls = []
+        case.seed()
+        store.enqueue("fact_merge", "qq:gm:1")
+        store.claim(kind="fact_merge")
+        captured = []
+
+        async def model(*args):
+            captured.append(args[-1])
+            return MergeCase.merge_reply(args[-1])
+
+        engine = e.Engine(
+            store, lambda: c.Settings(fact_merge_evidence=flag), model, None, None
+        )
+        run(engine.queue_fact_merges("qq:gm:1", 0))
+        run(engine.merge_facts("qq:gm:1"))
+        group = captured[-1]["groups"][0]
+        assert "evidence" in group
+        if flag:
+            assert group["evidence"], "开启时证据不能为空"
+        else:
+            assert group["evidence"] == [], "关闭时不应附证据"

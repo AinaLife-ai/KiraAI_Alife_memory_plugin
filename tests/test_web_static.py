@@ -73,3 +73,25 @@ def test_dataset_attributes_and_routes_are_consistent():
 def test_style_braces_balanced():
     css = (WEB / "style.css").read_text(encoding="utf-8")
     assert css.count("{") == css.count("}"), "style.css 大括号不配对"
+
+
+def test_job_kind_labels_cover_every_queued_kind():
+    """任务名映射必须覆盖后端所有会排队的 kind，且全站只有一份。
+
+    踩过的坑：tasksHtml() 里另有一份只有 6 项的内联映射，
+    于是 fact_merge / tidy 在任务卡片里显示英文（明细弹窗却是中文）。
+    """
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    engine = (Path(__file__).resolve().parents[1] / "engine.py").read_text(encoding="utf-8")
+    main = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+    kinds = set(re.findall(r'enqueue\("([a-z_]+)"', engine + main))
+    assert kinds, "没找到后端排队的任务类型"
+
+    block = js[js.index("const JOB_KINDS = {") : js.index("};", js.index("const JOB_KINDS = {"))]
+    labeled = set(re.findall(r"^\s*([a-z_]+):", block, re.M))
+    missing = kinds - labeled
+    assert not missing, f"前端任务名缺映射：{sorted(missing)}"
+
+    # 只允许一份 kind→中文 映射：按「键: "标签"」的形式数，避免误伤配置帮助文案
+    for entry in ('compress: "分层压缩"', 'audit: "事实审计"', 'fact_merge: "事实合并"'):
+        assert js.count(entry) == 1, f"重复的任务名映射：{entry} 出现 {js.count(entry)} 次"

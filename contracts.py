@@ -130,16 +130,49 @@ class Fact(Strict):
 
 
 class FactMergeGroup(Strict):
+    """一组相似事实的处置。**没有 keep**：判定必须给出动作。
+
+    merge   = 合并（跨类别时须同时给 category，先把全组统一到该类别）
+    relabel = 只统一类别（同一件事被记成了不同类别，但内容各自保留也没问题）
+    drop    = 删掉 source_ids 里那些冗余的（软删，可还原），保留 target_id
+    """
+
     target_id: Short
-    source_ids: list[Short] = Field(min_length=2, max_length=50)
-    content: Text
+    source_ids: list[Short] = Field(min_length=1, max_length=50)
+    action: Literal["merge", "relabel", "drop"] = "merge"
+    category: str = Field(default="", max_length=40)
+    content: str = Field(default="", max_length=16000)
     reason: Short
+
+    @model_validator(mode="after")
+    def validate_action(self):
+        if self.action == "merge" and not self.content.strip():
+            raise ValueError("merge requires content")
+        if self.action == "merge" and len(self.source_ids) < 2:
+            raise ValueError("merge needs at least two facts")
+        return self
 
 
 class FactMerge(Strict):
     """One model call merges a batch of near-duplicate fact groups."""
 
     groups: list[FactMergeGroup] = Field(max_length=20)
+
+
+class TidyItem(Strict):
+    """永久记忆整理：一条记忆的处置结论。"""
+
+    id: Short
+    action: Literal["keep", "extract", "archive", "split"]
+    category: str = Field(default="", max_length=40)
+    importance: int | None = Field(default=None, ge=1, le=10)
+    facts: list[Fact] = Field(default_factory=list, max_length=6)
+    keep_content: str = Field(default="", max_length=16000)
+    reason: Short
+
+
+class PermanentTidy(Strict):
+    items: list[TidyItem] = Field(max_length=50)
 
 
 class Compression(Strict):
@@ -188,19 +221,20 @@ class RecordMerge(Strict):
 
 
 FACT_MERGE_PROMPT = (
-    "输入是若干组待合并的事实（groups[]）：每组 subject 与 category 相同，"
-    "组内 facts 按时间从新到旧排列，facts[0] 是最新的。\n"
-    "为每一组输出一条结果，数量与顺序与输入完全一致，只做 merge（不允许 keep）。\n"
-    "以该组 facts[0] 为基准：先保留它的结论，再把其余事实里独有的人名、数字、日期、"
-    "否定、条件、状态补充进去。\n"
-    "冲突之处以时间较晚的说法为准，不保留已被推翻的旧结论。\n"
-    "涉及不同对象时必须在同一条 content 里分别写明，不得丢弃任何主体或任何独有信息。\n"
-    "content 必须自包含：不写“同上”，不引用任何 ID，不写“以上”“根据记录”之类的元话，"
-    "不重复原文措辞。\n"
-    "不得编造原文没有的信息。\n"
+    "输入是若干组相似事实（groups[]）：同组同主体，类别可能相同也可能不同；"
+    "组内 facts 按时间从新到旧排列，facts[0] 最新；若附了 evidence，那是这些事实的来源原文，用它核对。\n"
+    "为每一组输出一条结果，数量与顺序与输入完全一致。【必须给出动作，没有 keep】三种动作：\n"
+    "- merge：确认是同一件事 → 以 facts[0] 为基准合并，把其余事实独有的人名、数字、日期、否定、"
+    "条件、状态补进去；冲突以时间较晚者为准；不同对象要分别写明，不得丢弃独有信息。"
+    "content 必须自包含，不写“同上”、不引用 ID、不写“根据记录”之类元话，不得编造。\n"
+    "- relabel：确实是同一件事，但两边内容各自都成立、无需合并 → 只统一类别（给 category）。\n"
+    "- drop：其中若干条是纯冗余或错误记录 → 保留 target_id，其余进 source_ids 被删除（可恢复）。\n"
+    "跨类别时（组内 category 不一致）必须给 category，写明统一后的类别；"
+    "合并前会先把整组统一到该类别。\n"
     "硬性字数：每条 content ≤ {content_max} 字，reason ≤ {reason_max} 字；超出即判定失败。\n"
-    '只输出 JSON：{"groups":[{"target_id":"…","source_ids":["…"],"content":"…","reason":"…"}]}\n'
-    "target_id 取该组最新那条的 id；source_ids 为该组全部 id（至少两条），逐字复制。"
+    '只输出 JSON：{"groups":[{"target_id":"…","source_ids":["…"],"action":"merge|relabel|drop",'
+    '"category":"…","content":"…","reason":"…"}]}\n'
+    "target_id 取要保留的那条 id；source_ids 至少一条，逐字复制。"
 )
 
 RECORD_MERGE_PROMPT = (
@@ -273,6 +307,14 @@ class Settings(Strict):
     boot_enabled: bool = True
     boot_replay_seconds: int = Field(default=90, ge=0, le=86400)
     session_affinity: bool = False
+    memorize_cover_check: bool = True
+    permanent_tidy_enabled: bool = True
+    permanent_cap: int = Field(default=10, ge=1, le=200)
+    permanent_budget_chars: int = Field(default=3000, ge=200, le=100000)
+    permanent_tidy_batch: int = Field(default=10, ge=1, le=100)
+    permanent_tidy_days: int = Field(default=14, ge=0, le=3650)
+    fact_merge_cross_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
+    fact_merge_evidence: bool = True
     permanent_dedupe: bool = True
     dedupe_force_merge: bool = True
     dedupe_threshold: float = Field(default=0.25, ge=0.1, le=0.95)
@@ -374,7 +416,13 @@ class Edit(Strict):
     @model_validator(mode="after")
     def validate_patch(self):
         if self.kind == "record":
-            if not set(self.patch) <= {"summary", "active", "deleted"}:
+            if not set(self.patch) <= {
+                "summary",
+                "active",
+                "deleted",
+                "category",
+                "importance",
+            }:
                 raise ValueError("invalid fields")
             if "summary" in self.patch and (
                 not isinstance(self.patch["summary"], str)
@@ -404,6 +452,7 @@ class Restore(Strict):
 class NewMemory(Strict):
     sid: Short
     content: Text
+    category: str = Field(default="", max_length=40)
     users: list[Short] = Field(default_factory=list, max_length=100)
     start: float | None = None
     end: float | None = None

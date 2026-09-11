@@ -454,6 +454,19 @@ CATEGORY_CODES = {
     "resource": "rs",
     "self": "sf",
 }
+# 记忆类别优先级：越小越"必须留在上下文里"（用于注入排序与裁剪）
+CATEGORY_RANK = {
+    "rule": 0,
+    "commitment": 1,
+    "preference": 2,
+    "profile": 3,
+    "relationship": 4,
+    "resource": 5,
+    "event": 6,
+    "fact": 7,
+    "note": 8,
+}
+
 CATEGORY_LEGEND = "事实短码：" + " ".join(
     f"{code}={name}" for name, code in CATEGORY_CODES.items()
 )

@@ -153,6 +153,23 @@ class Store:
                 db.execute(
                     "ALTER TABLE records ADD COLUMN importance INTEGER NOT NULL DEFAULT 0"
                 )
+            if "category" not in columns:
+                # 永久记忆也带类别（沿用事实那套词汇 + rule/note）
+                db.execute(
+                    "ALTER TABLE records ADD COLUMN category TEXT NOT NULL DEFAULT ''"
+                )
+            if "access_count" not in columns:
+                db.execute(
+                    "ALTER TABLE records ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "last_accessed" not in columns:
+                db.execute(
+                    "ALTER TABLE records ADD COLUMN last_accessed REAL NOT NULL DEFAULT 0"
+                )
+            if "tidy_at" not in columns:
+                db.execute(
+                    "ALTER TABLE records ADD COLUMN tidy_at REAL NOT NULL DEFAULT 0"
+                )
             job_item_columns = {r[1] for r in db.execute("PRAGMA table_info(job_items)")}
             if "before" not in job_item_columns:
                 db.execute(
@@ -1310,15 +1327,15 @@ class Store:
             self.bump(db)
             return archive_id
 
-    def memorize(self, sid, content, users, start, end, importance=8):
+    def memorize(self, sid, content, users, start, end, importance=8, category=""):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self._ensure_entities(db, sid, users)
             record_id = f"100-{int(start * 1000)}-{int(end * 1000)}-{uid()[:12]}"
             db.execute(
                 """INSERT INTO records(id,sid,role,level,start,end,summary,content,users,
-              permanent,position,created,importance)
-              VALUES (?,?,'assistant',100,?,?,?,?,?,1,0,?,?)""",
+              permanent,position,created,importance,category)
+              VALUES (?,?,'assistant',100,?,?,?,?,?,1,0,?,?,?)""",
                 (
                     record_id,
                     sid,
@@ -1329,6 +1346,7 @@ class Store:
                     dump(users),
                     time.time(),
                     int(importance),
+                    str(category or ""),
                 ),
             )
             self.bump(db)
@@ -1492,7 +1510,7 @@ class Store:
     def edit(self, kind, target, revision, patch, reason):
         table = "records" if kind == "record" else "facts"
         allowed = (
-            {"summary", "active", "deleted"}
+            {"summary", "active", "deleted", "category", "importance"}
             if kind == "record"
             else {
                 "content",
@@ -1782,6 +1800,24 @@ class Store:
             total = db.execute(
                 "SELECT count(*) FROM records WHERE " + where, args
             ).fetchone()[0]
+            if vector and lexical:
+                return {
+                    "total": total,
+                    "items": self._fused_rows(
+                        db,
+                        where,
+                        args,
+                        tier_sql,
+                        tier_args,
+                        vector,
+                        model,
+                        lexical,
+                        limit,
+                        offset,
+                        prefer_sid,
+                        prefer_users,
+                    ),
+                }
             if vector:
                 norm = math.sqrt(sum(x * x for x in vector))
 
@@ -1813,6 +1849,84 @@ class Store:
                     [*args, *tier_args, limit, offset],
                 )
             return {"total": total, "items": [self.row(r) for r in rows]}
+
+    def _fused_rows(
+        self, db, where, args, tier_sql, tier_args, vector, model,
+        lexical, limit, offset, prefer_sid="", prefer_users=(),
+    ):
+        """词面 + 向量融合取页（只在两者同时可用时启用）。
+
+        各取一路候选池 → 按本池最大值归一 → 0.3*词面 + 0.7*向量 → 重排取页。
+        没有向量时不走这里，行为与以前完全一致。
+        """
+        import math
+
+        from .retrieval import relevance
+
+        db.create_function(
+            "lexical_score", 1, lambda text: relevance(lexical, text)
+        )
+        norm = math.sqrt(sum(x * x for x in vector))
+
+        def cosine(raw):
+            other = json.loads(raw)
+            if len(other) != len(vector):
+                return -1.0
+            denom = norm * math.sqrt(sum(x * x for x in other))
+            return (
+                sum(x * y for x, y in zip(vector, other)) / denom if denom else -1.0
+            )
+
+        db.create_function("similarity", 1, cosine)
+        pool = max(30, (offset + limit) * 3)
+        vec_sql = f"""SELECT records.*,
+              coalesce((SELECT similarity(vector) FROM vectors WHERE vectors.id=records.id
+                AND vectors.model=? AND vectors.revision=records.revision),-1) AS vscore,
+              lexical_score(summary) AS lscore
+            FROM records WHERE {where}
+            ORDER BY {tier_sql}vscore DESC LIMIT ?"""
+        lex_sql = f"""SELECT records.*,0 AS vscore, lexical_score(summary) AS lscore
+            FROM records WHERE {where} AND lexical_score(summary)>0
+            ORDER BY {tier_sql}lscore DESC LIMIT ?"""
+        pool_rows = {}
+        for row in db.execute(vec_sql, [model, *args, *tier_args, pool]):
+            pool_rows[row["id"]] = self.row(row)
+        for row in db.execute(lex_sql, [*args, *tier_args, pool]):
+            item = self.row(row)
+            if row["id"] in pool_rows:
+                pool_rows[row["id"]]["lscore"] = max(
+                    pool_rows[row["id"]]["lscore"], item["lscore"]
+                )
+            else:
+                pool_rows[row["id"]] = item
+        if not pool_rows:
+            return []
+        users = set(prefer_users or ())
+        max_l = max((r["lscore"] for r in pool_rows.values()), default=0) or 1.0
+        max_v = max((max(r["vscore"], 0.0) for r in pool_rows.values()), default=0) or 1.0
+        for item in pool_rows.values():
+            item["_fused"] = 0.3 * (item["lscore"] / max_l) + 0.7 * (
+                max(item["vscore"], 0.0) / max_v
+            )
+            if tier_sql:
+                # 会话亲和仍然优先，与旧路径保持一致
+                if item["sid"] == prefer_sid:
+                    item["_tier"] = 0
+                elif users & set(item["users"]):
+                    item["_tier"] = 1
+                else:
+                    item["_tier"] = 2 if item.get("visibility") == "global" else 3
+        ordered = sorted(
+            pool_rows.values(),
+            key=lambda r: (r.get("_tier", 0), -r["_fused"], -r["end"], r["id"]),
+        )
+        page = ordered[offset : offset + limit]
+        for item in page:
+            item.pop("lscore", None)
+            item.pop("vscore", None)
+            item.pop("_fused", None)
+            item.pop("_tier", None)
+        return page
 
     def facts(
         self,
@@ -1917,6 +2031,138 @@ class Store:
                     [*args, limit],
                 )
             ]
+
+    def covering_fact(self, sid, content, threshold=0.4):
+        """该内容是否已被某条事实覆盖（零模型）。
+
+        用于永久记忆的「入闸」：能被事实覆盖的信息没必要再占一个每轮常驻的席位。
+        """
+        from .retrieval import similarity
+
+        text = str(content or "").strip()
+        if len(text) < 4:
+            return None
+        with self.connect() as db:
+            rows = [
+                self.row(r)
+                for r in db.execute(
+                    "SELECT * FROM facts WHERE deleted=0 AND merge_pending=0"
+                    " AND (sid=? OR sid='global') LIMIT 400",
+                    (sid,),
+                )
+            ]
+        best, score = None, 0.0
+        for row in rows:
+            current = similarity(text, row["content"], min_overlap=3)
+            if current > score:
+                best, score = row, current
+        return {"fact": best, "score": round(score, 3)} if best and score >= threshold else None
+
+    def tidy_candidates(self, sid, days=14, limit=50):
+        """按「保留度」从低到高挑永久记忆整理候选（零模型）。
+
+        保留度 = 重要度 0.35 + 访问衰减 0.25 + 创建衰减 0.1 + 访问加成 ≤0.3，
+        再给 rule 类一个保底加成——它不是不能被整理，只是不会被优先挑中。
+        """
+        now = time.time()
+        cutoff = now - max(0, int(days)) * 86400
+        with self.connect() as db:
+            rows = [
+                self.row(r)
+                for r in db.execute(
+                    "SELECT * FROM records WHERE sid=? AND permanent=1 AND deleted=0"
+                    " AND active=1 AND cold=0",
+                    (sid,),
+                )
+            ]
+        fresh = []
+        for row in rows:
+            if row.get("tidy_at") and row["tidy_at"] > cutoff:
+                continue
+            score = (
+                (row.get("importance") or 5) / 10 * 0.35
+                + 0.5 ** ((now - (row.get("last_accessed") or row.get("start") or now)) / 86400 / 30) * 0.25
+                + 0.5 ** ((now - (row.get("start") or now)) / 86400 / 90) * 0.1
+                + min((row.get("access_count") or 0) * 0.05, 0.3)
+            )
+            if str(row.get("category") or "") == "rule":
+                score += 0.5
+            row["_score"] = round(score, 4)
+            fresh.append(row)
+        fresh.sort(key=lambda r: (r["_score"], r["id"]))
+        return fresh[:limit]
+
+    def touch_accessed(self, ids):
+        """记一次「被召回/被注入了」，供保留度评分使用。"""
+        ids = [value for value in dict.fromkeys(ids or []) if value]
+        if not ids:
+            return
+        marks = ",".join("?" * len(ids))
+        with self.connect() as db:
+            db.execute(
+                f"UPDATE records SET access_count=access_count+1, last_accessed=?"
+                f" WHERE id IN ({marks})",
+                [time.time(), *ids],
+            )
+
+    def touch_tidy(self, ids):
+        """记一次「刚整理过」，配合 tidy_days 做幂等限流。"""
+        ids = [value for value in dict.fromkeys(ids or []) if value]
+        if not ids:
+            return
+        marks = ",".join("?" * len(ids))
+        with self.connect() as db:
+            db.execute(
+                f"UPDATE records SET tidy_at=? WHERE id IN ({marks})",
+                [time.time(), *ids],
+            )
+
+    def add_facts(self, sid, facts):
+        """批量写入事实（整理提炼用）：走与压缩/归类同一条 _add_fact 链路。"""
+        ids = []
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for fact in facts:
+                ids.append(self._add_fact(db, sid, fact))
+            self.bump(db)
+        return ids
+
+    def flag_similar_pairs(self, ids, threshold, cross_threshold=0.0):
+        """在给定事实集合内找出「同主体且相似」的重复项（零模型）。
+
+        召回时调用：那一瞬间候选正好都在手里，判定几乎是白送的。
+        同主体、同类别用写入侧阈值；同主体、跨类别用更保守的 cross_threshold
+        （跨类型常常是「同一件事被记成了不同类别」，但也可能是两件不同性质的事，
+        所以门槛更高，且最终处置交给带原文证据的模型）。跨主体一律不参与。
+        """
+        from .retrieval import similarity
+
+        ids = [value for value in dict.fromkeys(ids or []) if value]
+        if len(ids) < 2:
+            return []
+        marks = ",".join("?" * len(ids))
+        with self.connect() as db:
+            rows = [
+                self.row(r)
+                for r in db.execute(
+                    f"SELECT * FROM facts WHERE id IN ({marks})"
+                    " AND deleted=0 AND merge_pending=0",
+                    ids,
+                )
+            ]
+        flagged = set()
+        for index, left in enumerate(rows):
+            for right in rows[index + 1 :]:
+                if left["subject"] != right["subject"]:
+                    continue  # 跨主体：合并后归谁是个新问题，不在这里处理
+                same_scope = left["category"] == right["category"]
+                limit = threshold if same_scope else cross_threshold
+                if limit <= 0:
+                    continue
+                if similarity(left["content"], right["content"], min_overlap=2) >= limit:
+                    flagged.add(left["id"])
+                    flagged.add(right["id"])
+        return sorted(flagged)
 
     def similar_facts(
         self, sid, subject, category, content, limit=3, min_score=0.25,
