@@ -346,6 +346,7 @@ class Engine:
         self.last_audit = 0.0
         self.last_dedupe = 0.0
         # 主动感知：首轮要等一个完整间隔，避免每次重启都立刻主动一轮。
+        self.last_tidy_note = ""
         self.proactive_due = None
         self.proactive_last = {}
         self.audit_day = ""
@@ -1089,17 +1090,22 @@ class Engine:
         if not cfg.permanent_tidy_enabled:
             return 0
         live = await self.store.call("permanent_records", sid)
-        if len(live) < 2:
+        # 任务本身就是「整理一次」：容量闸门只在**自动触发**处判断
+        # （注入侧/定时器超上限才排队）；被 Bot 或人手动叫起来的这一次，
+        # 不管有没有超上限都要真的看一遍——否则会出现"日志说整理完成、其实什么都没做"。
+        if not live:
+            self.last_tidy_note = "该会话还没有永久记忆"
             return 0
         over_cap = len(live) > cfg.permanent_cap
-        over_budget = sum(len(row.get("summary") or "") for row in live) > cfg.permanent_budget_chars
-        if not (over_cap or over_budget):
-            return 0
         wanted = len(live) if over_cap else cfg.permanent_tidy_batch
         candidates = await self.store.call(
             "tidy_candidates", sid, cfg.permanent_tidy_days, max(wanted, 1)
         )
         if not candidates:
+            self.last_tidy_note = (
+                "%d 条永久记忆都在 %d 天整理间隔内，本次跳过"
+                % (len(live), cfg.permanent_tidy_days)
+            )
             return 0
         candidates = candidates[:wanted]
         aliases = {"p%d" % (i + 1): row["id"] for i, row in enumerate(candidates)}
@@ -1209,7 +1215,7 @@ class Engine:
                 detail = (
                     "整理 %s 条永久记忆" % applied
                     if applied
-                    else "没有需要移出常驻的永久记忆"
+                    else (self.last_tidy_note or "本次没有需要调整的永久记忆")
                 )
                 await self.store.call("finish", job["id"], "completed", detail)
                 logger.info(
