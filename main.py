@@ -48,6 +48,7 @@ from .retrieval import (
     clean_text,
     short_time,
     squeeze,
+    strip_reasoning,
     trim_nested,
     TOOL_RESULT_PREFIX,
     archive_view,
@@ -173,6 +174,25 @@ def text_of(message):
             for e in message.chain
         )
     )
+
+
+def capture_text(raw, is_bot=False):
+    """落库前的文本：剥掉协议外壳，Bot 的输出再剥掉思考块。
+
+    ``<msg>``/``<text>``/``<msg/>`` 这些是"进模型的那版文本"的外壳，不是人说
+    的话；``<reasoning>…</reasoning>`` 更是内部推理。两者都不该进长期记忆：
+    会被压缩成摘要与事实（截图里那句"主人叫收声，立刻听话"就是思考块里的话），
+    还白占压缩额度。
+
+    清洗只吃标签、不吃标签外的任何字符（见 ``retrieval.clean_text``），
+    所以"原文"的语义不变：人说过的话一个字都不少。
+    """
+    text = clean_text(strip_reasoning(raw) if is_bot else raw)
+    return (text or "").strip()
+
+
+def is_notice_message(message):
+    return bool(getattr(message, "is_notice", False))
 
 
 def revision(settings):
@@ -589,11 +609,15 @@ class AlifeMemoryPlugin(BasePlugin):
     # ---- 给模型看的紧凑表示 ------------------------------------------------
     @staticmethod
     def model_text(text, keep=(), reply_chars=40, desc_chars=100):
-        """剥包裹 + 压空白 + 截断嵌套的长描述（只影响模型看到的样子）。
+        """剥思考块 + 剥包裹 + 压空白 + 截断嵌套的长描述（只影响模型看到的样子）。
 
         ``keep`` 传「含空格的已登记名字」：这些是真实昵称，不能被空白归一合并。
+
+        这里**比落库多剥一层思考块**：落库要保原文（用户有可能真的引用了 Bot 的
+        思考块，那是他说过的话），但发给模型的内容不该带任何内部推理——
+        即使存量清理没跑到，模型也不会被思考块污染。
         """
-        return trim_nested(clean_text(text, keep), reply_chars, desc_chars)
+        return trim_nested(clean_text(strip_reasoning(text), keep), reply_chars, desc_chars)
 
     def _mark_access(self, ids):
         """注入即算「被使用」一次；同一小时内同一只记一次，避免每轮都写库。"""
@@ -610,6 +634,7 @@ class AlifeMemoryPlugin(BasePlugin):
 
     async def build_search_index(self):
         """后台把检索索引补齐（存量用户首次升级时用；不阻塞启动）。"""
+        await self.scrub_capture_text()
         if self.store.search_index_state() == "unavailable":
             logger.info("[记忆·Z] 本机 SQLite 无 FTS5，检索走全表（功能不受影响）")
             return
@@ -635,6 +660,20 @@ class AlifeMemoryPlugin(BasePlugin):
             )
         else:
             logger.info("[记忆·Z] 检索索引已就绪（无待补齐记录）")
+
+    async def scrub_capture_text(self):
+        """一次性把存量原文/摘要里混进来的协议外壳与思考块清掉（只跑一次）。"""
+        try:
+            if not await self.store.call("prepare_capture_scrub"):
+                return
+            while not await self.store.call("scrub_capture_text"):
+                await asyncio.sleep(0.05)
+            await self.store.call("finish_capture_scrub")
+            changed = self.store.scrub_stats()["changed"]
+            if changed:
+                logger.info("[记忆·Z] 存量记录已清理协议外壳/思考块：%s 条", changed)
+        except Exception as exc:  # 清理只是让老数据更好用，失败不影响任何功能
+            logger.warning("[记忆·Z] 存量记录清理失败（下次启动会重试）：%s", exc)
 
     async def queue_tidy_all(self, fallback_sid=""):
         """把所有有意久记忆的会话都排上整理（去重/提炼/归档都按归属会话执行）。"""
@@ -1127,7 +1166,7 @@ class AlifeMemoryPlugin(BasePlugin):
         if not cfg.auto_inject:
             return
         users = user_ids(event)
-        query = " ".join(text_of(m) for m in event.messages)
+        query = " ".join(capture_text(text_of(m)) for m in event.messages)
         recall_key = (sid, tuple(users), cfg.recall_scope)
         # 这三个查询互不依赖：并行发出，把「串行等待」压成「取最长」。
         # store.call 走线程池，SQLite 连接互不影响。
@@ -1435,7 +1474,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 render_template=False,
             ),
         )
-        query = " ".join(text_of(m) for m in event.messages)
+        query = " ".join(capture_text(text_of(m)) for m in event.messages)
         if any(k in query for k in cfg.recall_keywords):
             req.user_prompt.insert(
                 1,
@@ -1460,21 +1499,30 @@ class AlifeMemoryPlugin(BasePlugin):
         base = str(event.event_id)
         # 通知类消息（主动感知、提醒插件等）是插件的实现细节，不是用户说的话：
         # 不写进记忆，但要保留 Bot 自己的回复与工具调用。
-        incoming = [
-            {
-                "role": "user",
-                "content": text_of(m),
-                "time": float(m.timestamp),
-                "users": users,
-            }
-            for m in event.messages
-            if not getattr(m, "is_notice", False)
-        ]
+        # 剥掉协议外壳后没内容的（空 <msg/>、渲染不出来的消息）也不占 L0 席位：
+        # 它们没有信息量，却会被计入压缩阈值、进压缩输入。
+        incoming = []
+        for message in event.messages:
+            if is_notice_message(message):
+                continue
+            content = capture_text(text_of(message))
+            if not content:
+                continue
+            incoming.append(
+                {
+                    "role": "user",
+                    "content": content,
+                    "time": float(message.timestamp),
+                    "users": users,
+                }
+            )
         if incoming:
             await self.store.call("capture", sid, base + ":input", incoming)
-        text = response.text_response or ""
+        # Bot 的输出：先剥思考块，再剥协议外壳；只剩外壳（例如只输出了 <msg/>）
+        # 且没有工具调用 = 这次没真的说话 → 不建记录。
+        text = capture_text(response.text_response or "", is_bot=True)
         content = text
-        summary = text.strip()
+        summary = text
         if response.tool_calls:
             content += ("\n" if content else "") + dump(
                 {"tool_calls": response.tool_calls}
@@ -1482,21 +1530,22 @@ class AlifeMemoryPlugin(BasePlugin):
             summary = (
                 (summary + "\n" if summary else "") + tool_call_summary(response.tool_calls)
             )
-        await self.store.call(
-            "capture",
-            sid,
-            base + ":response:" + str(response.agent_step_index),
-            [
-                {
-                    "role": "assistant",
-                    "content": content,
-                    # The raw tool_calls JSON stays in content, never in the summary.
-                    "summary": summary or "（无文字回复）",
-                    "time": time.time(),
-                    "users": users,
-                }
-            ],
-        )
+        if content:
+            await self.store.call(
+                "capture",
+                sid,
+                base + ":response:" + str(response.agent_step_index),
+                [
+                    {
+                        "role": "assistant",
+                        "content": content,
+                        # The raw tool_calls JSON stays in content, never in the summary.
+                        "summary": summary or "（无文字回复）",
+                        "time": time.time(),
+                        "users": users,
+                    }
+                ],
+            )
         if random.random() < self.settings.probability:
             rows = await self.store.call("active", sid)
             if compression_plan(rows, self.settings):
@@ -1530,6 +1579,9 @@ class AlifeMemoryPlugin(BasePlugin):
             self._own_outputs.discard(digest)
             return
         if looks_like_memory_payload(text):
+            return
+        text = capture_text(text)  # 工具返回里若夹带协议外壳，也不该进记忆
+        if not text:
             return
         key = str(event.event_id) + ":tool:" + digest
         await self.store.call(
