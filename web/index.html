@@ -253,14 +253,15 @@
           <div class="panel">
             <div class="panel-title">
               <h2>整理工作台</h2>
-              <span class="tag">无需等待模型返回</span>
+              <span class="tag">无需等待模型返回</span
+              ><span class="tag" id="searchIndex" title="词面检索索引（FTS5）：ready=已启用，building=后台回填中，unavailable=本机 SQLite 不支持、走全表检索">索引 —</span>
             </div>
             <div class="row">
               <select id="jobSession" aria-label="任务会话"></select
               ><button data-job="compress">压缩存档</button
               ><button data-job="audit">审计与合并</button
               ><button data-job="dedupe">合并相似永久记忆</button
-              ><button data-job="tidy">整理永久记忆</button
+              ><button data-job="tidy" title="整理所有会话的永久记忆（不受上方会话选择限制）">整理永久记忆</button
               ><button data-job="reindex">重建向量索引（可选）</button>
             </div>
             <p class="muted" style="margin-top: 14px">

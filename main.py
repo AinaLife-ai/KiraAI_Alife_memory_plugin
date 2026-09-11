@@ -170,6 +170,8 @@ class AlifeMemoryPlugin(BasePlugin):
         self._own_outputs = set()
         self._bootstrap_notified = set()
         self._access_seen = {}
+        self._memo = {}
+        self._prewarm_seen = {}
         self._bootstrap_review_logged = False
         self.bootstrap_review = {}
 
@@ -322,6 +324,7 @@ class AlifeMemoryPlugin(BasePlugin):
         )
         # 后台迁移：不阻塞插件加载；迁移期间记忆功能由 migration_blocked 暂停。
         self.migration_task = asyncio.create_task(self.migrate())
+        asyncio.create_task(self.build_search_index())
         self.migration_task.add_done_callback(_log_migration_failure)
         try:
             await self.refresh_bootstrap_review()
@@ -368,7 +371,10 @@ class AlifeMemoryPlugin(BasePlugin):
         if self.engine:
             await self.engine.stop()
 
-    async def situational_facts(self, sid, query, users, subjects, keyword_hit, cfg, prefer):
+    async def situational_facts(
+        self, sid, query, users, subjects, keyword_hit, cfg, prefer,
+        allow_content_match=True,
+    ):
         """情境化注入的事实：常驻约定/偏好 + 提到的人或触发词带回来的事实。
 
         常驻只放「随时该记得」的类别；事件类事实等消息真正提到相关的人或往事时
@@ -435,7 +441,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 )
             )
         keyword_hits = len(triggered) - entity_hits
-        if cfg.fact_recall_min_score and query.strip():
+        if cfg.fact_recall_min_score and query.strip() and allow_content_match:
             # 内容匹配：消息里出现的词直接命中事实内容。
             # 只按类别/实体召回会漏掉「事实内容里有这个词、但主体和名字都没出现」的情况
             # （例：问「你师傅是谁」→ 事实「我师傅是星月」）。软删与待合并的自然被排除。
@@ -572,6 +578,57 @@ class AlifeMemoryPlugin(BasePlugin):
             for key in sorted(self._access_seen, key=self._access_seen.get)[:256]:
                 self._access_seen.pop(key, None)
         return fresh
+
+    async def build_search_index(self):
+        """后台把检索索引补齐（存量用户首次升级时用；不阻塞启动）。"""
+        try:
+            while not await self.store.call("index_backfill"):
+                await asyncio.sleep(0.05)
+            logger.debug("[记忆·Z] 检索索引已就绪")
+        except Exception as exc:  # 索引只是加速层，失败不影响任何功能
+            logger.debug("[记忆·Z] 检索索引回填失败，继续走全表检索：%s", exc)
+
+    async def queue_tidy_all(self, fallback_sid=""):
+        """把所有有意久记忆的会话都排上整理（去重/提炼/归档都按归属会话执行）。"""
+        owners = set(await self.store.call("sessions_with_permanents"))
+        if fallback_sid:
+            owners.add(fallback_sid)
+        for owner in sorted(owners):
+            await self.engine.enqueue("tidy", owner, automatic=True)
+        return sorted(owners)
+
+    async def memo(self, key, factory):
+        """进程内缓存：只缓存「不随消息变化」的查询，按 store revision 失效。
+
+        写入会 bump revision（touch_accessed 除外），所以任何真实变更都会让缓存失效；
+        命中时这些查询是零成本的，注入路径只剩「依赖消息」的那几条。
+        """
+        revision = await self.store.call("revision")
+        cached = self._memo.get(key)
+        if cached is not None and cached[0] == revision:
+            return cached[1]
+        value = await factory()
+        if len(self._memo) >= 128:
+            self._memo.clear()  # 简单有界：满了就整体丢弃，避免无界增长
+        self._memo[key] = (revision, value)
+        return value
+
+    async def prewarm(self, sid, users, scope):
+        """预热：把「不随消息变化」的部分提前算进缓存。
+
+        消息一到就调用（此时用户还在打字、消息还要走网络），
+        到真正注入时这些查询已经命中缓存。
+        """
+        try:
+            await asyncio.gather(
+                self.memo(("context", sid, tuple(users or ()), scope),
+                          lambda: self.store.call("context", sid, users, scope=scope)),
+                self.memo(
+                    ("spaced_names",), lambda: self.store.call("spaced_names")
+                ),
+            )
+        except Exception:
+            logger.debug("[记忆·Z] 预热失败（不影响正常注入）", exc_info=True)
 
     async def queue_recall_merges(self, sid, facts):
         """召回时顺手发现重复事实：本地判定 → 只标记 → 后台合并（不阻塞回复）。
@@ -951,6 +1008,24 @@ class AlifeMemoryPlugin(BasePlugin):
             return True
         return not self.merge_plugin_active()
 
+    @on.im_message(priority=Priority.LOW)
+    async def on_message_prewarm(self, event):
+        """消息一到就预热记忆缓存：把「不随消息变化」的查询挪到打字/网络期间完成。"""
+        cfg = self.runtime_settings()
+        if not cfg.enabled or not cfg.auto_inject:
+            return
+        sid = getattr(event, "sid", "")
+        now = time.time()
+        if now - self._prewarm_seen.get(sid, 0) < 2:
+            return  # 同一会话 2 秒内只预热一次，避免连发消息时重复计算
+        self._prewarm_seen[sid] = now
+        if len(self._prewarm_seen) > 256:
+            for key in sorted(self._prewarm_seen, key=self._prewarm_seen.get)[:128]:
+                self._prewarm_seen.pop(key, None)
+        asyncio.create_task(
+            self.prewarm(sid, user_ids(event), cfg.recall_scope)
+        )
+
     @on.llm_request(priority=Priority.LOW)
     async def on_request(self, event, req: LLMRequest, *_):
         cfg = self.runtime_settings()
@@ -1006,16 +1081,38 @@ class AlifeMemoryPlugin(BasePlugin):
         users = user_ids(event)
         query = " ".join(text_of(m) for m in event.messages)
         recall_key = (sid, tuple(users), cfg.recall_scope)
-        rows = await self.store.call("context", sid, users, scope=cfg.recall_scope)
+        # 这三个查询互不依赖：并行发出，把「串行等待」压成「取最长」。
+        # store.call 走线程池，SQLite 连接互不影响。
+        started = time.monotonic()
+        rows, keep_names, subjects = await asyncio.gather(
+            self.memo(
+                ("context", sid, tuple(users), cfg.recall_scope),
+                lambda: self.store.call(
+                    "context", sid, users, scope=cfg.recall_scope
+                ),
+            ),
+            self.memo(
+                ("spaced_names",), lambda: self.store.call("spaced_names")
+            ),
+            self.store.call(
+                "entity_ids_for_query", query, sid, users, cfg.recall_scope
+            ),
+        )
+        over_budget = bool(cfg.inject_budget_ms) and (
+            (time.monotonic() - started) * 1000 > cfg.inject_budget_ms
+        )
+        if over_budget:
+            logger.debug(
+                "[记忆·Z] 常驻部分耗时 %.0fms 超过预算 %dms，本轮跳过可选通道"
+                "（存档检索 / 内容匹配）",
+                (time.monotonic() - started) * 1000,
+                cfg.inject_budget_ms,
+            )
         prefer = (
             {"prefer_sid": sid, "prefer_users": tuple(users)}
             if cfg.session_affinity
             else {}
         )
-        subjects = await self.store.call(
-            "entity_ids_for_query", query, sid, users, cfg.recall_scope
-        )
-        keep_names = await self.store.call("spaced_names")  # 名字带空格的昵称，渲染时保护
         keyword_hit = any(word in query for word in cfg.recall_keywords)
         if cfg.inject_mode == "full":
             facts = await self.store.call(
@@ -1031,10 +1128,17 @@ class AlifeMemoryPlugin(BasePlugin):
             )
         else:
             facts = await self.situational_facts(
-                sid, query, users, subjects, keyword_hit, cfg, prefer
+                sid,
+                query,
+                users,
+                subjects,
+                keyword_hit,
+                cfg,
+                prefer,
+                allow_content_match=not over_budget,
             )
         related, related_rows, related_shorts = [], [], {}
-        if cfg.recall_scope != "session" and query.strip():
+        if cfg.recall_scope != "session" and query.strip() and not over_budget:
             reach = cfg.top_k * (2 if keyword_hit else 1)
             matches = await self.store.call(
                 "search",
@@ -1133,11 +1237,15 @@ class AlifeMemoryPlugin(BasePlugin):
                 -(r.get("start") or 0),
             )
         )
-        # 永久记忆的成本压力在注入处就能看见：超条数或超字符预算就排队整理
+        # 永久记忆的成本压力在注入处就能看见：超条数或超字符预算就排队整理。
+        # 注意：recall_scope=global 时这里看到的是**所有会话**的永久记忆，
+        # 所以整理要按「归属会话」分别排队——否则膨胀在别的会话时，
+        # 只清当前会话永远清不掉，每轮都会重新排队。
         if cfg.permanent_tidy_enabled:
             perm_chars = sum(len(row.get("summary") or "") for row in perms)
             if len(perms) > cfg.permanent_cap or perm_chars > cfg.permanent_budget_chars:
-                await self.engine.enqueue("tidy", sid, automatic=True)
+                for owner in sorted({row["sid"] for row in perms if row["sid"]}):
+                    await self.engine.enqueue("tidy", owner, automatic=True)
         fresh = self._mark_access([row["id"] for row in perms])
         if fresh:
             await self.store.call("touch_accessed", fresh)
@@ -1863,16 +1971,39 @@ class AlifeMemoryPlugin(BasePlugin):
         kind = str(kind or "record").strip()
 
         if action == "tidy":
+            cfg = self.runtime_settings()
             reset = [await self.store.call("real_id", value) for value in targets]
+            owners = set()
             if reset:
-                await self.store.call("touch_tidy_at", reset, 0)  # 让它们立刻可被整理
-            await self.engine.enqueue("tidy", event.sid, automatic=True)
+                # 指定了条目：按它们各自的归属会话排队（让这几条立刻可被整理）
+                await self.store.call("touch_tidy_at", reset, 0)
+                for record_id in reset:
+                    row = await self.store.call("get", record_id)
+                    if row and row["permanent"]:
+                        owners.add(row["sid"])
+            # 没指定条目时，范围跟随 access scope：
+            # global（默认）→ 所有有意久记忆的会话；session → 仅当前会话
+            if not owners:
+                if cfg.recall_scope == "global":
+                    owners = set(await self.queue_tidy_all(event.sid))
+                else:
+                    owners.add(event.sid)
+                    for owner in sorted(owners):
+                        await self.engine.enqueue("tidy", owner, automatic=True)
+            else:
+                for owner in sorted(owners):
+                    await self.engine.enqueue("tidy", owner, automatic=True)
             return self.recall_result(
                 event,
                 {
                     "ok": True,
                     "queued": True,
-                    "scope": "指定的 %d 条" % len(reset) if reset else "按保留度自动挑候选",
+                    "sessions": len(owners),
+                    "scope": (
+                        "指定的 %d 条（%d 个会话）" % (len(reset), len(owners))
+                        if reset
+                        else "按保留度自动挑候选 · %d 个会话" % len(owners)
+                    ),
                 },
             )
 
@@ -2023,6 +2154,7 @@ class AlifeMemoryPlugin(BasePlugin):
         names = await self.store.call("entities", ids=status["sessions"], limit=1000)
         status["session_names"] = {n["id"]: n["name"] for n in names if n["name"]}
         status["version"] = await asyncio.to_thread(self._plugin_version)
+        status["search_index"] = await self.store.call("search_index_state")
         status["assets"] = await asyncio.to_thread(
             lambda: hashlib.sha256(
                 b"".join(
@@ -2349,6 +2481,16 @@ class AlifeMemoryPlugin(BasePlugin):
         value = await self.body(request, Job)
         if value.kind == "reindex" and not self.settings.semantic_enabled:
             raise HTTPException(409, "optional vector search is disabled")
+        if value.kind == "tidy":
+            # 永久记忆的成本是全局的（默认 recall_scope=global 时，
+            # 任何会话都在付所有会话的永久记忆），所以工作台的这个按钮
+            # 也按「所有有意久记忆的会话」排队，与 Bot 的 tidy 一致。
+            owners = await self.queue_tidy_all(value.sid)
+            return {
+                "id": "",
+                "state": "queued",
+                "sessions": len(owners),
+            }
         return {
             "id": await self.engine.enqueue(value.kind, value.sid),
             "state": "queued",

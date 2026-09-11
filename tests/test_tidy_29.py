@@ -198,3 +198,78 @@ async def test_manual_tidy_runs_even_below_capacity(tmp_path):
         assert called[0]["items"], "候选不该为空"
     finally:
         await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_auto_tidy_queues_per_owner_session(tmp_path):
+    """注入看的是全局永久记忆，整理要按归属会话分别排队（否则永远清不掉）。"""
+    if not os.environ.get("KIRA_CORE"):
+        pytest.skip("set KIRA_CORE for host integration")
+
+    import sys as _sys
+    import types as _types
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_helpers_plugin import build_plugin
+
+    from core.provider import LLMRequest
+
+    plugin, store = await build_plugin(tmp_path)
+    try:
+        plugin.settings.permanent_cap = 2  # 方便用小样本触发
+        for sid in ("qq:dm:A", "qq:gm:B"):
+            store.memorize(sid, f"{sid} 的永久记忆", ["u:1"], 1.0, 1.0)
+        store.memorize("qq:dm:A", "A 的第二条永久记忆", ["u:1"], 2.0, 2.0)
+        store.memorize("qq:dm:A", "A 的第三条永久记忆", ["u:1"], 3.0, 3.0)
+
+        event = _types.SimpleNamespace(
+            sid="qq:dm:A",
+            event_id="e",
+            messages=[_types.SimpleNamespace(message_str="你好")],
+            self_id="bot",
+            session=_types.SimpleNamespace(adapter_name="qq", session_title="私聊"),
+        )
+        req = LLMRequest(messages=[], system_prompt=[], user_prompt=[])
+        await plugin.on_request(event, req)
+
+        with store.connect() as db:
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT sid, kind FROM jobs WHERE kind='tidy'"
+                )
+            ]
+        queued = sorted({row["sid"] for row in rows if row["kind"] == "tidy"})
+        assert queued == ["qq:dm:A", "qq:gm:B"], f"应按归属会话排队，实际 {queued}"
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_manual_tidy_all_sessions(tmp_path):
+    """手动整理默认覆盖所有有意久记忆的会话（成本是全局的）。"""
+    if not os.environ.get("KIRA_CORE"):
+        pytest.skip("set KIRA_CORE for host integration")
+
+    import sys as _sys
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_helpers_plugin import build_plugin
+
+    plugin, store = await build_plugin(tmp_path)
+    try:
+        for sid in ("qq:dm:A", "qq:gm:B"):
+            store.memorize(sid, f"{sid} 第一条", ["u:1"], 1.0, 1.0)
+            store.memorize(sid, f"{sid} 第二条", ["u:1"], 2.0, 2.0)
+        owners = await plugin.queue_tidy_all("qq:dm:A")
+        assert owners == ["qq:dm:A", "qq:gm:B"], owners
+        with store.connect() as db:
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT DISTINCT sid FROM jobs WHERE kind='tidy'"
+                )
+            ]
+        assert sorted(row["sid"] for row in rows) == ["qq:dm:A", "qq:gm:B"]
+    finally:
+        await plugin.terminate()

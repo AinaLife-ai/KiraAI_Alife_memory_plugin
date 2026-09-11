@@ -428,6 +428,15 @@ async function poll() {
       : "已连接 · 已暂停";
     // 带上版本与资源指纹：一眼能看出前端是不是旧版
     // （旧版页面缺新功能时，先看这里对不对得上插件版本）
+    if (next.search_index) {
+      const labels = {
+        ready: "索引 已启用",
+        building: "索引 回填中",
+        unavailable: "索引 不可用（全表检索）",
+      };
+      const badge = $("#searchIndex");
+      if (badge) badge.textContent = labels[next.search_index] || "索引 —";
+    }
     $("#connection").textContent = next.version
       ? conn + " · v" + next.version
       : conn;

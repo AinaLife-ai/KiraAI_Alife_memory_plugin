@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sqlite3
+import sys
 from contextlib import closing
 import pytest
 from test_memory import c, s, e
@@ -346,3 +347,133 @@ def test_rerun_migration_keeps_edits_and_deletions(tmp_path):
     assert after[record_a["id"]]["summary"] == "手改A"
     assert after[record_b["id"]]["deleted"] == 1
     assert len(store.facts(limit=50, global_scope=True)) == facts_before
+
+
+def test_sql_lexical_score_matches_python_relevance(tmp_path):
+    """SQL 打分必须与 relevance() 口径完全一致（质量不降的硬保证）。"""
+    import importlib
+    import types
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    package = types.ModuleType("alife_score_parity")
+    package.__path__ = [str(root)]
+    sys.modules.setdefault("alife_score_parity", package)
+    storage = importlib.import_module("alife_score_parity.storage")
+    retrieval = importlib.import_module("alife_score_parity.retrieval")
+
+    queries = ["你师傅是谁", "主人喜欢喝乌龙茶", "香菇 落尘", "iPhone 15"]
+    texts = [
+        "我师傅是星月",
+        "主人喜欢喝乌龙茶加冰",
+        "香菇和落尘是两个人",
+        "上次说 iPhone 15 的事",
+        "完全无关的一句话",
+    ]
+    for query in queries:
+        tokens = retrieval.query_tokens(query)
+        # 真实路径用的是 lower(summary)；测试里同样加 lower 才可比
+        expr = storage._lexical_sql("lower(?)", tokens)
+        with storage.Store(tmp_path / "db").connect() as db:
+            for text in texts:
+                sql_score = db.execute(
+                    "SELECT " + expr, [text] * len(tokens)
+                ).fetchone()[0]
+                assert sql_score == retrieval.relevance(query, text), (
+                    query,
+                    text,
+                    sql_score,
+                    retrieval.relevance(query, text),
+                )
+
+
+@pytest.mark.asyncio
+async def test_memo_cache_hits_until_write(tmp_path):
+    """进程内缓存：写入前命中、写入后失效（避免拿到过期记忆）。"""
+    import os
+
+    if not os.environ.get("KIRA_CORE"):
+        pytest.skip("set KIRA_CORE for host integration")
+    import sys as _sys
+    import types
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent))
+    from test_helpers_plugin import build_plugin
+
+    plugin, store = await build_plugin(tmp_path)
+    try:
+        calls = []
+        original = store.call
+
+        async def counting(method, *args, **kwargs):
+            if method == "spaced_names":
+                calls.append(1)
+            return await original(method, *args, **kwargs)
+
+        store.call = counting
+        await plugin.memo(("spaced_names",), lambda: store.call("spaced_names"))
+        await plugin.memo(("spaced_names",), lambda: store.call("spaced_names"))
+        assert len(calls) == 1, "同一 revision 内应命中缓存"
+
+        store.capture("qq:dm:1", "turn", [
+            {"role": "user", "content": "写一条", "users": ["u"], "time": 1.0}
+        ])
+        await plugin.memo(("spaced_names",), lambda: store.call("spaced_names"))
+        assert len(calls) == 2, "写入后应失效重算"
+    finally:
+        store.call = original
+        await plugin.terminate()
+
+
+def test_fts_path_matches_full_scan(tmp_path):
+    """检索索引只是加速：两条路径结果必须完全一致（含未进索引的行）。"""
+    import importlib
+    import types
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    package = types.ModuleType("alife_fts_parity")
+    package.__path__ = [str(root)]
+    sys.modules.setdefault("alife_fts_parity", package)
+    storage = importlib.import_module("alife_fts_parity.storage")
+
+    store = storage.Store(tmp_path / "db")
+    store.initialize()
+    texts = [
+        "主人喜欢喝乌龙茶，每天都喝一壶",
+        "星月最喜欢吃草莓蛋糕",
+        "上次说 iPhone 15 的事",
+        "香菇和落尘是两个人",
+        "翅 膀被人处刑了",
+    ]
+    for i, text in enumerate(texts):
+        store.capture("qq:gm:A", f"ev{i}", [
+            {"role": "user", "content": text, "users": ["u:1"], "time": float(i)}
+        ])
+    # 再塞一条「绕过本模块写入」的行（模拟外部/旧版工具写库）：它不会进索引
+    with store.connect() as db:
+        db.execute(
+            "INSERT INTO records(id,sid,role,level,start,end,summary,content,users,"
+            "position,created) VALUES ('bypass','qq:gm:A','user',0,9.0,9.0,"
+            "'主人喜欢喝乌龙茶吗','x','[]',0,9.0)"
+        )
+
+    if store.search_index_state() == "unavailable":
+        pytest.skip("本机 SQLite 无 FTS5")
+
+    for query in ("乌龙茶", "草莓蛋糕", "iphone", "翅膀", "师傅", "两个人"):
+        store._fts_state = "ready"
+        indexed = store.search("qq:gm:A", lexical=query, scope="global",
+                               users=["u:1"], limit=10, exclude_sid="")
+        store._fts_state = "building"
+        scanned = store.search("qq:gm:A", lexical=query, scope="global",
+                               users=["u:1"], limit=10, exclude_sid="")
+        assert [i["id"] for i in indexed["items"]] == [
+            i["id"] for i in scanned["items"]
+        ], query
+    # 未进索引的那条也必须能被检索到
+    store._fts_state = "ready"
+    hits = store.search("qq:gm:A", lexical="乌龙茶", scope="global",
+                        users=["u:1"], limit=10, exclude_sid="")
+    assert any(i["id"] == "bypass" for i in hits["items"]), "未索引的行被漏掉了"

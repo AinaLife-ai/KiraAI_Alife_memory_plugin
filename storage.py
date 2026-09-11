@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import random
 import sqlite3
@@ -16,7 +17,9 @@ from contextlib import contextmanager, closing
 from pathlib import Path
 from .contracts import dump, relation_issue
 from .output_validation import validate_audit
-from .retrieval import identity_info
+from .retrieval import bigram_body, identity_info
+
+logger = logging.getLogger(__name__)
 
 
 class Conflict(ValueError):
@@ -27,8 +30,39 @@ def uid():
     return uuid.uuid4().hex
 
 
+def _lexical_sql(column, tokens):
+    """把「词元命中 × 词长」的求和写成 SQL 表达式（纯 C 层，无 Python 回调）。
+
+    与 relevance() 口径完全一致：score = Σ len(token)（命中即计入）。
+    tokens 来自 query_tokens（只含字母数字与汉字），这里转义单引号后安全内联。
+    """
+    parts = []
+    for token in tokens:
+        literal = "'" + str(token).replace("'", "''") + "'"
+        parts.append("(instr(%s,%s)>0)*%d" % (column, literal, len(str(token))))
+    return " + ".join(parts) if parts else "0"
+
+
+def _lexical_scorer(query):
+    """返回一个「词元只算一次」的打分函数，供 SQLite 逐行调用。
+
+    relevance() 每次调用都会重新切查询词元——在全表打分时等于每行重切一遍，
+    是 1 秒级的开销来源。这里把词元提到闭包外，逐行只做一次子串计数。
+    """
+    from .retrieval import query_tokens, squeeze
+
+    tokens = query_tokens(query)
+
+    def score(text):
+        lowered = squeeze(text).casefold()
+        return sum(len(token) * (token in lowered) for token in tokens)
+
+    return score
+
+
 class Store:
     def __init__(self, path: Path):
+        self._fts_state = "unknown"  # unknown/ready/building/unavailable
         self.path = path
 
     async def call(self, method, *args, **kwargs):
@@ -54,6 +88,10 @@ class Store:
         db = sqlite3.connect(self.path, timeout=20)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
+        # FTS 触发器要用到它（连接级注册，成本可忽略）
+        from .retrieval import bigram_body
+
+        db.create_function("bigram_body", 1, bigram_body)
         try:
             with db:
                 yield db
@@ -99,6 +137,10 @@ class Store:
             CREATE TABLE IF NOT EXISTS short_ids (
               short TEXT PRIMARY KEY, real TEXT NOT NULL UNIQUE, created REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS short_id_real ON short_ids(real);
+            -- 全局词面扫描与永久记忆整理都按这两个条件筛
+            CREATE INDEX IF NOT EXISTS fact_scan ON facts(deleted,merge_pending);
+            CREATE INDEX IF NOT EXISTS record_permanent ON records(permanent)
+              WHERE permanent=1;
             CREATE TABLE IF NOT EXISTS versions (
               id INTEGER PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL,
               snapshot TEXT NOT NULL, reason TEXT NOT NULL, created REAL NOT NULL);
@@ -170,6 +212,10 @@ class Store:
                 db.execute(
                     "ALTER TABLE records ADD COLUMN tidy_at REAL NOT NULL DEFAULT 0"
                 )
+            if "search_body" not in columns:
+                db.execute(
+                    "ALTER TABLE records ADD COLUMN search_body TEXT NOT NULL DEFAULT ''"
+                )
             job_item_columns = {r[1] for r in db.execute("PRAGMA table_info(job_items)")}
             if "before" not in job_item_columns:
                 db.execute(
@@ -205,6 +251,121 @@ class Store:
             db.execute(
                 "INSERT OR IGNORE INTO entities(id,kind,name,updated) SELECT DISTINCT subject,'user','',0 FROM facts WHERE subject LIKE 'legacy:%'"
             )
+
+        # 检索索引：可用就建（派生数据，失败不影响任何功能）
+        try:
+            self.setup_search_index()
+        except sqlite3.Error:
+            self._fts_state = "unavailable"
+            logger.debug("[记忆·Z] 本机 SQLite 不支持 FTS5，检索走全表路径")
+
+    def setup_search_index(self):
+        """建立 FTS5 检索索引（可用才建；不可用就永久走全表路径）。
+
+        索引是**派生数据**：删了、坏了都能从 records 原表重建，所以
+        存量用户不需要做任何事，这里失败也不影响任何功能。
+        """
+        with self.connect() as db:
+            # 外部内容表：索引体就是 records.search_body 这一列。
+            # contentless 表在"删除/改写"时要求提供与索引时完全一致的原文，
+            # 恢复旧快照等场景会因此报错；外部内容表没有这个问题，还自带 rebuild。
+            db.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5("
+                "body, content='records', content_rowid='rowid')"
+            )
+            # 索引体存在记录的 search_body 列里（写入时算好），触发器只做搬运——
+            # 触发器里调 Python 函数会让「用原生连接写库」直接报 SQL logic error。
+            for stale in ("records_fts_ai", "records_fts_au", "records_fts_ad"):
+                db.execute("DROP TRIGGER IF EXISTS %s" % stale)
+            db.execute(
+                """CREATE TRIGGER records_fts_ai AFTER INSERT ON records
+                   BEGIN INSERT INTO records_fts(rowid,body)
+                   VALUES (new.rowid, new.search_body); END"""
+            )
+            db.execute(
+                """CREATE TRIGGER records_fts_au AFTER UPDATE OF search_body ON records
+                   BEGIN INSERT INTO records_fts(records_fts,rowid,body)
+                   VALUES('delete', old.rowid, old.search_body);
+                   INSERT INTO records_fts(rowid,body)
+                   VALUES (new.rowid, new.search_body); END"""
+            )
+            db.execute(
+                """CREATE TRIGGER records_fts_ad AFTER DELETE ON records
+                   BEGIN INSERT INTO records_fts(records_fts,rowid,body)
+                   VALUES('delete', old.rowid, old.search_body); END"""
+            )
+        with self.connect() as db:
+            missing = db.execute(
+                "SELECT 1 FROM records WHERE search_body='' LIMIT 1"
+            ).fetchone()
+        self._fts_state = "building" if missing else "ready"
+        return True
+
+    def index_backfill(self, batch=500):
+        """补齐 search_body 列与索引；返回是否已全部覆盖（供后台分批调用）。"""
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT rowid, summary FROM records WHERE search_body='' LIMIT ?",
+                (batch,),
+            ).fetchall()
+            if not rows:
+                self._fts_state = "ready"
+                return True
+            db.executemany(
+                "UPDATE records SET search_body=? WHERE rowid=?",
+                [(bigram_body(row["summary"]), row["rowid"]) for row in rows],
+            )
+        return False
+
+    def rebuild_search_index(self):
+        """整表重建（异常或版本升级时用）。"""
+        with self.connect() as db:
+            for row in db.execute("SELECT rowid, summary FROM records").fetchall():
+                db.execute(
+                    "UPDATE records SET search_body=? WHERE rowid=?",
+                    (bigram_body(row["summary"]), row["rowid"]),
+                )
+            db.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')")
+        self._fts_state = "ready"
+        return True
+
+    def search_index_state(self):
+        """索引状态：unavailable / ready / building（供界面显示，不查库）。"""
+        return self._fts_state
+
+    def _fts_hits(self, tokens, cap=1200):
+        """用 FTS 索引取候选 rowid；索引不可用/命中过宽时返回 None（走全表）。
+
+        返回 None 只表示"不优化"，不表示"没有命中"——调用方必须退回全表路径，
+        这样两条路径的结果始终一致。
+        """
+        if not tokens or self._fts_state != "ready":
+            return None
+        from .retrieval import fts_match_query
+
+        match = fts_match_query(tokens)
+        if not match:
+            return None
+        try:
+            with self.connect() as db:
+                rows = db.execute(
+                    "SELECT rowid FROM records_fts WHERE records_fts MATCH ? LIMIT ?",
+                    (match, cap + 1),
+                ).fetchall()
+        except sqlite3.Error:
+            self._fts_state = "unavailable"
+            return None
+        if len(rows) > cap:
+            return None
+        return [row["rowid"] for row in rows]
+
+    def revision(self):
+        """当前库版本号（写入即 +1，供进程内缓存判失效）。"""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='revision'"
+            ).fetchone()
+        return int(row[0]) if row else 0
 
     @staticmethod
     def bump(db):
@@ -1060,8 +1221,9 @@ class Store:
                     (row["id"], dump(dict(row)), "工具记录摘要压缩", time.time()),
                 )
                 db.execute(
-                    "UPDATE records SET summary=?,revision=revision+1 WHERE id=?",
-                    (new_summary, row["id"]),
+                    "UPDATE records SET summary=?,search_body=?,"
+                    "revision=revision+1 WHERE id=?",
+                    (new_summary, bigram_body(new_summary), row["id"]),
                 )
                 report["rewritten"] += 1
                 report["freed_chars"] += max(0, len(summary) - len(new_summary))
@@ -1367,15 +1529,34 @@ class Store:
                     return self.row(row)
         return None
 
-    def permanent_records(self, sid):
-        """Active permanent memories of one session, newest first."""
+    def permanent_records(self, sid="", all_sessions=False):
+        """Active permanent memories, newest first.
+
+        ``all_sessions`` 用于 recall_scope=global：注入本来就是全局的
+        （任何会话都在付所有会话的永久记忆），去重与整理也应看到同一个池子。
+        """
+        clause = "permanent=1 AND deleted=0 AND active=1"
+        args = ()
+        if not all_sessions:
+            clause += " AND sid=?"
+            args = (sid,)
         with self.connect() as db:
             return [
                 self.row(row)
                 for row in db.execute(
-                    "SELECT * FROM records WHERE sid=? AND permanent=1 AND deleted=0 "
-                    "AND active=1 ORDER BY end DESC,id",
-                    (sid,),
+                    "SELECT * FROM records WHERE " + clause + " ORDER BY end DESC,id",
+                    args,
+                )
+            ]
+
+    def sessions_with_any_permanent(self):
+        """有意久记忆的会话（哪怕只有一条）——跨会话去重需要它们都能被扫到。"""
+        with self.connect() as db:
+            return [
+                row[0]
+                for row in db.execute(
+                    "SELECT DISTINCT sid FROM records WHERE permanent=1 AND deleted=0 "
+                    "AND active=1"
                 )
             ]
 
@@ -1491,8 +1672,9 @@ class Store:
                 )
             # Summary is what the model sees; content keeps the archive text.
             db.execute(
-                "UPDATE records SET summary=?,revision=revision+1 WHERE id=?",
-                (content, target_id),
+                "UPDATE records SET summary=?,search_body=?,"
+                "revision=revision+1 WHERE id=?",
+                (content, bigram_body(content), target_id),
             )
             folded_at = time.time()
             for record_id in ids:
@@ -1591,6 +1773,10 @@ class Store:
                 "INSERT INTO versions(kind,target,snapshot,reason,created) VALUES (?,?,?,?,?)",
                 (kind, target, dump(dict(current)), "恢复前存档", time.time()),
             )
+            if kind == "record" and "summary" in updates:
+                # 恢复的是旧快照，索引体必须按恢复后的摘要重算，
+                # 否则 FTS 外部内容表会因"与索引时不一致"报错
+                updates["search_body"] = bigram_body(updates["summary"])
             values = [dump(v) if isinstance(v, (list, dict)) else v for v in updates.values()]
             db.execute(
                 f"UPDATE {table} SET {','.join(k + '=?' for k in updates)},"
@@ -1785,14 +1971,24 @@ class Store:
 
             db.create_function("squeeze", 1, squeeze)
             if lexical and not vector:
-                from .retrieval import relevance
+                from .retrieval import query_tokens, relevance
 
-                db.create_function(
-                    "lexical_score",
-                    1,
-                    lambda text: relevance(lexical, text),
-                )
-                clauses.append("lexical_score(summary)>0")
+                # 打分整段下推到 SQL：与逐行 Python 打分口径完全一致
+                # （score = Σ 命中词元的长度），但全程在 C 层跑——
+                # 此前 relevance() 每行都要重切一次查询词元，是秒级开销的来源。
+                # 词元不再截断：原来 [:24] 会让长消息静默少召回。
+                tokens = query_tokens(lexical)
+                lexical_sql = _lexical_sql("lower(summary)", tokens)
+                clauses.append("(%s)>0" % lexical_sql)
+                hits = self._fts_hits(tokens)
+                if hits is not None:
+                    # 先用 FTS 索引取候选（命中太宽返回 None → 退回全表）。
+                    # 关键：search_body 为空的行 = 还没进索引的行，必须一并参与，
+                    # 否则任何绕过本模块写入的记录都会被静默漏掉 → 召回减少。
+                    clauses.append(
+                        "(search_body='' OR rowid IN (SELECT value FROM json_each(?)))"
+                    )
+                    args.append(dump(hits))
             # 归档也参与召回时，同分让常驻的排在前面：
             # 旧原文和新摘要词面打平时，先给模型看「还在上下文里」的那条。
             active_tier = "" if active else "CASE WHEN active=1 THEN 0 ELSE 1 END,"
@@ -1842,7 +2038,7 @@ class Store:
                     "SELECT * FROM records WHERE "
                     + where
                     + (
-                        f" ORDER BY {tier_sql}lexical_score(summary) DESC,{active_tier}end,id LIMIT ? OFFSET ?"
+                        f" ORDER BY {tier_sql}{lexical_sql} DESC,{active_tier}end,id LIMIT ? OFFSET ?"
                         if lexical
                         else f" ORDER BY {tier_sql}end,id LIMIT ? OFFSET ?"
                     ),
@@ -1863,9 +2059,7 @@ class Store:
 
         from .retrieval import relevance
 
-        db.create_function(
-            "lexical_score", 1, lambda text: relevance(lexical, text)
-        )
+        db.create_function("lexical_score", 1, _lexical_scorer(lexical))
         norm = math.sqrt(sum(x * x for x in vector))
 
         def cosine(raw):
@@ -1985,26 +2179,22 @@ class Store:
         tier_sql = (", ".join(tier_parts) + ", ") if tier_parts else ""
         with self.connect() as db:
             if lexical:
-                from .retrieval import relevance
+                from .retrieval import query_tokens, relevance
 
-                db.create_function(
-                    "fact_score", 1, lambda text: relevance(lexical, text)
-                )
+                # 同样下推到 SQL（含 min_score 门槛），全程 C 层
+                tokens = query_tokens(lexical)
+                fact_sql = _lexical_sql("lower(content)", tokens)
                 # min_score 是「内容匹配」门槛：中文按 2 字切分，任一双字片段命中 = 2 分。
                 # 默认只要求 >0；调用方（被动召回）用更高门槛挡掉「今天/喜欢」这类常见词。
                 threshold = max(1, int(min_score or 0))
-                if threshold > 1:
-                    where.append("fact_score(content)>=?")
-                    args.append(threshold)
-                else:
-                    where.append("fact_score(content)>0")
+                where.append("(%s)>=%d" % (fact_sql, threshold))
             return [
                 self.row(r)
                 for r in db.execute(
                     "SELECT * FROM facts WHERE "
                     + " AND ".join(where)
                     + (
-                        f" ORDER BY {tier_sql}fact_score(content) DESC,"
+                        f" ORDER BY {tier_sql}{fact_sql} DESC,"
                         f"{'importance DESC,created DESC,' if importance_first else 'audited,'}id LIMIT ? OFFSET ?"
                         if lexical
                         else f" ORDER BY {tier_sql}"
