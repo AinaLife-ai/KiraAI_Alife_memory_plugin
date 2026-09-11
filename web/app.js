@@ -421,14 +421,22 @@ $("#closeJob").onclick = () => $("#jobDialog").close();
 async function poll() {
   try {
     const next = await api("/status");
-    $("#connection").textContent = next.enabled
+    const conn = next.enabled
       ? autoRefresh
         ? "已连接 · 实时同步"
         : "已连接 · 手动同步"
       : "已连接 · 已暂停";
+    // 带上版本与资源指纹：一眼能看出前端是不是旧版
+    // （旧版页面缺新功能时，先看这里对不对得上插件版本）
+    $("#connection").textContent = next.version
+      ? conn + " · v" + next.version
+      : conn;
     if (asset && asset !== next.assets) {
+      // 插件文件变了：带版本参数跳转，绕开 WebView 的静态缓存
+      // （普通 reload() 会把缓存的 index.html/app.js 再拿一遍，于是"看不到新按钮"）
       saveDraft();
-      location.reload();
+      const url = location.pathname + "?v=" + encodeURIComponent(next.assets);
+      location.replace(url);
       return;
     }
     asset = next.assets;

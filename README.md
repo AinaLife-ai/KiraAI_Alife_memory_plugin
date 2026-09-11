@@ -307,6 +307,18 @@ python tools/web_audit.py                 # 前端静态审计：属性读写配
 <details>
 <summary><b>📝 更新日志（点击展开）</b></summary>
 
+### v2.9.2 (2026-09-11) — 前端更新后能真正生效（绕开 WebView 缓存）🔁
+
+> 起因：合并 v2.9.1 后有人看不到新加的「整理永久记忆」按钮——代码里明明有。
+
+- **带版本参数跳转**：资源指纹变化时不再用裸 `location.reload()`（安卓 WebView 会把缓存的
+  `index.html` / `app.js` 原样再来一遍），改成 `location.replace(path + "?v=" + assets)`，强制取新的。
+- **界面显示插件版本**：连接状态旁会显示 `已连接 · 实时同步 · v2.9.2`，
+  一眼能确认前端是不是旧版——以后遇到「看不到新功能」先看这里。
+- `/status` 增加 `version` 字段（读 manifest）。
+
+测试：默认 209 passed 3 skipped；KIRA_CORE 245 passed。
+
 ### v2.9.1 (2026-09-11) — 修「手动整理永久记忆什么都没做」🐛
 
 - **现象**：让 Bot「整理一下你的永久记忆」，她调用 `CorrectMemory(action=tidy)` 返回 `queued: true`，

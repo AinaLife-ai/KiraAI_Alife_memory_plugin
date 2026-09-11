@@ -1987,6 +1987,17 @@ class AlifeMemoryPlugin(BasePlugin):
         except (ValueError, TypeError):
             raise HTTPException(422, "invalid request schema") from None
 
+    @staticmethod
+    def _plugin_version():
+        """读 manifest 里的版本号；读不到就留空（界面会显示 -）。"""
+        try:
+            data = json.loads(
+                (Path(__file__).parent / "manifest.json").read_text(encoding="utf-8")
+            )
+            return str(data.get("version") or "")
+        except Exception:
+            return ""
+
     @register.api(method="GET", path="/status", auth=True)
     async def api_status(self):
         status = await self.store.call("status")
@@ -2011,6 +2022,7 @@ class AlifeMemoryPlugin(BasePlugin):
         status["sessions"] = await self.store.call("sessions")
         names = await self.store.call("entities", ids=status["sessions"], limit=1000)
         status["session_names"] = {n["id"]: n["name"] for n in names if n["name"]}
+        status["version"] = await asyncio.to_thread(self._plugin_version)
         status["assets"] = await asyncio.to_thread(
             lambda: hashlib.sha256(
                 b"".join(
