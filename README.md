@@ -307,6 +307,26 @@ python tools/web_audit.py                 # 前端静态审计：属性读写配
 <details>
 <summary><b>📝 更新日志（点击展开）</b></summary>
 
+### v2.16.2 (2026-09-12) — 修「extra_forbidden」频繁失败（紧凑 schema 漏了白名单）🔧
+
+**线上现象**：分层压缩频繁 `structured_output_rejected · <field>: extra_forbidden` ✗
+
+**根因**：v2.16.0 把 schema 换成手写紧凑声明时，**丢了一条关键约束** ✗ ——
+自动 schema 里带 `additionalProperties: false`（= 不许加字段 ✓），我的紧凑版没写这句 ✗
+而契约是 `extra="forbid"`（严格 ✓）→ 模型多塞一个键（notes/explanation 之类）就整条被拒 ✗
+
+**修**：三个紧凑块（compress / fact_merge / audit）统一补一行
+**「字段白名单：只允许上面出现过的键，多任何一个都会被拒。」** ✓
+
+**没做（特意回退）**：我一度改成"解析时静默剪掉多余的键" ✗ —— 但那与既有设计冲突：
+现在的设计是**明确拒绝 + 把出问题的键名提示给模型**（`test_output_diagnostics` 一直在保护这条 ✓
+"诊断不回声私密内容 + 提示允许的枚举/关系嵌套"）✓ 静默丢弃会让模型继续乱写 ✗ 也让诊断失效 ✗
+→ 只修**提示词层**（根因 ✓），解析层保持严格 ✓；加上原有的"连续被拒两次 → 退回完整自动 schema"兜底 ✓
+
+新增测试：三个紧凑块必须含「字段白名单」✓（防以后再漏）
+
+测试：默认 330 passed 14 skipped；KIRA_CORE 380 passed；web_audit 0。
+
 ### v2.16.1 (2026-09-12) — 修轮换槽位：档案与事实的状态串号（线上 KeyError）🚑
 
 **线上报错**：`on_request ... "t": short_time(r["end"] or r["start"])` → `KeyError: 'end'` ✗

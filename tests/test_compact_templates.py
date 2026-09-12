@@ -101,3 +101,13 @@ def test_memory_rules_keeps_the_essential_tokens():
     ):
         assert token in block, token
     assert len(block) < 900, "规则块每轮全价发送，涨回去就是白花钱 ✗"
+
+
+def test_compact_schema_forbids_extra_keys():
+    """线上踩过：紧凑声明漏了「不许加字段」→ 模型多塞键 → extra_forbidden 频繁失败 ✗
+
+    修法是在**提示词**里写明字段白名单（既有设计是"多字段 → 明确拒绝 + 提示"，
+    不静默丢弃 —— 那由 test_output_diagnostics 保护 ✓）。
+    """
+    for purpose, text in engine.COMPACT_SCHEMAS.items():
+        assert "字段白名单" in text, purpose
