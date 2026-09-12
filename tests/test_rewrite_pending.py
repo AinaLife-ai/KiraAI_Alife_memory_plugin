@@ -207,6 +207,42 @@ class RewriteCase(unittest.TestCase):
         assert self.store.unmerge_fact(target) is True
         assert self.target_row(stranger)["deleted"] == 1, "不是同一簇的绝不能被还原"
 
+    def test_candidates_are_found_even_without_the_flag(self):
+        """判据现算：即使标记位没被回填过（比如插件只热重载、初始化没跑到），也要挑得到。
+
+        用户实测「手动按钮识别不到」的真因就出在这里——挑候选只看标记位。
+        """
+        ids = self.seed()
+        self.concat_merge(ids)
+        with self.store.connect() as db:  # 模拟"标记从来没打过"
+            db.execute("UPDATE facts SET rewrite_pending=0")
+        rows = self.store.pending_rewrites(3, 3)
+        assert len(rows) == 1, "没标记但理由摆在那儿，就该被挑出来"
+
+    def test_unmerge_tolerates_revision_bump_from_audit(self):
+        """审计调 importance 也会 revision+1 —— 不能因此判定"被人改过"而拒绝重做。
+
+        所以校验改成用**内容**重建这一组（降级拼接 = 内容的连接），不再看计数器。
+        """
+        ids = self.seed()
+        target = self.concat_merge(ids)
+        with self.store.connect() as db:
+            db.execute(
+                "UPDATE facts SET importance=importance+1, revision=revision+1 WHERE id=?",
+                (target,),
+            )
+        assert self.store.unmerge_fact(target) is True
+
+    def test_refused_redo_also_counts_attempts(self):
+        """校验不通过时也要 +1：否则每轮审计都对同一条白试一遍。"""
+        ids = self.seed()
+        target = self.concat_merge(ids)
+        with self.store.connect() as db:  # 让"还原"必然失败：来源被彻底删掉
+            db.execute("DELETE FROM facts WHERE id=?", (ids[1],))
+        assert self.store.unmerge_fact(target) is False
+        assert self.store.bump_rewrite_attempts([target]) == 1
+        assert self.target_row(target)["rewrite_attempts"] == 1
+
     # ---- 2. 幂等 ------------------------------------------------------------
 
     def test_unmerge_is_idempotent(self):
