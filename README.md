@@ -307,6 +307,26 @@ python tools/web_audit.py                 # 前端静态审计：属性读写配
 <details>
 <summary><b>📝 更新日志（点击展开）</b></summary>
 
+### v2.16.1 (2026-09-12) — 修轮换槽位：档案与事实的状态串号（线上 KeyError）🚑
+
+**线上报错**：`on_request ... "t": short_time(r["end"] or r["start"])` → `KeyError: 'end'` ✗
+
+**根因（我的设计缺陷）**：v2.15.0 的轮换槽位把「档案」和「事实」**共用同一份状态** ✗
+—— 两边的批次混在一起，于是某一轮把**事实行**补进了档案列表 ✗
+档案渲染要读 `r["end"]` → 事实行没有这个字段 → **每个请求都抛异常** ✗（记忆注入整体失效）
+
+**修**：状态按**槽位**分开（`state["slots"]["archive"]` / `["fact"]` ✓）
+- `rotation_extras(..., kind)`、`rotation_needs_batch(sid, kind)` 都带 kind ✓
+- 反馈 `rotation_feedback` 遍历所有槽位 ✓（各自判定命中/留满）
+- **内存计数快照**（`shown`/`used`）仍**共用一份** ✓（那是排序依据，与槽位无关 ✓）
+- seen 窗口仍然共用 ✓（按你之前的决定 ✓）
+
+**新增回归测试** `test_archive_and_fact_slots_do_not_mix` ✓：
+两个池子各挑一批 → 档案槽位拿到的行必须有 `summary`、事实槽位必须有 `content` ✓
+（这个 bug 正是"没测两个槽位并存"漏掉的 ✗）
+
+测试：默认 329 passed 14 skipped；KIRA_CORE 379 passed；web_audit 0。
+
 ### v2.16.0 (2026-09-12) — 成本优化：模板瘦身（省 token、不丢信息、不降质量）💰
 
 按"钱、速度、质量都要"的目标做了一轮体检与瘦身。**先量账**：
