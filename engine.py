@@ -100,6 +100,48 @@ DEDUPE_CONSERVATIVE_INSTRUCTION = (
 )
 
 
+# 手写紧凑声明（v2.16.0 成本优化）
+# pydantic 自动生成的 schema 会带上 $defs / additionalProperties / maxLength 等**机器语法**，
+# 它们对模型没有行为价值（真正的人话约束早就在 COMMON_INSTRUCTION 和各用途指令里 ✓），
+# 却每次要占 1000~1500 字 ✗。这里只保留：结构、字段名、**必填**、枚举、
+# 行为性上限，以及我们线上真踩过的坑（写进"常见错误"）。
+# 兜底：紧凑声明连续被拒两次 → 自动退回完整自动 schema（最坏情况 = 旧成本）✓
+COMPACT_SCHEMAS = {
+    "compress": (
+        '返回 JSON（无 markdown、无额外字段）：\n'
+        '{"summary": str, "range": {"start": iso, "end": iso},\n'
+        ' "records": [{"id": str, "summary": str}],\n'
+        ' "facts": [{"category": "<枚举见上>", "subject": str, "content": str,\n'
+        '            "reason": str, "scenario": str, "tags": [str],\n'
+        '            "relations": [{"subject","predicate","object"}],\n'
+        '            "source_ids": [str], "importance": 1-10}]}\n'
+        '必填：summary；facts 里 category/subject/content/reason/scenario/tags/relations/source_ids。\n'
+        '上限：facts ≤12、content ≤60 字、reason ≤40 字、scenario ≤20 字、summary ≤300 字。\n'
+        '常见错误（会被拒）：把 predicate/object 平铺进事实（必须放 relations）；\n'
+        'source_ids 编造或漏抄；content 为空。'
+    ),
+    "fact_merge": (
+        '返回 JSON（无 markdown、无额外字段）：\n'
+        '{"groups": [{"target_id": str, "source_ids": [str], "content": str,\n'
+        '             "reason": str, "action": "merge"}]}\n'
+        '必填：groups；每组 target_id/source_ids/reason（action=merge 时 content 不能为空）。\n'
+        '上限：content 目标 ≤80 字（硬上限 150）、reason ≤15 字（硬上限 40）。\n'
+        '常见错误（会被拒）：action=merge 但 content 为空；source_ids 里没有要并掉的 id；\n'
+        '编造不存在的 id。'
+    ),
+    "audit": (
+        '返回 JSON（无 markdown、无额外字段）：\n'
+        '{"actions": [{"action": "keep|correct|merge|retract", "target_id": str,\n'
+        '              "source_ids": [str], "content": str, "reason": str, "importance": 1-10,\n'
+        '              "relations": [{"subject","predicate","object"}]}]}\n'
+        '必填：actions；每项 action/target_id/source_ids/content/reason。\n'
+        '上限：reason ≤40 字。\n'
+        '常见错误（会被拒）：目标 id 不在输入里；keep/correct/retract 却给了别的 id；\n'
+        '编造 target_id 或 source_ids。'
+    ),
+}
+
+
 def build_instruction(purpose, cfg):
     if purpose == "compress":
         return (
@@ -502,9 +544,15 @@ class Engine:
             else cfg.audit_model
         )
         instruction = COMMON_INSTRUCTION + build_instruction(purpose, cfg)
-        schema = strip_schema_titles(contract.model_json_schema())
+        # 先用手写紧凑声明（省 1000+ 字）；没有对应条目才退回自动 schema
+        schema = COMPACT_SCHEMAS.get(purpose) or strip_schema_titles(
+            contract.model_json_schema()
+        )
         retries = cfg.model_retries if retry_timeout else 0
         for attempt in range(retries + 1):
+            if attempt >= 2 and isinstance(schema, str):
+                # 兜底：紧凑声明连续被拒两次 → 用完整自动 schema 重试（最坏 = 旧成本）
+                schema = strip_schema_titles(contract.model_json_schema())
             try:
                 text = await asyncio.wait_for(
                     self.model_call(model, purpose, instruction, schema, payload),
