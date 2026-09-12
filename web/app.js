@@ -307,6 +307,7 @@ const JOB_ACTIONS = {
   archive: "记忆存档",
   compressed: "已并入存档",
   merged: "并入",
+  rewrite: "重做合并",
   keep: "保留",
   correct: "修正",
   merge: "合并",
@@ -357,9 +358,11 @@ async function openJob(id) {
           const shifted =
             item.action === "merged"
               ? [item.before, byTarget[item.note] || item.note]
-              : item.action === "correct" && item.before && item.before !== text
+              : item.action === "rewrite" && item.before
                 ? [item.before, text]
-                : null;
+                : item.action === "correct" && item.before && item.before !== text
+                  ? [item.before, text]
+                  : null;
           const arrow = shifted
             ? '<div class="arrow"><span class="from">' +
               esc(shifted[0]) +
@@ -386,7 +389,10 @@ async function openJob(id) {
           return (
             '<div class="task"><div><span class="tag">' +
             esc(JOB_ACTIONS[item.action] || item.action) +
-            (item.fact && item.fact.deleted && item.action !== "merged"
+            (item.fact &&
+            item.fact.deleted &&
+            item.action !== "merged" &&
+            item.action !== "rewrite"
               ? '<span class="tag off">已撤回</span>'
               : "") +
             "</span> " +

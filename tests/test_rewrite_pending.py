@@ -376,6 +376,29 @@ class RewriteEngineCase(RewriteCase):
         assert row["rewrite_pending"] == 0
         assert self.store.rewrite_backlog() == 0
 
+    def test_manual_redo_writes_job_details(self):
+        """手动「重整理事实」要在工作台明细里留下痕迹（否则按钮点了看不到任何细节）。
+
+        和「并入」同一套渲染：action=rewrite + before=重做前那条拼接内容，
+        前端会摆成「旧 → 新」。
+        """
+        ids = self.seed()
+        target = self.concat_merge(ids)
+        before = self.target_row(target)["content"]
+        engine = e.Engine(
+            self.store, lambda: c.Settings(), self.merged_reply("星月最爱草莓蛋糕"), None, None
+        )
+        assert run(engine.redo_pending_rewrites(10**6, "job-manual")) == 1
+        items = self.store.job_items("job-manual")
+        actions = [item["action"] for item in items]
+        assert "rewrite" in actions, items
+        item = next(i for i in items if i["action"] == "rewrite")
+        assert item["kind"] == "fact"
+        assert item["target"] == target
+        assert item["before"] == before, "明细里要能看到重做前的内容"
+        # 随后真正的合并也记在同一个任务里（明细显示为「并入」）
+        assert "merged" in actions, items
+
     def test_redo_skips_when_attempts_exhausted_but_manual_forces(self):
         ids = self.seed()
         target = self.concat_merge(ids)

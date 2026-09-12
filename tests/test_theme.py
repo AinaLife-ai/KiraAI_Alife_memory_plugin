@@ -67,3 +67,15 @@ def test_theme_survives_host_bridge_overwrite():
     assert "跟随宿主" in js, "没选过时应说明是跟随宿主"
     # 抢回来不能造成死循环：只在「当前值 != 用户选择」时才写
     assert "if (current !== saved) applyTheme(saved)" in js
+
+
+def test_rewrite_action_has_label_and_shifted_view():
+    """「重做合并」的明细行要能显示成「旧 → 新」——和「并入」同一套。
+
+    后端写 action=rewrite + before；前端必须有中文标签，并把它算进 shifted 分支，
+    否则明细里只会显示一行看不懂的英文 action。
+    """
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'rewrite: "重做合并"' in js, "明细动作要有中文标签"
+    assert 'rewrite: "重整理事实"' in js, "任务卡片的 kind 标签沿用原来的"
+    assert 'item.action === "rewrite" && item.before' in js, "要让重做合并走「旧 → 新」渲染"
