@@ -664,15 +664,23 @@ class AlifeMemoryPlugin(BasePlugin):
     async def backfill_time_provenance(self):
         """后台给存量数据补「事件时间」与「发言人」（分批、幂等、不阻塞启动）。"""
         try:
-            total = 0
+            facts = records = unresolved = 0
             for _ in range(500):  # 兜底上限，避免异常时空转
-                filled = await self.store.call("backfill_time_provenance")
-                total += filled
-                if not filled:
+                stats = await self.store.call("backfill_time_provenance")
+                facts += stats.get("facts", 0)
+                records += stats.get("records", 0)
+                unresolved += stats.get("unresolved", 0)
+                if not stats.get("scanned"):
                     break
                 await asyncio.sleep(0.02)
-            if total:
-                logger.info("[记忆·Z] 存量时间/发言人回填：%s 条记录", total)
+            # **无论如何都要报一行**：不然"没日志"和"跑完了没东西可补"分不清 ✗
+            logger.info(
+                "[记忆·Z] 存量时间/发言人回填：事实 %s 条、记录 %s 条"
+                "（另有 %s 条群聊老记录判定不出是谁说的，新记录不受影响）",
+                facts,
+                records,
+                unresolved,
+            )
         except Exception as exc:
             logger.warning("[记忆·Z] 存量时间/发言人回填失败（下次启动会重试）：%s", exc)
 

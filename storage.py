@@ -531,17 +531,23 @@ class Store:
         - `records.speaker`：显示名。优先用 `users` 里唯一的那个人；否则从正文开头的
           `[名字] ` 前缀里取（宿主渲染常常带这个前缀）。分批做，因为要查一次名字映射。
 
-        幂等：只动 `event_at=0` / `speaker=''` 的行。返回本次补了多少条记录。
+        幂等：只动 `event_at=0` / `speaker=''` 的行。
+
+        返回 ``{facts, records, scanned, unresolved}``：
+        - facts=补上事件时间的事实条数（**必须计**，否则只补事实时调用方会以为啥也没做 ✗）
+        - records=补上发言人的记录条数；scanned=本批扫过的候选条数
+        - unresolved=扫到但**判定不出来**的（群聊多人 + 正文没带名字）
         """
+        facts_filled = 0
         with self.connect() as db:
-            db.execute(
+            facts_filled = db.execute(
                 "UPDATE facts SET"
                 " event_at=coalesce((SELECT min(r.start) FROM records r,"
                 "   json_each(facts.sources) s WHERE r.id=s.value),0),"
                 " event_end=coalesce((SELECT max(r.start) FROM records r,"
                 "   json_each(facts.sources) s WHERE r.id=s.value),0)"
                 " WHERE event_at=0 AND sources<>'[]'"
-            )
+            ).rowcount or 0
             rows = db.execute(
                 "SELECT rowid,id,users,content FROM records"
                 " WHERE speaker='' AND role='user' AND rowid > ? LIMIT ?",
@@ -550,7 +556,12 @@ class Store:
             if rows:
                 self._time_cursor = rows[-1]["rowid"]
         if not rows:
-            return 0
+            return {
+                "facts": facts_filled,
+                "records": 0,
+                "scanned": 0,
+                "unresolved": 0,
+            }
         wanted = set()
         for row in rows:
             try:
@@ -589,7 +600,12 @@ class Store:
                 db.executemany(
                     "UPDATE records SET speaker=? WHERE id=?", updates
                 )
-        return len(updates)
+        return {
+            "facts": facts_filled,
+            "records": len(updates),
+            "scanned": len(rows),
+            "unresolved": len(rows) - len(updates),
+        }
 
     def prepare_capture_scrub(self):
         """是否还需要跑一次存量清洗（口径版本记在 meta 里，升级后会自动再跑一次）。
