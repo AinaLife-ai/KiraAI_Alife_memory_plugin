@@ -351,6 +351,15 @@ class AlifeMemoryPlugin(BasePlugin):
             raise RuntimeError("KiraAI did not associate plugin data directory")
         self.store = Store(Path(data_dir) / "alife-v2.sqlite3")
         await self.store.call("initialize")
+        try:
+            # v2.13.0 之前拼接出来的事实没有待重做标记，这里回填一次（幂等）
+            marked = await self.store.call("backfill_rewrite_pending")
+            if marked:
+                logger.info(
+                    "[记忆·Z] 发现 %s 条历史「降级拼接」事实，已排入重做队列", marked
+                )
+        except Exception as exc:
+            logger.warning("[记忆·Z] 历史拼接事实回填标记失败（下次启动会重试）：%s", exc)
         self.identity_report = {}
         try:
             if await self.store.call("synthetic_identity"):

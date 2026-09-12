@@ -46,6 +46,23 @@ def uid():
     return uuid.uuid4().hex
 
 
+FALLBACK_REASON_MARK = "按时间拼接"
+
+
+def _snapshot_in_content(snapshot, merged_content):
+    """老库兜底用：这条快照的内容当初真的被拼进了目标吗？
+
+    降级拼接是 ``"；".join(内容)``，所以同组的每条内容都应原样出现在结果里
+    （被 ``fact_merge_max_chars`` 截掉的那几条会判否 → 宁可不还原，也不还原错的）。
+    """
+    try:
+        body = (json.loads(snapshot) or {}).get("content") or ""
+    except (TypeError, ValueError):
+        return False
+    body = str(body).strip()
+    return bool(body) and body in str(merged_content or "")
+
+
 def scrub_row_text(level, role, text):
     """存量清洗的单行规则（与落库同口径）。
 
@@ -2871,6 +2888,29 @@ class Store:
                 )
             ]
 
+    def backfill_rewrite_pending(self):
+        """给**历史**的降级拼接事实补上待重做标记。
+
+        v2.13.0 才引入这个标记，所以升级前拼接出来的事实没有标记、
+        手动/自动重做都挑不到它们（用户实测报过）。
+
+        判据取「这条事实**最新一条版本记录**的 reason」（界面那行「最近审校」显示的
+        就是它）——降级拼接的 reason 只写在版本里，**不会**写到 facts.reason 上。
+        幂等：重做成功后目标事实会多一条「重做合并…」的版本，于是不再匹配。
+        """
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE facts SET rewrite_pending=1 WHERE deleted=0 "
+                "AND rewrite_pending=0 AND id IN ("
+                "  SELECT v.target FROM versions v WHERE v.kind='fact'"
+                "   AND instr(v.reason, ?)>0"
+                "   AND v.id=(SELECT max(x.id) FROM versions x"
+                "             WHERE x.kind='fact' AND x.target=v.target)"
+                ")",
+                (FALLBACK_REASON_MARK,),
+            )
+            return int(cursor.rowcount or 0)
+
     def mark_rewrite_pending(self, fact_ids, pending=1):
         """给「降级拼接」出来的事实打/清待重做标记（不动其它任何字段）。"""
         ids = [str(fid) for fid in (fact_ids or []) if fid]
@@ -2927,11 +2967,25 @@ class Store:
             )
             if latest is None:
                 return False
-            # 那次合并给组里每条都写了同一 reason + 同一时间戳的版本
+            # 那次合并给组里每条都写了同一 reason + 同一时间戳的版本。
+            # v2.13.0 之前是逐条 time.time()（差几微秒），所以下面还有一层时间窗兜底。
             group = db.execute(
                 "SELECT snapshot FROM versions WHERE kind='fact' AND reason=? AND created=?",
                 (latest["reason"], latest["created"]),
             ).fetchall()
+            if len(group) < 2:
+                # 老库兜底：同一次合并的版本只差几微秒 → 用时间窗取候选，
+                # 再用「它的内容确实被拼进了目标」过滤，避免把**别的簇**误当同组
+                # （一次合并多个簇时，它们的 reason 与时间都很接近 ✗）。
+                group = [
+                    row
+                    for row in db.execute(
+                        "SELECT snapshot FROM versions WHERE kind='fact' AND reason=? "
+                        "AND abs(created-?) <= 5",
+                        (latest["reason"], latest["created"]),
+                    ).fetchall()
+                    if _snapshot_in_content(row["snapshot"], target["content"])
+                ]
             snapshots = {}
             for row in group:
                 try:
