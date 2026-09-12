@@ -93,20 +93,28 @@ async def test_rotation_slot_behaviour(tmp_path):
             {"id": "c", "content": "紫小贱捏脸"},
         ]
         key = ("qq:gm:1", ("qq:1",), "global")
-        first = await plugin.rotation_extras("qq:gm:1", cfg, pool, key, lambda r: r["content"])
+        first = await plugin.rotation_extras(
+            "qq:gm:1", cfg, pool, key, lambda r: r["content"], "archive"
+        )
         assert [r["id"] for r in first] == ["a", "b", "c"], first
         # 没被用到 → 同一批继续留（不再重新挑）
-        again = await plugin.rotation_extras("qq:gm:1", cfg, pool, key, lambda r: r["content"])
+        again = await plugin.rotation_extras(
+            "qq:gm:1", cfg, pool, key, lambda r: r["content"], "archive"
+        )
         assert [r["id"] for r in again] == ["a", "b", "c"]
         # seen 已经记住它们 → 换批时池子里没有"新的"了 → 留空
         store.mark_rotation([], ["a"])
-        plugin.rotation["qq:gm:1"]["next"] = True
-        empty = await plugin.rotation_extras("qq:gm:1", cfg, pool, key, lambda r: r["content"])
+        plugin.rotation_state("qq:gm:1")["slots"]["archive"]["next"] = True
+        empty = await plugin.rotation_extras(
+            "qq:gm:1", cfg, pool, key, lambda r: r["content"], "archive"
+        )
         assert empty == []
         # 新候选进来 → 冷却中的 a 不会再被挑
         _record(store, "d", "新的候选")
         pool2 = pool + [{"id": "d", "content": "新的候选"}]
-        picked = await plugin.rotation_extras("qq:gm:1", cfg, pool2, key, lambda r: r["content"])
+        picked = await plugin.rotation_extras(
+            "qq:gm:1", cfg, pool2, key, lambda r: r["content"], "archive"
+        )
         assert [r["id"] for r in picked] == ["d"], picked
     finally:
         await plugin.terminate()
@@ -126,19 +134,20 @@ async def test_feedback_flips_to_next_batch(tmp_path):
         cfg.rotate_keep_rounds = 3
         cfg.rotate_min_hits = 2
         _record(store, "a", "香菇尾巴会摇")
-        plugin.rotation["qq:gm:1"] = {
+        plugin.rotation_state("qq:gm:1")["slots"]["archive"] = {
             "rows": [{"id": "a"}], "texts": {"a": "香菇尾巴会摇"},
-            "ids": ["a"], "rounds": 0, "next": False, "cooldown": {}, "touch": 0,
+            "ids": ["a"], "rounds": 0, "next": False, "cooldown": {},
         }
+        slot = plugin.rotation_state("qq:gm:1")["slots"]["archive"]
         await plugin.rotation_feedback("qq:gm:1", "今天风挺大")
-        assert plugin.rotation["qq:gm:1"]["next"] is False  # 没用上 → 继续留
-        assert plugin.rotation["qq:gm:1"]["rounds"] == 1
+        assert slot["next"] is False  # 没用上 → 继续留
+        assert slot["rounds"] == 1
         await plugin.rotation_feedback("qq:gm:1", "香菇的尾巴会摇")
-        assert plugin.rotation["qq:gm:1"]["next"] is True  # 用上了 → 换批
-        plugin.rotation["qq:gm:1"]["next"] = False
-        plugin.rotation["qq:gm:1"]["rounds"] = 3
+        assert slot["next"] is True  # 用上了 → 换批
+        slot["next"] = False
+        slot["rounds"] = 3
         await plugin.rotation_feedback("qq:gm:1", "今天风挺大")
-        assert plugin.rotation["qq:gm:1"]["next"] is True, "留满 keep_rounds 也要换批"
+        assert slot["next"] is True, "留满 keep_rounds 也要换批"
     finally:
         await plugin.terminate()
 
@@ -165,3 +174,36 @@ def test_pure_order_matches_sql_pick(tmp_path):
             ids, limit
         ), limit
     assert retrieval.rotation_order(["x", "a"], {}, {}, 2) == ["x", "a"]
+
+
+@pytest.mark.asyncio
+async def test_archive_and_fact_slots_do_not_mix(tmp_path):
+    """档案与事实的槽位状态必须分开 —— 混用会把事实行塞进档案列表，
+    渲染时读 r["end"] 直接 KeyError（线上实测踩到 ✗）。"""
+    if not os.environ.get("KIRA_CORE"):
+        pytest.skip("set KIRA_CORE for host integration")
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_helpers_plugin import build_plugin
+
+    plugin, store = await build_plugin(tmp_path)
+    try:
+        for rid in ("fa", "fb", "ra", "rb"):
+            _record(store, rid)
+        cfg = plugin.settings
+        cfg.rotate_enabled = True
+        cfg.rotate_count = 2
+        key = ("qq:gm:1", ("qq:1",), "global")
+        fact_pool = [{"id": "fa", "content": "事实A"}, {"id": "fb", "content": "事实B"}]
+        archive_pool = [{"id": "ra", "summary": "档案A"}, {"id": "rb", "summary": "档案B"}]
+        picked_facts = await plugin.rotation_extras(
+            "qq:gm:1", cfg, fact_pool, key, lambda r: r["content"], "fact"
+        )
+        picked_archives = await plugin.rotation_extras(
+            "qq:gm:1", cfg, archive_pool, key, lambda r: r["summary"], "archive"
+        )
+        assert [r["id"] for r in picked_facts] == ["fa", "fb"]
+        assert [r["id"] for r in picked_archives] == ["ra", "rb"]
+        assert "summary" in picked_archives[0], "档案槽位不该拿到事实行"
+        assert "content" in picked_facts[0], "事实槽位不该拿到档案行"
+    finally:
+        await plugin.terminate()
