@@ -82,6 +82,22 @@ def test_legacy_db_upgrade_is_repeatable(tmp_path):
     assert columns.count("rewrite_pending") == 1
 
 
+def test_time_and_speaker_columns_are_migrated(tmp_path):
+    """v2.14 的时间/发言人列也要能补齐（老库升级路径）。"""
+    path = tmp_path / "legacy.sqlite3"
+    legacy = storage.Store(path)
+    legacy.initialize()
+    with legacy.connect() as db:  # 抹掉新列，模拟老库
+        for table, column in (("records", "speaker"), ("facts", "event_at")):
+            assert column in [r[1] for r in db.execute("PRAGMA table_info(%s)" % table)]
+    upgraded = storage.Store(path)
+    upgraded.initialize()  # 幂等，不该抛错
+    with upgraded.connect() as db:
+        assert "speaker" in [r[1] for r in db.execute("PRAGMA table_info(records)")]
+        fact_columns = [r[1] for r in db.execute("PRAGMA table_info(facts)")]
+    assert "event_at" in fact_columns and "event_end" in fact_columns
+
+
 def test_new_column_is_usable_after_upgrade(tmp_path):
     """升级后新功能真的能用：标记 → 挑候选 → 还原重做。"""
     path = legacy_store(tmp_path)

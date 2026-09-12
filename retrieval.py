@@ -162,6 +162,7 @@ def archive_view(row, child_offset=0, child_count=20, include_content=False):
             "end",
             "summary",
             "users",
+            "speaker",
             "revision",
             "permanent",
         )
@@ -521,14 +522,21 @@ def _clip(text, limit):
 
 
 def short_time(value):
-    """epoch → ``MM-DD HH:MM``（本地时区）。浮点秒对模型毫无意义，还占 25 字符。"""
+    """epoch → ``MM-DD HH:MM``（同年）/ ``YYYY-MM-DD HH:MM``（跨年）。
+
+    跨年**一定要带年份**：模型虽然知道"现在"，但看到「11-16 10:33」会当成今年 ✗
+    （事实那边用 ``short_day``，口径保持一致）
+    """
     try:
         ts = float(value)
     except (TypeError, ValueError):
         return ""
     if ts <= 0:
         return ""
-    return time.strftime("%m-%d %H:%M", time.localtime(ts))
+    stamp = time.localtime(ts)
+    if stamp.tm_year == time.localtime().tm_year:
+        return time.strftime("%m-%d %H:%M", stamp)
+    return time.strftime("%Y-%m-%d %H:%M", stamp)
 
 
 def full_time(value):
@@ -681,6 +689,18 @@ def relevance(query, text):
     return sum(len(t) * (t in lowered) for t in tokens)
 
 
+def short_day(ts):
+    """给模型看的日期短码：今年不带年，跨年才带（省 token，且一眼能读）。"""
+    try:
+        stamp = time.localtime(float(ts))
+    except (TypeError, ValueError, OSError):
+        return ""
+    now = time.localtime()
+    if stamp.tm_year == now.tm_year:
+        return time.strftime("%m-%d", stamp)
+    return time.strftime("%Y-%m-%d", stamp)
+
+
 def bot_facts(facts, current_sid="", short=None):
     """给 Bot 看的精简事实视图：只留判断与追溯必需的字段。
 
@@ -713,8 +733,22 @@ def bot_facts(facts, current_sid="", short=None):
             # 短码映射里没有的（例如 sources 兜底值）就用原值，绝不输出 null
             item["src"] = (short(source) or source) if short else source
         created = fact.get("created")
-        if isinstance(created, (int, float)) and created > 0:
-            item["t"] = time.strftime("%m-%d", time.localtime(created))
+        # 事件时间（这条事实讲的事发生在什么时候）优先；老数据没有 event_at 时退回 created。
+        event_at = fact.get("event_at") or created
+        event_end = fact.get("event_end") or event_at
+        if isinstance(event_at, (int, float)) and event_at > 0:
+            item["t"] = short_day(event_at)
+            # 跨天的事（多条时间点合并进来的）给个区间，不然"塌成一点" ✗
+            if isinstance(event_end, (int, float)) and event_end - event_at > 86400:
+                item["t2"] = short_day(event_end)
+        # 记录时刻和事情发生的时间不是一回事：差得远时才附上，省 token
+        if (
+            isinstance(created, (int, float))
+            and created > 0
+            and isinstance(event_end, (int, float))
+            and created - event_end > 86400
+        ):
+            item["rec"] = short_day(created)
         if fact.get("relationship_status") == "needs_review" or fact.get(
             "relation_warnings"
         ):

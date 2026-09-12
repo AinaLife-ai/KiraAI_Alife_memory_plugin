@@ -41,7 +41,10 @@ COMMON_INSTRUCTION = (
     "未知原因/场景使用空字符串，未知集合使用空数组。关系和画像须有原文证据。"
     "subject 使用输入中的稳定实体 ID；未明确的实体名称按原文保留。"
     "记录里形如 qq:769690776(周武) 表示「ID(名字)」：subject 只填括号前的 ID，写内容时用名字。"
-    "records[].s 是这段对话的原文。"
+    "records[].s 是这段对话的原文，records[].t 是这条消息发生的时间。"
+    # 相对时间必须换算成绝对日期，否则"昨天"会永久失真 ✗
+    "写摘要和事实时，把原文里的「今天/昨天/前天/刚刚/上周/去年」按 records[].t "
+    "换算成绝对日期（如 9月11日 / 2025年），不要照抄相对说法。"
     "关系谓词必须表达完整关系，例如朋友、姐姐、喜欢；"
     "认为/觉得/说不是关系，不要把观点的说话者当作关系主体。没有证据时 relations=[]。"
 )
@@ -1165,11 +1168,22 @@ class Engine:
         rows = await self.store.call("pending_rewrites", limit, cap)
         if not rows:
             return 0
-        sids, done = set(), 0
+        sids, done, items = set(), 0, []
         for row in rows:
+            before = str(row.get("content") or "")
             if await self.store.call("unmerge_fact", row["id"]):
                 sids.add(row["sid"])
                 done += 1
+                # 明细里要能看出「原来那条拼接的是什么、重做后变成什么」
+                # （和「并入」用同一套「旧 → 新」渲染）
+                items.append(
+                    {
+                        "kind": "fact",
+                        "target": row["id"],
+                        "action": "rewrite",
+                        "before": before,
+                    }
+                )
             else:
                 # 被人改过 / 来源已被彻底删除：标记留着给界面看，但也要计数，
                 # 否则每轮审计都会对同一条白试一遍（自动上限 3 次后自然停）。
@@ -1179,8 +1193,11 @@ class Engine:
                     "[记忆·Z] 事实 %s 无法重做合并（已改动或来源缺失），跳过",
                     await self.store.call("short_id", row["id"]),
                 )
+        if items and job_id:
+            await self.store.call("add_job_items", job_id, items)
         for sid in sids:
-            await self.merge_facts(sid, None)
+            # 带上同一个 job_id：随后真正的合并在明细里显示成「并入」
+            await self.merge_facts(sid, job_id)
         if done:
             logger.info(
                 "[记忆·Z] 重做合并 %s 组（上次模型输出不可用，已还原来源重试）", done
