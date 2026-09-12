@@ -2,11 +2,14 @@
 
 import importlib
 import json
+import os
 import sys
 import tempfile
 import time
 import types
 import unittest
+
+import pytest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -124,7 +127,8 @@ class TimeProvenanceTests(unittest.TestCase):
             db.execute(
                 "INSERT INTO entities(id,kind,name,updated) VALUES('qq:1','user','星月',0)"
             )
-        self.assertGreaterEqual(self.store.backfill_time_provenance(), 2)
+        stats = self.store.backfill_time_provenance()
+        self.assertGreaterEqual(stats["records"] + stats["unresolved"], 2)
         self.assertEqual(self.row("facts", fid)["event_at"], 1700000000.0)
         self.assertEqual(self.row("records", "old1")["speaker"], "星月")
         self.assertEqual(self.row("records", "old2")["speaker"], "星月")
@@ -200,3 +204,62 @@ def test_short_time_keeps_the_year_when_it_is_not_this_year():
 def test_compression_input_always_has_the_year():
     """压缩输入的时间必须带年份：否则"昨天"换算成绝对日期时会算错 ✗。"""
     assert "YYYY-MM-DD HH:MM" in (ROOT / "retrieval.py").read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_startup_background_task_actually_backfills(tmp_path):
+    """线上"没有那行日志"的真因：启动任务有没有真的跑到回填 ✗
+
+    这条测的是**接线**（不只是方法本身）：plugin.build_search_index() 是启动时创建的
+    那个后台任务，它必须先跑存量回填、再管索引。
+    """
+    if not os.environ.get("KIRA_CORE"):
+        pytest.skip("set KIRA_CORE for host integration")
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_helpers_plugin import build_plugin
+
+    plugin, store = await build_plugin(tmp_path)
+    try:
+        store.capture(
+            "qq:gm:1",
+            "ev0",
+            [
+                {
+                    "role": "user",
+                    "content": "四十天前说想吃蛋糕",
+                    "time": 1700000000.0,
+                    "users": ["qq:1"],
+                    "speaker": "",
+                }
+            ],
+        )
+        with store.connect() as db:  # 造一条事实 + 抹掉事件时间（模拟存量）
+            db.execute("BEGIN IMMEDIATE")
+            fid = store._add_fact(
+                db,
+                "qq:gm:1",
+                {
+                    "category": "experience",
+                    "subject": "qq:1",
+                    "content": "想吃蛋糕",
+                    "reason": "",
+                    "scenario": "",
+                    "tags": [],
+                    "relations": [],
+                    "source_ids": [],
+                    "importance": 5,
+                },
+            )
+            db.execute("UPDATE facts SET event_at=0, event_end=0 WHERE id=?", (fid,))
+            db.execute("UPDATE records SET speaker=''")
+            db.execute(
+                "UPDATE facts SET sources=(SELECT json_group_array(id) FROM records) WHERE id=?",
+                (fid,),
+            )
+        await plugin.build_search_index()  # 启动时那个后台任务
+        with store.connect() as db:
+            row = dict(db.execute("SELECT * FROM facts WHERE id=?", (fid,)).fetchone())
+        assert row["event_at"] == 1700000000.0, "后台任务没把存量事件时间补上 ✗"
+        assert row["event_end"] == 1700000000.0
+    finally:
+        await plugin.terminate()
