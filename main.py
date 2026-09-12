@@ -1585,6 +1585,9 @@ class AlifeMemoryPlugin(BasePlugin):
             if len(perms) > cfg.permanent_cap or perm_chars > cfg.permanent_budget_chars:
                 for owner in sorted({row["sid"] for row in perms if row["sid"]}):
                     await self.engine.enqueue("tidy", owner, automatic=True)
+                    # 超重往往是"重复项堆出来的" → 顺手把去重也排上（清老根 ✓）
+                    if self.settings.permanent_dedupe:
+                        await self.engine.enqueue("dedupe", owner, automatic=True)
         fresh = self._mark_access([row["id"] for row in perms])
         if fresh:
             await self.store.call("touch_accessed", fresh)
@@ -2204,6 +2207,10 @@ class AlifeMemoryPlugin(BasePlugin):
         await self.engine.enqueue("classify", record_id)
         if self.settings.permanent_dedupe:
             await self.engine.enqueue("dedupe", value.sid, automatic=True)
+        if self.settings.permanent_tidy_on_write:
+            # 刚写下的永久记忆也顺手过一遍整理（提炼成事实/确认是否真该常驻 ✓）
+            # 开销小：刚写入的那条本来就是待整理项，旧记录在 permanent_tidy_days 内会被跳过 ✓
+            await self.engine.enqueue("tidy", value.sid, automatic=True)
         return self.recall_result(
             event, {"ok": True, "id": await self.store.call("short_id", record_id)}
         )

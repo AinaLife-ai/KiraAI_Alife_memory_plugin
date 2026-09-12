@@ -391,6 +391,12 @@
         "minimum": 1,
         "description": "一次整理最多交给模型几条永久记忆（条数上限触发时会一次排空积压）。"
       },
+      "permanent_tidy_on_write": {
+        "type": "bool",
+        "name": "记住后立即整理",
+        "default": true,
+        "description": "Bot 每次写下永久记忆后，顺手整理一次常驻区（哪怕没触发去重）。开销很小：刚写入的那条本来就是待整理项，旧记录仍在 permanent_tidy_days 间隔内会被跳过。"
+      },
       "permanent_tidy_days": {
         "type": "integer",
         "name": "同一条整理间隔（天）",

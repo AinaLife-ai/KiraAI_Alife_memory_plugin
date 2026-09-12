@@ -311,6 +311,8 @@ class Settings(Strict):
     session_affinity: bool = False
     memorize_cover_check: bool = True
     permanent_tidy_enabled: bool = True
+    # 写入永久记忆后直接整理一次（即使没触发去重）
+    permanent_tidy_on_write: bool = True
     permanent_cap: int = Field(default=10, ge=1, le=200)
     permanent_budget_chars: int = Field(default=3000, ge=200, le=100000)
     permanent_tidy_batch: int = Field(default=10, ge=1, le=100)

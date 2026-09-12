@@ -617,6 +617,21 @@ class Store:
             "unresolved": len(rows) - len(updates),
         }
 
+    def permanents_need_tidy(self, sid, days):
+        """这个会话里是否有"太久没被整理"的永久记忆（v2.16.3 周期整理用）。
+
+        `permanent_tidy_days` 原来只是"整理时挑哪些记录"的间隔；
+        现在同时当作"至少多久整理一次"：没有任何超重也会定期体检一次 ✓
+        """
+        cutoff = time.time() - max(0, int(days)) * 86400
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT 1 FROM records WHERE sid=? AND level=100 AND deleted=0"
+                " AND active=1 AND cold=0 AND (tidy_at=0 OR tidy_at<?) LIMIT 1",
+                (sid, cutoff),
+            ).fetchone()
+        return bool(row)
+
     def prepare_capture_scrub(self):
         """是否还需要跑一次存量清洗（口径版本记在 meta 里，升级后会自动再跑一次）。
 

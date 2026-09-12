@@ -307,6 +307,42 @@ python tools/web_audit.py                 # 前端静态审计：属性读写配
 <details>
 <summary><b>📝 更新日志（点击展开）</b></summary>
 
+### v2.16.3 (2026-09-12) — 永久记忆：整理与去重联动 + 不超重也定期体检 🧹
+
+**问题（用户发现）**：永久记忆的「整理（tidy）」只在**超重**时才被触发
+（条数 > `permanent_cap` 或字符 > `permanent_budget_chars`）✗
+→ 一个会话长期稳定在 cap 之下时，**永远不会被整理** ✗
+里面"其实该提炼成事实 / 已过时 / 表述冗余"的条目会一直每轮吃 token ✗
+
+（顺带澄清：`permanent_tidy_days` 原来只是"整理时**挑哪些记录**"的 cutoff ✗
+不是"多久整理一次" —— 现在它同时承担后者 ✓）
+
+**三处改动**
+
+| # | 触发 | 条件 |
+|---|---|---|
+| ① | **dedupe 完成后跟一次 tidy** | 本次 `merged > 0`（**真的合并了**才跟，避免空转 ✗）|
+| ② | **注入侧超重时**（现有）| 排 tidy ✓ **同时排一次 dedupe** ✓（超重往往是重复项堆出来的，顺手清老根 ✓）|
+| ③ | **定时器周期体检**（新增）| 不超重、但存在 `tidy_at` 早于 `permanent_tidy_days`（14 天）的永久记忆 → 也排 tidy ✓ |
+| ④ | **写下永久记忆后**（新增）| Bot 每次 `Memorize` 成功后**直接排一次 tidy** ✓（哪怕没触发去重 ✓）——新开关 `permanent_tidy_on_write` **默认开** ✓ |
+
+④ 的开销很小：刚写入的那条本来就是"待整理项" ✓，旧记录在 `permanent_tidy_days` 内会被跳过 ✓
+所以实际工作就是"把刚记下的这条过一遍"（判断该不该常驻 / 能否提炼成事实）✓
+
+**为什么①的顺序重要**：先合并、再整理 → tidy 看到的是**更小更干净**的集合 ✓
+提炼/移出的判断更准 ✓ 输入 token 也更少 ✓（反过来会让两者重复处理同一批 ✗）
+
+**防乒乓**：①只在"有改动"时跟 ✓ ②只在超重信号下排 ✓ ③不反向叫 dedupe ✗
+加上 `jobs` 表按 `kind+sid` 去重 ✓ 不会循环 ✓
+
+**配置**：①②③ 复用现有开关 ✓；④ 新增 `permanent_tidy_on_write`（默认开 ✓）
+（`permanent_tidy_days` 语义扩展为"至少多久整理一次"，设置页说明同步 ✓）
+
+**测试**：默认 332 passed 14 skipped；KIRA_CORE 382 passed；web_audit 0
+新增 `tests/test_tidy_dedupe_link.py`：
+① `permanents_need_tidy` 的四种情形（从没整理过 / 刚整理过 / 超过 14 天 / 关掉周期）✓
+② 三处联动都在代码里（静态检查，防以后被改掉 ✗）
+
 ### v2.16.2 (2026-09-12) — 修「extra_forbidden」频繁失败（紧凑 schema 漏了白名单）🔧
 
 **线上现象**：分层压缩频繁 `structured_output_rejected · <field>: extra_forbidden` ✗
