@@ -23,6 +23,7 @@ OWN_MESSAGES = {
     "谓词没有表达具体关系；请按原文补全，无法确定时删除这条连线",
     "关系两端相同，需核对身份",
     "merged content required",
+    "merge requires content",
 }
 
 

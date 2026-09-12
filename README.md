@@ -307,6 +307,30 @@ python tools/web_audit.py                 # 前端静态审计：属性读写配
 <details>
 <summary><b>📝 更新日志（点击展开）</b></summary>
 
+### v2.13.4 (2026-09-12) — 修「事实合并总是降级拼接」的真因：提示词与契约自相矛盾 ⚖️
+
+用户点了重整事实后，日志里三组**全部**降级拼接：
+
+```
+事实合并模型输出不可用，改用原文拼接：structured_output_rejected ·
+<field>.0: value_error; <field>.1: value_error; <field>.2: value_error
+```
+
+**根因**（我自己的两处矛盾）：
+- **提示词**（`FACT_MERGE_PROMPT`）写的是「`source_ids` **至少一条**，逐字复制」
+- **契约校验**（`FactMergeGroup.validate_action`）却要求 `len(source_ids) >= 2` ✗
+
+两条事实合并时，模型按提示词只会给出"另一条"（1 条）→ 被我们判成输出不可用 → 降级拼接 ✗
+而 `merge_facts` 本来就会自动把 `target_id` 并进组 → 这条 ≥2 规则既多余又自相矛盾 ✗
+
+**修**：删掉这条 ≥2 校验（字段本身仍是 `min_length=1`，与提示词一致）。
+另外把我们的校验消息加进可回显白名单，于是这类拒绝的日志会直接说清原因
+（`<field>.0: value_error（merge requires content）`），不用再猜 ✗
+
+**验证**：把旧规则塞回去，新加的测试立刻变红，并**逐字复现**上面那行线上日志 ✓
+
+测试：默认 307 passed 10 skipped；KIRA_CORE 353 passed；web_audit 0。
+
 ### v2.13.3 (2026-09-12) — 重做机制不再依赖标记位（修「手动按钮识别不到」的真因）🔁
 
 用户合并 v2.13.2 后反馈：**还是没有识别到那条拼接事实**。查到两个我自己的设计问题：

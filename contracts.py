@@ -148,8 +148,10 @@ class FactMergeGroup(Strict):
     def validate_action(self):
         if self.action == "merge" and not self.content.strip():
             raise ValueError("merge requires content")
-        if self.action == "merge" and len(self.source_ids) < 2:
-            raise ValueError("merge needs at least two facts")
+        # 注意：**不要**在这里要求 len(source_ids) >= 2。
+        # 提示词里写的是「source_ids 至少一条」（两条事实合并时模型只会给出另一条），
+        # 而 merge_facts 本来就会把 target_id 并进组 → 再要 ≥2 就是把合乎提示词的
+        # 输出判成失败、白走一次降级拼接（实测踩到）。
         return self
 
 
