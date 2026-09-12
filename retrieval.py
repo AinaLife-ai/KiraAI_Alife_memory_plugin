@@ -701,6 +701,29 @@ def short_day(ts):
     return time.strftime("%Y-%m-%d", stamp)
 
 
+def rotation_order(ids, shown, used, limit):
+    """轮换挑选的**纯计算**版本（与 storage.rotation_pick 完全同一套顺序）。
+
+    ① 从没展示过的优先 ② 用过/展示比例高的次之 ③ 展示次数少的再后
+    ④ 同条件按传入顺序（那本身就是相关性排序）稳定。
+    """
+    wanted = [str(i) for i in (ids or []) if i]
+    if not wanted or limit <= 0:
+        return []
+    order = {rid: index for index, rid in enumerate(wanted)}
+
+    def key(rid):
+        count_shown, count_used = shown.get(rid, 0), used.get(rid, 0)
+        return (
+            0 if count_shown == 0 else 1,
+            -(count_used / count_shown) if count_shown else 0,
+            count_shown,
+            order.get(rid, 0),
+        )
+
+    return sorted(wanted, key=key)[: int(limit)]
+
+
 def overlap_hit(text, reply, min_hits=2):
     """这轮回复里有没有"用上"这条记忆？（轮换槽位的反馈信号）
 

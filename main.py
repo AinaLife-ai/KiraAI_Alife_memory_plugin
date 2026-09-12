@@ -49,6 +49,7 @@ from .retrieval import (
     short_time,
     squeeze,
     overlap_hit,
+    rotation_order,
     strip_reasoning,
     trim_nested,
     TOOL_RESULT_PREFIX,
@@ -766,6 +767,8 @@ class AlifeMemoryPlugin(BasePlugin):
             state = {
                 "rows": [], "texts": {}, "rounds": 0, "next": True,
                 "cooldown": {}, "touch": time.monotonic(),
+                # 轮换计数快照：每会话只从库里加载一次，之后纯内存排序（热路径 0 查询 ✓）
+                "shown": None, "used": {},
             }
             self.rotation[sid] = state
         state["touch"] = time.monotonic()
@@ -813,8 +816,16 @@ class AlifeMemoryPlugin(BasePlugin):
         if not candidates:  # 池子空了：这轮留空（但不改 next，下一轮还要再试）
             state.update({"rows": [], "texts": {}, "ids": [], "rounds": 0})
             return []
-        ids = await self.store.call(
-            "rotation_pick", [row["id"] for row in candidates], cfg.rotate_count
+        state.setdefault("used", {})
+        if state.get("shown") is None:  # 每会话只查一次（有轮换记录的通常很少）
+            snapshot = await self.store.call("rotation_stats")
+            state["shown"] = {rid: stat[0] for rid, stat in snapshot.items()}
+            state["used"] = {rid: stat[1] for rid, stat in snapshot.items()}
+        ids = rotation_order(
+            [row["id"] for row in candidates],
+            state["shown"],
+            state["used"],
+            cfg.rotate_count,
         )
         chosen = [row for row in candidates if row["id"] in set(ids)]
         if not chosen:
@@ -830,6 +841,7 @@ class AlifeMemoryPlugin(BasePlugin):
         )
         for row in chosen:
             state["cooldown"][row["id"]] = cfg.rotate_cooldown_rounds
+            state["shown"][row["id"]] = int(state["shown"].get(row["id"], 0)) + 1
         # 进 seen：下一轮它们就不再算"没给过"，也不会被当成主召回的重复项
         self.seen_window.remember(seen_key, "", [row["id"] for row in chosen])
         await self.store.call("mark_rotation", [row["id"] for row in chosen], [])
@@ -854,6 +866,9 @@ class AlifeMemoryPlugin(BasePlugin):
         ]
         if hits:
             await self.store.call("mark_rotation", [], hits)
+            used_map = state.setdefault("used", {})
+            for rid in hits:
+                used_map[rid] = int(used_map.get(rid, 0)) + 1
             state["next"] = True  # 用到了 → 下轮换批
             state["rounds"] = 0
             logger.info("[记忆·Z] 轮换槽位：命中 %s/%s 条 → 下轮换批", len(hits), len(state["ids"]))

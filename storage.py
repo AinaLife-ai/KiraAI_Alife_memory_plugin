@@ -3088,6 +3088,20 @@ class Store:
                 )
         return len(shown) + len(used)
 
+    def rotation_stats(self):
+        """一次性取回"有轮换记录"的计数（量很小）。
+
+        热路径（每轮注入）再用它做**纯内存排序**，省掉每轮的两次 DB 往返 ✓
+        """
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT id,rotate_shown,rotate_used FROM records WHERE rotate_shown > 0"
+            ).fetchall()
+        return {
+            row["id"]: (int(row["rotate_shown"] or 0), int(row["rotate_used"] or 0))
+            for row in rows
+        }
+
     def rotation_pick(self, ids, limit):
         """从给定的候选 id 里挑下一批轮换条目（排序即"学习"）。
 
