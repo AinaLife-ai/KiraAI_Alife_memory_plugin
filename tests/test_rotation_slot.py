@@ -141,3 +141,27 @@ async def test_feedback_flips_to_next_batch(tmp_path):
         assert plugin.rotation["qq:gm:1"]["next"] is True, "留满 keep_rounds 也要换批"
     finally:
         await plugin.terminate()
+
+
+def test_pure_order_matches_sql_pick(tmp_path):
+    """A 方案的安全阀：纯内存排序必须与 storage.rotation_pick 结果完全一致。
+
+    两者同一套顺序；谁只改了其中一处，这条立刻红灯。
+    """
+    store = _store(tmp_path)
+    ids = ["a", "b", "c", "d", "e"]
+    for rid in ids:
+        _record(store, rid)
+    store.mark_rotation(["b"], ["b"])
+    store.mark_rotation(["c"], [])
+    store.mark_rotation(["d", "d", "d"], [])
+    store.mark_rotation(["e"], ["e"])
+    store.mark_rotation(["e"], ["e"])
+    snapshot = store.rotation_stats()
+    shown = {rid: stat[0] for rid, stat in snapshot.items()}
+    used = {rid: stat[1] for rid, stat in snapshot.items()}
+    for limit in (1, 3, 5):
+        assert retrieval.rotation_order(ids, shown, used, limit) == store.rotation_pick(
+            ids, limit
+        ), limit
+    assert retrieval.rotation_order(["x", "a"], {}, {}, 2) == ["x", "a"]

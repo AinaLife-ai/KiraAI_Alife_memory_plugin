@@ -110,7 +110,7 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(records[1]["bot"], 1)        # assistant 用一位短标记
         self.assertEqual(records[0]["t"], "1970-01-01 08:01")  # 可读时间（本地）
         self.assertNotIn("start", records[0])
-        self.assertEqual(records[0]["u"], ["u(周武)"])         # 名字随行，ID 在前
+        self.assertEqual(records[0]["u"], ["u"])   # 只写 ID；名字在 payload 顶层 names 表
 
     def test_compress_records_keep_range_for_archives(self):
         rows = [

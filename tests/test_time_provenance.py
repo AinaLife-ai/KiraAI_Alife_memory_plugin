@@ -180,8 +180,10 @@ def test_prompt_tells_model_to_absolutize_relative_dates():
 def test_rules_document_time_and_speaker_fields():
     """规则块要说明时间与发言人短键，模型才会用。"""
     main = (ROOT / "main.py").read_text(encoding="utf-8")
-    for field in ("t=**事件发生日期**", "t2", "rec=记录日期", "sp=", "SearchMemoryArchive"):
-        assert field in main, field
+    start = main.find("MEMORY_RULES = (")
+    block = main[start : main.find(")\\n", start)]
+    for field in ("t=事件日期", "t2", "rec=记录日期", "sp=存档里", "SearchMemoryArchive"):
+        assert field in block, field
 
 
 if __name__ == "__main__":
