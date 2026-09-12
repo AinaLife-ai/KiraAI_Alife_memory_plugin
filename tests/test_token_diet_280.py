@@ -57,7 +57,7 @@ def test_compress_records_are_compact_and_named():
     assert first["s"] == "翅膀被人打了"          # 剥包裹 + 折行空格合并
     assert "role" not in first and "bot" not in first
     assert second["bot"] == 1                    # assistant 用一位标记
-    assert first["u"] == ["qq:769690776(周武)"]  # ID 在前、名字随行
+    assert first["u"] == ["qq:769690776"]  # 只写 ID（名字在顶层 names 表，省 token）
     assert first["t"] == "2026-03-08 02:36"      # 可读时间（本地）
     assert second["t2"] and second["t2"] != ""   # 多层存档保留起止两点
     assert "summary" not in first and "start" not in first
@@ -89,13 +89,20 @@ def test_restore_group_ids_for_merges():
     assert single["source_ids"] == ["r1", "r2"]
 
 
+def test_compress_payload_carries_names_map():
+    """名字只在顶层给一次（ID→名字），记录里只用 ID —— 少重复、不丢信息。"""
+    src = (Path(__file__).resolve().parents[1] / "engine.py").read_text(encoding="utf-8")
+    assert '"names": {' in src, "压缩 payload 顶层要带 names 表"
+    assert "names 表（ID→名字）" in src or "names 表" in src, "COMMON 要说明 u 是 ID、名字看 names"
+
+
 def test_instructions_carry_the_new_limits():
     text = e.COMMON_INSTRUCTION + e.build_instruction("compress", _settings())
     assert "summary 不超过 300 字" in text
     assert "scenario 不超过 20 字" in text
     assert "content 不超过 60 字" in text
     assert "records[].s 是这段对话的原文" in text
-    assert "括号前的 ID" in text
+    assert "records[].u 是实体 ID 列表" in text, "要说明 u 是 ID、名字在 names 表"
     audit = e.AUDIT_INSTRUCTION
     assert "facts[].sources" not in audit, "sources 已不入参，指令不该再提它"
 

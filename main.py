@@ -771,6 +771,11 @@ class AlifeMemoryPlugin(BasePlugin):
         state["touch"] = time.monotonic()
         return state
 
+    def rotation_needs_batch(self, sid):
+        """这轮是否需要重新挑一批（否则复用上批 → 省掉一次候选查询 ✓）。"""
+        state = self.rotation.get(sid)
+        return state is None or bool(state.get("next", True))
+
     async def rotation_extras(self, sid, cfg, pool, seen_key, text_of):
         """轮换槽位：从「同样过门槛、但没被选中」的候选里补几条。
 
@@ -781,6 +786,16 @@ class AlifeMemoryPlugin(BasePlugin):
         if not cfg.rotate_enabled or cfg.rotate_count <= 0:
             return []
         state = self.rotation_state(sid)
+        # 配置变了（例如门槛被调高、槽位条数改了）→ 上批立刻作废、重挑
+        signature = (
+            bool(cfg.rotate_enabled),
+            int(cfg.rotate_count),
+            int(cfg.rotate_min_hits),
+            float(cfg.fact_recall_min_score or 0),
+        )
+        if state.get("signature") != signature:
+            state["next"] = True
+            state["signature"] = signature
         state["cooldown"] = {
             rid: left - 1 for rid, left in state["cooldown"].items() if left - 1 > 0
         }
@@ -1375,31 +1390,42 @@ class AlifeMemoryPlugin(BasePlugin):
                 prefer,
                 allow_content_match=not over_budget,
             )
-        if cfg.rotate_enabled and cfg.rotate_count > 0 and cfg.fact_recall_min_score:
-            # 轮换槽位（事实）：同一个门槛、同一套词面匹配，只取"还没召回过"的
-            fact_pool = await self.store.call(
-                "facts",
-                sid,
-                subject="",
-                category="",
-                limit=cfg.rotate_count * 4,
-                offset=0,
-                global_scope=cfg.recall_scope == "global",
-                users=users,
-                include_shared=True,
-                hide_pending=cfg.merge_pending_hide,
-                lexical=query,
-                min_score=cfg.fact_recall_min_score,
-                **prefer,
-            )
-            if fact_pool:
-                facts = facts + await self.rotation_extras(
+        # 轮换槽位（事实）的前提与主路径的"内容匹配"完全一致：
+        # 门槛、查询词一样，而且主路径因为预算/条件没跑时，槽位也不该自己跑
+        # （否则会绕过门槛把"本来不该出现的事实"带进来 ✗ —— 实测被测试抓到过）。
+        if (
+            cfg.rotate_enabled
+            and cfg.rotate_count > 0
+            and cfg.fact_recall_min_score
+            and query.strip()
+            and not over_budget
+        ):
+            # 轮换槽位（事实）：同一个门槛、同一套词面匹配，只取"还没召回过"的。
+            # 只有真要换批时才查（"继续留批"的轮次直接复用上批 → 省一次查询 ✓）
+            fact_pool = []
+            if self.rotation_needs_batch(sid):
+                fact_pool = await self.store.call(
+                    "facts",
                     sid,
-                    cfg,
-                    fact_pool,
-                    recall_key,
-                    lambda r: str(r.get("content") or ""),
+                    subject="",
+                    category="",
+                    limit=cfg.rotate_count * 4,
+                    offset=0,
+                    global_scope=cfg.recall_scope == "global",
+                    users=users,
+                    include_shared=True,
+                    hide_pending=cfg.merge_pending_hide,
+                    lexical=query,
+                    min_score=cfg.fact_recall_min_score,
+                    **prefer,
                 )
+            facts = facts + await self.rotation_extras(
+                sid,
+                cfg,
+                fact_pool,
+                recall_key,
+                lambda r: str(r.get("content") or ""),
+            )
         related, related_rows, related_shorts = [], [], {}
         if cfg.recall_scope != "session" and query.strip() and not over_budget:
             reach = cfg.top_k * (2 if keyword_hit else 1)

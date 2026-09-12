@@ -347,7 +347,20 @@ pydantic 自动 schema 里的 `$defs` / `additionalProperties` / `maxLength:1600
 **本轮按你的意见不动的**：审计证据按需截断 ✗（审计的价值就是有据可查 ✓ 削它伤质量 ✓）；
 再压 `src`/`sid`/`by` 等字段名 ✗（省 20~30 字/条不值得 ✓）；正文/时间区间/摘要一律不截 ✗
 
-**测试**：默认 327 passed 13 skipped；KIRA_CORE 376 passed；web_audit 0
+**改动 4：`u` 只留 ID + 顶层 `names` 表（v2.16.0 追加）**
+记录里的 `u` 从 `qq:769690776(周武)` 改成**纯 ID** ✗→✓，名字只在 payload 顶层 `names` 表给一次 ✓
+`COMMON_INSTRUCTION` 同步改为「`records[].u` 是实体 ID 列表，名字看 names 表」✓
+**实测省**：2 人参与的 40 条批省 **284 字**（我原先估 1.2k 是虚的 ✗ 参与者越多省得越多 ✓ 6 人批约省 1k）
+
+**改动 5：轮换槽位省掉多余查询（v2.16.0 追加）**
+只在**真要换批**时才查事实候选 ✓；"继续留批"的轮次直接复用上批 ✓ → 每 3 轮省 2 次查询 ✓
+并且：**配置一变（门槛/条数/命中阈值）上批立刻作废重挑** ✓ —— 否则调高门槛后上批还会赖着不走 ✗
+（这个边界是**测试抓出来的** ✓ `test_recall_threshold_is_configurable`）
+同时把轮换事实查询的门控对齐主路径（`query` 非空 + 未超预算 ✓），避免绕过门槛 ✗
+
+**未做**：prewarm 覆盖轮换挑选（需要注入上下文，收益最小 ✓ 留作后续）
+
+**测试**：默认 328 passed 13 skipped；KIRA_CORE 377 passed；web_audit 0
 新增 `tests/test_compact_templates.py`：
 ① 紧凑声明必须覆盖契约**全部必填字段**（**当场抓到 audit 漏了 relations 三个字段** ✓✓）
 ② 真瘦（<自动 schema 的 70%）且必须含"必填/常见错误"
