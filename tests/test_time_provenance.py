@@ -4,6 +4,7 @@ import importlib
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -181,3 +182,21 @@ def test_rules_document_time_and_speaker_fields():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_short_time_keeps_the_year_when_it_is_not_this_year():
+    """存档给模型看的时间：同年省年份，跨年必须带——否则模型会当成今年 ✗。
+
+    （模型知道"现在"是几号，所以同年省略是安全的；跨年省略就是错的。）
+    """
+    now = time.time()
+    same_year = retrieval.short_time(now)
+    assert len(same_year.split(" ")[0].split("-")) == 2, same_year  # MM-DD
+    older = retrieval.short_time(now - 300 * 86400)  # 任何日期往前 300 天必然跨年
+    assert len(older.split(" ")[0].split("-")) == 3, older  # YYYY-MM-DD
+    assert retrieval.short_day(now - 300 * 86400).count("-") == 2
+
+
+def test_compression_input_always_has_the_year():
+    """压缩输入的时间必须带年份：否则"昨天"换算成绝对日期时会算错 ✗。"""
+    assert "YYYY-MM-DD HH:MM" in (ROOT / "retrieval.py").read_text(encoding="utf-8")

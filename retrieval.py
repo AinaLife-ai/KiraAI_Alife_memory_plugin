@@ -522,14 +522,21 @@ def _clip(text, limit):
 
 
 def short_time(value):
-    """epoch → ``MM-DD HH:MM``（本地时区）。浮点秒对模型毫无意义，还占 25 字符。"""
+    """epoch → ``MM-DD HH:MM``（同年）/ ``YYYY-MM-DD HH:MM``（跨年）。
+
+    跨年**一定要带年份**：模型虽然知道"现在"，但看到「11-16 10:33」会当成今年 ✗
+    （事实那边用 ``short_day``，口径保持一致）
+    """
     try:
         ts = float(value)
     except (TypeError, ValueError):
         return ""
     if ts <= 0:
         return ""
-    return time.strftime("%m-%d %H:%M", time.localtime(ts))
+    stamp = time.localtime(ts)
+    if stamp.tm_year == time.localtime().tm_year:
+        return time.strftime("%m-%d %H:%M", stamp)
+    return time.strftime("%Y-%m-%d %H:%M", stamp)
 
 
 def full_time(value):
