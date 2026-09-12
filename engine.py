@@ -1171,8 +1171,10 @@ class Engine:
                 sids.add(row["sid"])
                 done += 1
             else:
-                # 被人改过 / 来源已被彻底删除：不再自动重试，标记留着给界面
+                # 被人改过 / 来源已被彻底删除：标记留着给界面看，但也要计数，
+                # 否则每轮审计都会对同一条白试一遍（自动上限 3 次后自然停）。
                 await self.store.call("mark_rewrite_pending", [row["id"]], 1)
+                await self.store.call("bump_rewrite_attempts", [row["id"]])
                 logger.debug(
                     "[记忆·Z] 事实 %s 无法重做合并（已改动或来源缺失），跳过",
                     await self.store.call("short_id", row["id"]),

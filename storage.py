@@ -49,18 +49,47 @@ def uid():
 FALLBACK_REASON_MARK = "按时间拼接"
 
 
-def _snapshot_in_content(snapshot, merged_content):
-    """老库兜底用：这条快照的内容当初真的被拼进了目标吗？
+def _pick_group(rows, target):
+    """从版本行里挑出「确实构成了这次拼接」的那一组。
 
-    降级拼接是 ``"；".join(内容)``，所以同组的每条内容都应原样出现在结果里
-    （被 ``fact_merge_max_chars`` 截掉的那几条会判否 → 宁可不还原，也不还原错的）。
+    判据是**内容本身**，不是 revision 计数器：降级拼接就是
+    ``"；".join(按时间倒序去重后的内容)[:上限]``，所以按同样顺序走一遍、
+    要求每一步都对得上目标当前内容的当前位置；对不上的（别的簇、或被上限截掉的）
+    一律跳过。这样即使审计动过 importance（也会 +1 revision）也不会误判成"被改过"。
+
+    返回 {fact_id: 合并前快照}；理论上对不上就返回空 → 调用方放弃重做。
     """
-    try:
-        body = (json.loads(snapshot) or {}).get("content") or ""
-    except (TypeError, ValueError):
-        return False
-    body = str(body).strip()
-    return bool(body) and body in str(merged_content or "")
+    wanted = str(target["content"] or "")
+    remaining = []
+    for row in rows:
+        try:
+            snapshot = json.loads(row["snapshot"])
+        except (TypeError, ValueError):
+            continue
+        if snapshot.get("id") and str(snapshot.get("content") or ""):
+            remaining.append(snapshot)
+    # 按内容游标贪心匹配：每一步都要求「这条的内容」正好出现在当前位置。
+    # 顺序无关（真实合并按时间倒序，但这里不依赖它），对不上的（别的簇、
+    # 或被 fact_merge_max_chars 截掉的尾巴）自然被跳过。
+    picked, cursor = [], 0
+    while True:
+        for snapshot in list(remaining):
+            body = str(snapshot["content"])
+            if wanted.startswith(body, cursor):
+                picked.append(snapshot)
+                remaining.remove(snapshot)
+                cursor += len(body) + 1  # +1 = 拼接用的分隔符「；」
+                break
+        else:
+            break
+    if not picked:
+        return {}
+    group = {snapshot["id"]: snapshot for snapshot in picked}
+    if target["id"] not in group or len(group) < 2:
+        return {}
+    if not wanted.startswith("；".join(snapshot["content"] for snapshot in picked)):
+        return {}
+    return group
 
 
 def scrub_row_text(level, role, text):
@@ -2923,13 +2952,35 @@ class Store:
             )
         return len(ids)
 
+    def bump_rewrite_attempts(self, fact_ids):
+        """给重试计数 +1（重做被安全校验拒绝时也要计，否则每轮审计都白试一遍）。"""
+        ids = [str(fid) for fid in (fact_ids or []) if fid]
+        if not ids:
+            return 0
+        with self.connect() as db:
+            db.executemany(
+                "UPDATE facts SET rewrite_attempts=rewrite_attempts+1 WHERE id=?",
+                [(fid,) for fid in ids],
+            )
+        return len(ids)
+
     def pending_rewrites(self, limit=3, max_attempts=3):
-        """等着重做的降级拼接事实（自动重试次数未超上限的）。"""
+        """等着重做的降级拼接事实。
+
+        **判据现算**，不依赖 `rewrite_pending` 是否被回填过：一条事实的最新版本记录
+        reason 里出现降级拼接的特征串就算（界面那行「最近审校」显示的就是它）。
+        这样即使插件只是热重载、`initialize` 没跑到回填那一步，也照样挑得到。
+        """
         with self.connect() as db:
             rows = db.execute(
-                "SELECT * FROM facts WHERE rewrite_pending=1 AND deleted=0 "
-                "AND rewrite_attempts < ? ORDER BY audited ASC, created ASC LIMIT ?",
-                (int(max_attempts), int(limit)),
+                "SELECT * FROM facts WHERE deleted=0 AND rewrite_attempts < ? "
+                "AND (rewrite_pending=1 OR id IN ("
+                "  SELECT v.target FROM versions v WHERE v.kind='fact'"
+                "   AND instr(v.reason, ?)>0"
+                "   AND v.id=(SELECT max(x.id) FROM versions x"
+                "             WHERE x.kind='fact' AND x.target=v.target)"
+                ")) ORDER BY audited ASC, created ASC LIMIT ?",
+                (int(max_attempts), FALLBACK_REASON_MARK, int(limit)),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -2974,31 +3025,16 @@ class Store:
                 (latest["reason"], latest["created"]),
             ).fetchall()
             if len(group) < 2:
-                # 老库兜底：同一次合并的版本只差几微秒 → 用时间窗取候选，
-                # 再用「它的内容确实被拼进了目标」过滤，避免把**别的簇**误当同组
-                # （一次合并多个簇时，它们的 reason 与时间都很接近 ✗）。
-                group = [
-                    row
-                    for row in db.execute(
-                        "SELECT snapshot FROM versions WHERE kind='fact' AND reason=? "
-                        "AND abs(created-?) <= 5",
-                        (latest["reason"], latest["created"]),
-                    ).fetchall()
-                    if _snapshot_in_content(row["snapshot"], target["content"])
-                ]
-            snapshots = {}
-            for row in group:
-                try:
-                    snapshot = json.loads(row["snapshot"])
-                except (TypeError, ValueError):
-                    return False
-                if snapshot.get("id"):
-                    snapshots[snapshot["id"]] = snapshot
+                # 老库兜底：同一次合并的版本只差几微秒 → 用时间窗把候选放宽，
+                # 后面再用「内容确实是这次拼接的前缀」逐步验证（下面 _pick_group）。
+                group = db.execute(
+                    "SELECT snapshot FROM versions WHERE kind='fact' AND reason=? "
+                    "AND abs(created-?) <= 5",
+                    (latest["reason"], latest["created"]),
+                ).fetchall()
+            snapshots = _pick_group(group, target)
             base = snapshots.get(fact_id)
             if base is None or len(snapshots) < 2:
-                return False
-            # 目标自那次合并后必须没被人动过（合并只 +1；再改过就放弃）
-            if int(target["revision"]) != int(base.get("revision") or 1) + 1:
                 return False
             sources = [snap for fid, snap in snapshots.items() if fid != fact_id]
             alive = {
