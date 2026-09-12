@@ -1255,34 +1255,57 @@ function applyRefreshMode() {
       }, 2500)
     : null;
 }
-// ---- 主题：选择要记住（首帧前的兜底在 index.html 的内联脚本里）----
+// ---- 主题：用户选过就要守住，别被宿主的桥脚本改回去 ----
+// 宿主把插件页放在 iframe 里，并自动注入 /plugin-bridge.js；那个桥会按**宿主的**主题
+// 反复设置 <html data-theme>（切侧边栏、宿主主题变化都会触发）→ 用户的选择会被瞬间覆盖 ✗
+const THEME_KEY = "alife-theme";
+
 function savedTheme() {
   try {
-    const value = localStorage.getItem("alife-theme");
+    const value = localStorage.getItem(THEME_KEY);
     return value === "dark" || value === "light" ? value : "";
   } catch (err) {
     return "";
   }
 }
+function syncThemeButton(theme) {
+  const button = $("#theme");
+  if (!button) return;
+  button.textContent = theme === "dark" ? "☾" : "☀";
+  const saved = savedTheme();
+  button.title = saved
+    ? theme === "dark"
+      ? "当前：黑夜主题（点击切到明亮）"
+      : "当前：明亮主题（点击切到黑夜）"
+    : "当前跟随宿主主题（点击可固定为" + (theme === "dark" ? "明亮" : "黑夜") + "）";
+  button.setAttribute("aria-label", button.title);
+}
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
-  const button = $("#theme");
-  if (button) {
-    button.textContent = theme === "dark" ? "☾" : "☀";
-    button.title =
-      theme === "dark" ? "当前：黑夜主题（点击切到明亮）" : "当前：明亮主题（点击切到黑夜）";
-    button.setAttribute("aria-label", button.title);
-  }
+  syncThemeButton(theme);
 }
 function initTheme() {
-  // 内联脚本已经设过一次；这里兜底 + 让按钮图标反映当前状态
-  applyTheme(document.documentElement.dataset.theme || savedTheme() || "light");
+  // 内联脚本已经设过一次（避免首帧闪）；这里兜底 + 同步按钮图标
+  applyTheme(savedTheme() || document.documentElement.dataset.theme || "light");
+  // 宿主桥改 data-theme 时：用户明确选过 → 抢回来；没选过 → 跟随宿主，只同步图标
+  new MutationObserver(() => {
+    const saved = savedTheme();
+    const current = document.documentElement.dataset.theme;
+    if (saved) {
+      if (current !== saved) applyTheme(saved);
+    } else {
+      syncThemeButton(current === "dark" ? "dark" : "light");
+    }
+  }).observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ["data-theme"],
+  });
 }
 $("#theme").onclick = () => {
   const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
   applyTheme(next);
   try {
-    localStorage.setItem("alife-theme", next);
+    localStorage.setItem(THEME_KEY, next);
   } catch (err) {
     /* 记不住就只在本次会话生效 */
   }

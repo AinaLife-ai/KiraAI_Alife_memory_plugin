@@ -12,6 +12,7 @@ import importlib
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -120,6 +121,91 @@ class RewriteCase(unittest.TestCase):
         row = self.store.facts("qq:gm:1", "", "", 100, 0, False)[0]
         assert row["rewrite_pending"] == 1
         assert row["rewrite_attempts"] == 0
+
+    def test_backfill_marks_historical_concat_facts(self):
+        """v2.13.0 之前拼接的事实没有标记 → 靠 reason 特征串回填（用户实测漏过）。"""
+        ids = self.seed()
+        self.concat_merge(ids)
+        with self.store.connect() as db:  # 模拟老库：标记从来没打过
+            db.execute("UPDATE facts SET rewrite_pending=0")
+        assert self.store.rewrite_backlog() == 0
+        assert self.store.backfill_rewrite_pending() == 1
+        assert self.store.rewrite_backlog() == 1
+        assert self.store.backfill_rewrite_pending() == 0  # 幂等
+
+    def test_backfill_ignores_other_reasons(self):
+        """正常合并理由（不是降级拼接）绝不能被回填成待重做。"""
+        ids = self.seed()
+        target = self.concat_merge(ids)
+        with self.store.connect() as db:
+            db.execute(
+                "UPDATE versions SET reason='合并重复' WHERE target=? AND reason LIKE '%按时间拼接%'",
+                (target,),
+            )
+            db.execute("UPDATE facts SET rewrite_pending=0")
+        assert self.store.backfill_rewrite_pending() == 0
+
+    def test_unmerge_handles_old_format_version_timestamps(self):
+        """老库的版本是逐条 time.time() 写的（差几微秒）→ 靠时间窗 + 内容包含兜底。"""
+        ids = self.seed()
+        texts = [self.target_row(fid)["content"] for fid in ids]
+        target = self.concat_merge(ids)
+        with self.store.connect() as db:  # 打散成逐条时间戳
+            rows = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT id,created FROM versions WHERE kind='fact' AND target=?", (target,)
+                ).fetchall()
+            ]
+            base = min(r["created"] for r in rows)
+            for index, row in enumerate(rows):
+                db.execute(
+                    "UPDATE versions SET created=? WHERE id=?",
+                    (base + index * 0.0004, row["id"]),
+                )
+        assert self.store.unmerge_fact(target) is True
+        assert self.target_row(ids[1])["deleted"] == 0, "老格式也应当能还原"
+        assert self.target_row(target)["content"] == texts[0]
+
+    def test_unmerge_window_fallback_rejects_foreign_cluster(self):
+        """时间窗里混进的「别的簇」不许被当同组还原（内容没被拼进去 = 不是一伙的）。"""
+        ids = self.seed()
+        target = self.concat_merge(ids)
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            stranger = self.store._add_fact(
+                db,
+                "qq:gm:1",
+                {
+                    "category": "preference",
+                    "subject": "qq:9",
+                    "content": "完全无关的另一批内容",
+                    "reason": "模型输出不可用，按时间拼接",
+                    "scenario": "",
+                    "tags": [],
+                    "relations": [],
+                    "source_ids": [],
+                    "importance": 5,
+                },
+            )
+            db.execute("UPDATE facts SET deleted=1 WHERE id=?", (stranger,))  # 像"已被合并掉"那样
+            row = dict(
+                db.execute("SELECT * FROM facts WHERE id=?", (stranger,)).fetchone()
+            )
+            db.execute(
+                "INSERT INTO versions(kind,target,snapshot,reason,created) "
+                "VALUES ('fact',?,?,?,?)",
+                (
+                    stranger,
+                    json.dumps(row, ensure_ascii=False),
+                    "模型输出不可用，按时间拼接",
+                    time.time(),
+                ),
+            )
+        with self.store.connect() as db:  # 让时间窗兜底生效（打散时间戳）
+            db.execute("UPDATE versions SET created=created+0.0002 WHERE kind='fact' AND target=?", (target,))
+        assert self.store.unmerge_fact(target) is True
+        assert self.target_row(stranger)["deleted"] == 1, "不是同一簇的绝不能被还原"
 
     # ---- 2. 幂等 ------------------------------------------------------------
 

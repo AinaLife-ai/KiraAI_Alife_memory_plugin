@@ -13,10 +13,11 @@ def test_theme_choice_is_persisted_and_restored():
     js = (WEB / "app.js").read_text(encoding="utf-8")
     html = (WEB / "index.html").read_text(encoding="utf-8")
     key = "alife-theme"
-    # 切换时要存
-    assert 'localStorage.setItem("%s"' % key in js, "切换主题必须写入 localStorage"
-    # 启动时要恢复（内联脚本 + 运行期兜底都要认同一个 key）
-    assert js.count('localStorage.getItem("%s")' % key) >= 1
+    # 切换时要存（app.js 里用常量，避免字面量写散）
+    assert 'const THEME_KEY = "%s"' % key in js
+    assert "localStorage.setItem(THEME_KEY" in js, "切换主题必须写入 localStorage"
+    # 启动时要恢复：内联脚本（早于样式表）用字面量，app.js 用同一个常量
+    assert "localStorage.getItem(THEME_KEY)" in js
     assert html.count('localStorage.getItem("%s")' % key) == 1
     # 没选过就跟系统偏好
     assert "prefers-color-scheme: dark" in html, "没选过时应当跟随系统主题"
@@ -50,3 +51,19 @@ def test_boot_screen_uses_theme_variables_only():
     # 扫光必须有明暗两套值
     assert "var(--sheen)" in block
     assert css.count("--sheen:") == 2, "亮色/暗色两个主题各要有一份 --sheen"
+
+
+def test_theme_survives_host_bridge_overwrite():
+    """宿主桥会反复把 data-theme 设成**宿主**的主题（切侧边栏、宿主换主题都会触发）。
+
+    /plugin-bridge.js 是宿主自动注入的，它按 isDark 改 <html data-theme> →
+    用户选的黑夜会被瞬间改回亮色（用户实测报过）。所以：用户选过就抢回来，
+    没选过才跟随宿主。
+    """
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "MutationObserver" in js
+    assert 'attributeFilter: ["data-theme"]' in js
+    assert "savedTheme()" in js, "要靠用户的选择判断该不该抢回来"
+    assert "跟随宿主" in js, "没选过时应说明是跟随宿主"
+    # 抢回来不能造成死循环：只在「当前值 != 用户选择」时才写
+    assert "if (current !== saved) applyTheme(saved)" in js
