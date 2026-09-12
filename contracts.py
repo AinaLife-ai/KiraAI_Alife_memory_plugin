@@ -317,6 +317,12 @@ class Settings(Strict):
     permanent_tidy_days: int = Field(default=14, ge=0, le=3650)
     fact_merge_cross_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
     fact_merge_evidence: bool = True
+    # 轮换槽位：在"同样相关"的候选里，优先把还没被召回过的那几条补进来
+    rotate_enabled: bool = True
+    rotate_count: int = Field(default=3, ge=0, le=20)
+    rotate_keep_rounds: int = Field(default=3, ge=1, le=20)
+    rotate_min_hits: int = Field(default=2, ge=1, le=10)
+    rotate_cooldown_rounds: int = Field(default=10, ge=0, le=100)
     inject_budget_ms: int = Field(default=0, ge=0, le=10000)
     permanent_dedupe_cross_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
     permanent_dedupe: bool = True
