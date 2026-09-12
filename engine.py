@@ -118,6 +118,7 @@ COMPACT_SCHEMAS = {
         '            "source_ids": [str], "importance": 1-10}]}\n'
         '必填：summary；facts 里 category/subject/content/reason/scenario/tags/relations/source_ids。\n'
         '上限：facts ≤12、content ≤60 字、reason ≤40 字、scenario ≤20 字、summary ≤300 字。\n'
+        '字段白名单：只允许上面出现过的键，多任何一个都会被拒。\n'
         '常见错误（会被拒）：把 predicate/object 平铺进事实（必须放 relations）；\n'
         'source_ids 编造或漏抄；content 为空。'
     ),
@@ -127,6 +128,7 @@ COMPACT_SCHEMAS = {
         '             "reason": str, "action": "merge"}]}\n'
         '必填：groups；每组 target_id/source_ids/reason（action=merge 时 content 不能为空）。\n'
         '上限：content 目标 ≤80 字（硬上限 150）、reason ≤15 字（硬上限 40）。\n'
+        '字段白名单：只允许上面出现过的键，多任何一个都会被拒。\n'
         '常见错误（会被拒）：action=merge 但 content 为空；source_ids 里没有要并掉的 id；\n'
         '编造不存在的 id。'
     ),
@@ -137,6 +139,7 @@ COMPACT_SCHEMAS = {
         '              "relations": [{"subject","predicate","object"}]}]}\n'
         '必填：actions；每项 action/target_id/source_ids/content/reason。\n'
         '上限：reason ≤40 字。\n'
+        '字段白名单：只允许上面出现过的键，多任何一个都会被拒。\n'
         '常见错误（会被拒）：目标 id 不在输入里；keep/correct/retract 却给了别的 id；\n'
         '编造 target_id 或 source_ids。'
     ),
