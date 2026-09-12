@@ -324,6 +324,10 @@ python tools/web_audit.py                 # 前端静态审计：属性读写配
 | ① | **dedupe 完成后跟一次 tidy** | 本次 `merged > 0`（**真的合并了**才跟，避免空转 ✗）|
 | ② | **注入侧超重时**（现有）| 排 tidy ✓ **同时排一次 dedupe** ✓（超重往往是重复项堆出来的，顺手清老根 ✓）|
 | ③ | **定时器周期体检**（新增）| 不超重、但存在 `tidy_at` 早于 `permanent_tidy_days`（14 天）的永久记忆 → 也排 tidy ✓ |
+| ④ | **写下永久记忆后**（新增）| Bot 每次 `Memorize` 成功后**直接排一次 tidy** ✓（哪怕没触发去重 ✓）——新开关 `permanent_tidy_on_write` **默认开** ✓ |
+
+④ 的开销很小：刚写入的那条本来就是"待整理项" ✓，旧记录在 `permanent_tidy_days` 内会被跳过 ✓
+所以实际工作就是"把刚记下的这条过一遍"（判断该不该常驻 / 能否提炼成事实）✓
 
 **为什么①的顺序重要**：先合并、再整理 → tidy 看到的是**更小更干净**的集合 ✓
 提炼/移出的判断更准 ✓ 输入 token 也更少 ✓（反过来会让两者重复处理同一批 ✗）
@@ -331,7 +335,7 @@ python tools/web_audit.py                 # 前端静态审计：属性读写配
 **防乒乓**：①只在"有改动"时跟 ✓ ②只在超重信号下排 ✓ ③不反向叫 dedupe ✗
 加上 `jobs` 表按 `kind+sid` 去重 ✓ 不会循环 ✓
 
-**零新配置** ✓：复用 `permanent_tidy_enabled` / `permanent_dedupe` / `permanent_tidy_days` ✓
+**配置**：①②③ 复用现有开关 ✓；④ 新增 `permanent_tidy_on_write`（默认开 ✓）
 （`permanent_tidy_days` 语义扩展为"至少多久整理一次"，设置页说明同步 ✓）
 
 **测试**：默认 332 passed 14 skipped；KIRA_CORE 382 passed；web_audit 0
