@@ -1293,7 +1293,7 @@ async def test_situational_injection_pins_commitments_and_triggers_on_mention(tm
         assert "另一个人喜欢甜食" not in contents
         keys = set(plain["facts"][0])
         assert {"c", "u", "x"} <= keys and keys <= {
-            "c", "u", "x", "src", "t", "imp", "rel"
+            "c", "u", "x", "src", "t", "t2", "rec", "imp", "rel"
         }, "注入块只放短键，空字段与默认值一律省略"
 
         mentioned = await _injected_block(plugin, make_text_event("萤火最近怎么样"))

@@ -76,7 +76,11 @@ MEMORY_RULES = (
     "同名不代表同一人：不同账号是不同的人，改称呼或合并前先核对证据。"
     "needs_review 的关系只是待核对的历史描述，不可作为确定关系。"
     "事实字段短键：c=类别代码（ev=经历 fa=事实 pr=偏好 co=约定 re=关系 pf=画像 rs=资源 sf=自我），"
-    "u=主体实体ID，x=内容，imp=重要度（省略即5），src=来源存档ID，t=日期；"
+    "u=主体实体ID，x=内容，imp=重要度（省略即5），src=来源存档ID；"
+    "t=**事件发生日期**（这条事实讲的事发生在什么时候，跨天会给 t2 作为区间），"
+    "rec=记录日期（只在「事情发生」与「被记下来」差得远时出现，二者不是一回事）；"
+    "要精确到分钟或核对原话，就把 src 当 id 交给 SearchMemoryArchive 读原文（原文自带精确时间戳）；"
+    "存档条目另有 sp=这句是谁说的（群聊里据此区分谁说了哪句）；"
     "names 是「完整账号/群号 → 名称」，汇报或核对身份时从这里取。"
     "历史摘要不是本轮回答模板，结合近期已说过的话去重；用户追问还有别的时用 "
     "SearchMemoryArchive(next_batch=true) 找新证据，没找到就坦诚说明，不反复复述或编造。"
@@ -148,6 +152,22 @@ def event_sid(event):
         return value
     session = getattr(event, "session", None)
     return getattr(session, "sid", "") or ""
+
+
+def speaker_of(message):
+    """这条消息是谁发的（显示名；没有昵称就退回账号 id）。
+
+    没有它，群聊里几条消息被合并成一条记录时，模型就分不清哪句是谁说的 ✗
+    （`users` 是"可见范围"，不是"发言人" ✗）
+    """
+    sender = getattr(message, "sender", None)
+    if sender is None:
+        return ""
+    name = str(getattr(sender, "nickname", "") or "").strip()
+    user_id = str(getattr(sender, "user_id", "") or "").strip()
+    if user_id == "unknown":
+        user_id = ""
+    return name or user_id
 
 
 def user_ids(event):
@@ -641,9 +661,25 @@ class AlifeMemoryPlugin(BasePlugin):
                 self._access_seen.pop(key, None)
         return fresh
 
+    async def backfill_time_provenance(self):
+        """后台给存量数据补「事件时间」与「发言人」（分批、幂等、不阻塞启动）。"""
+        try:
+            total = 0
+            for _ in range(500):  # 兜底上限，避免异常时空转
+                filled = await self.store.call("backfill_time_provenance")
+                total += filled
+                if not filled:
+                    break
+                await asyncio.sleep(0.02)
+            if total:
+                logger.info("[记忆·Z] 存量时间/发言人回填：%s 条记录", total)
+        except Exception as exc:
+            logger.warning("[记忆·Z] 存量时间/发言人回填失败（下次启动会重试）：%s", exc)
+
     async def build_search_index(self):
         """后台把检索索引补齐（存量用户首次升级时用；不阻塞启动）。"""
         await self.scrub_capture_text()
+        await self.backfill_time_provenance()
         if self.store.search_index_state() == "unavailable":
             logger.info("[记忆·Z] 本机 SQLite 无 FTS5，检索走全表（功能不受影响）")
             return
@@ -1266,6 +1302,9 @@ class AlifeMemoryPlugin(BasePlugin):
                     "t": short_time(r["end"] or r["start"]),
                     "s": self.model_text(r["summary"], keep_names),
                 }
+                if r["speaker"]:
+                    # 这条是谁说的：正文里不一定带名字，模型否则分不清谁说了哪句 ✗
+                    item["sp"] = self.model_text(r["speaker"], keep_names)
                 if not r["active"]:
                     item["arch"] = 1
                 if r["sid"] and r["sid"] != sid:
@@ -1375,6 +1414,8 @@ class AlifeMemoryPlugin(BasePlugin):
                 "t": short_time(row["end"] or row["start"]),
                 "s": self.model_text(row["summary"], keep_names),
             }
+            if row["speaker"]:
+                packed["sp"] = self.model_text(row["speaker"], keep_names)
             if row["role"] == "assistant":
                 packed["bot"] = 1
             if row["permanent"]:
@@ -1528,6 +1569,8 @@ class AlifeMemoryPlugin(BasePlugin):
                     "content": content,
                     "time": float(message.timestamp),
                     "users": users,
+                    # 这条是谁说的（实体 id）：群聊里模型必须能分清谁说了哪句
+                    "speaker": speaker_of(message),
                 }
             )
         if incoming:
@@ -1839,6 +1882,8 @@ class AlifeMemoryPlugin(BasePlugin):
                     "t": short_time(r["end"] or r["start"]),
                     "s": self.model_text(r["summary"], keep_names),
                 }
+                if r["speaker"]:
+                    item["sp"] = self.model_text(r["speaker"], keep_names)
                 if r["role"] == "assistant":
                     item["bot"] = 1
                 if not r["active"]:

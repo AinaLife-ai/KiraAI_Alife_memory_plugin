@@ -117,6 +117,7 @@ def test_read_archive_projection_avoids_double_encoded_batch_and_pages_ids():
         end=2.0,
         summary="摘要",
         users=[],
+        speaker="小明",
         revision=1,
         permanent=0,
         content=content,

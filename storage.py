@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import logging
 import math
 import random
@@ -151,6 +152,7 @@ class Store:
         self._fts_stats = {"filled": 0, "plain": 0}  # 本次补齐 / 其中无可检索文字
         self._fts_stale = False  # 索引体口径与当前代码不同（需后台重算）
         self._scrub_cursor = 0  # 存量清洗的扫描游标
+        self._time_cursor = 0  # 时间/发言人存量回填的扫描游标
         self._scrub_stats = {"changed": 0, "emptied": 0}
         self.path = path
 
@@ -205,6 +207,8 @@ class Store:
               id TEXT PRIMARY KEY, sid TEXT NOT NULL, role TEXT NOT NULL,
               level INTEGER NOT NULL, start REAL NOT NULL, end REAL NOT NULL,
               summary TEXT NOT NULL, content TEXT NOT NULL, users TEXT NOT NULL,
+              -- speaker：这条是谁说的（显示名）。users 是"可见范围"，别混用 ✗
+              speaker TEXT NOT NULL DEFAULT '',
               active INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0,
               revision INTEGER NOT NULL DEFAULT 1, permanent INTEGER NOT NULL DEFAULT 0,
               position INTEGER NOT NULL, event_key TEXT UNIQUE, created REAL NOT NULL,
@@ -222,7 +226,11 @@ class Store:
               audited REAL NOT NULL DEFAULT 0, importance INTEGER NOT NULL DEFAULT 5,
               merge_pending INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL DEFAULT 0,
               rewrite_pending INTEGER NOT NULL DEFAULT 0,
-              rewrite_attempts INTEGER NOT NULL DEFAULT 0);
+              rewrite_attempts INTEGER NOT NULL DEFAULT 0,
+              -- 事件时间区间（来源记录的时间跨度）。注意 created 是"入库时刻"，
+              -- 两者不是一回事 ✗：今天整理出一周前的事，created=今天、event_at=那天。
+              event_at REAL NOT NULL DEFAULT 0,
+              event_end REAL NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS fact_identity ON facts(sid,subject,fingerprint,deleted);
             CREATE INDEX IF NOT EXISTS fact_subject ON facts(sid,subject,category,deleted);
             -- 注意：依赖新增列的索引必须放在下面的 ALTER 迁移**之后**建，
@@ -305,6 +313,11 @@ class Store:
                 db.execute(
                     "ALTER TABLE records ADD COLUMN tidy_at REAL NOT NULL DEFAULT 0"
                 )
+            if "speaker" not in columns:
+                # 这条是谁说的（显示名）。users 是"可见范围"，不是同义词 ✗
+                db.execute(
+                    "ALTER TABLE records ADD COLUMN speaker TEXT NOT NULL DEFAULT ''"
+                )
             if "search_body" not in columns:
                 db.execute(
                     "ALTER TABLE records ADD COLUMN search_body TEXT NOT NULL DEFAULT ''"
@@ -331,6 +344,14 @@ class Store:
             if "rewrite_attempts" not in fact_columns:
                 db.execute(
                     "ALTER TABLE facts ADD COLUMN rewrite_attempts INTEGER NOT NULL DEFAULT 0"
+                )
+            if "event_at" not in fact_columns:
+                # 事件时间区间（来源记录的时间跨度）；created 是"入库时刻"
+                db.execute(
+                    "ALTER TABLE facts ADD COLUMN event_at REAL NOT NULL DEFAULT 0"
+                )
+                db.execute(
+                    "ALTER TABLE facts ADD COLUMN event_end REAL NOT NULL DEFAULT 0"
                 )
             if "created" not in fact_columns:
                 db.execute(
@@ -501,6 +522,74 @@ class Store:
         self._scrub_stats["changed"] += len(updates)
         self._scrub_stats["emptied"] += len(emptied)
         return False
+
+    def backfill_time_provenance(self, batch=300):
+        """存量迁移：给老数据补上「事件时间」与「发言人」。
+
+        - `facts.event_at/event_end`：按 `sources` 里那些存档记录的 start 取最小/最大值
+          （纯 SQL，一次搞定）。老库这个字段是空的，不补的话注入里就没有时间 ✗
+        - `records.speaker`：显示名。优先用 `users` 里唯一的那个人；否则从正文开头的
+          `[名字] ` 前缀里取（宿主渲染常常带这个前缀）。分批做，因为要查一次名字映射。
+
+        幂等：只动 `event_at=0` / `speaker=''` 的行。返回本次补了多少条记录。
+        """
+        with self.connect() as db:
+            db.execute(
+                "UPDATE facts SET"
+                " event_at=coalesce((SELECT min(r.start) FROM records r,"
+                "   json_each(facts.sources) s WHERE r.id=s.value),0),"
+                " event_end=coalesce((SELECT max(r.start) FROM records r,"
+                "   json_each(facts.sources) s WHERE r.id=s.value),0)"
+                " WHERE event_at=0 AND sources<>'[]'"
+            )
+            rows = db.execute(
+                "SELECT rowid,id,users,content FROM records"
+                " WHERE speaker='' AND role='user' AND rowid > ? LIMIT ?",
+                (self._time_cursor, int(batch)),
+            ).fetchall()
+            if rows:
+                self._time_cursor = rows[-1]["rowid"]
+        if not rows:
+            return 0
+        wanted = set()
+        for row in rows:
+            try:
+                users = json.loads(row["users"] or "[]")
+            except (TypeError, ValueError):
+                users = []
+            if len(users) == 1 and users[0]:
+                wanted.add(str(users[0]))
+        names = {}
+        if wanted:
+            with self.connect() as db:
+                names = {
+                    row["id"]: (row["name"] or "").strip()
+                    for row in db.execute(
+                        "SELECT id,name FROM entities WHERE id IN (%s)"
+                        % ",".join("?" * len(wanted)),
+                        sorted(wanted),
+                    ).fetchall()
+                }
+        updates = []
+        for row in rows:
+            try:
+                users = json.loads(row["users"] or "[]")
+            except (TypeError, ValueError):
+                users = []
+            speaker = ""
+            if len(users) == 1:
+                speaker = names.get(str(users[0]), "") or ""
+            if not speaker:
+                match = re.match(r"\s*[\[【]([^\]】\n]{1,24})[\]】]", row["content"] or "")
+                speaker = (match.group(1).strip() if match else "") or ""
+            if speaker:
+                updates.append((speaker, row["id"]))
+        if updates:
+            with self.connect() as db:
+                db.executemany(
+                    "UPDATE records SET speaker=? WHERE id=?", updates
+                )
+        return len(updates)
 
     def prepare_capture_scrub(self):
         """是否还需要跑一次存量清洗（口径版本记在 meta 里，升级后会自动再跑一次）。
@@ -965,8 +1054,9 @@ class Store:
                 summary = msg.get("summary") or msg["content"]
                 db.execute(
                     """INSERT OR IGNORE INTO records
-                  (id,sid,role,level,start,end,summary,content,users,position,event_key,created,search_body)
-                  VALUES (?,?,?,0,?,?,?,?,?,?,?,?,?)""",
+                  (id,sid,role,level,start,end,summary,content,users,speaker,
+                   position,event_key,created,search_body)
+                  VALUES (?,?,?,0,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         uid(),
                         sid,
@@ -976,6 +1066,8 @@ class Store:
                         summary,
                         msg["content"],
                         dump(msg["users"]),
+                        # 这条是谁说的（显示名）：读原文时模型必须能分清谁说了哪句
+                        str(msg.get("speaker") or ""),
                         pos,
                         f"{sid}:{event_key}:{index}",
                         time.time(),
@@ -1621,9 +1713,22 @@ class Store:
                 dump(fact["source_ids"]),
                 fingerprint,
                 int(fact.get("importance", 5)),
-                time.time(),
+                time.time(),  # created = 入库时刻（不是事件时间 ✗）
             ),
         )
+        # 事件时间区间：取来源记录的时间跨度（没有来源就留 0）
+        ids = [str(x) for x in (fact.get("source_ids") or []) if x]
+        if ids:
+            span = db.execute(
+                "SELECT min(start) AS a, max(start) AS b FROM records WHERE id IN (%s)"
+                % ",".join("?" * len(ids)),
+                ids,
+            ).fetchone()
+            if span and span["a"]:
+                db.execute(
+                    "UPDATE facts SET event_at=?, event_end=? WHERE id=?",
+                    (float(span["a"]), float(span["b"] or span["a"]), new_id),
+                )
         return new_id
 
     # ---- 短码：给模型看的证据编码 ----------------------------------------
@@ -3056,6 +3161,7 @@ class Store:
             db.execute(
                 "UPDATE facts SET sid=?, content=?, reason=?, scenario=?, tags=?,"
                 " relations=?, sources=?, importance=?, fingerprint=?,"
+                " event_at=?, event_end=?,"
                 " merge_pending=1, rewrite_pending=0,"
                 " rewrite_attempts=rewrite_attempts+1, revision=revision+1"
                 " WHERE id=?",
@@ -3069,6 +3175,8 @@ class Store:
                     base.get("sources") or "[]",
                     int(base.get("importance") or 5),
                     base.get("fingerprint") or "",
+                    float(base.get("event_at") or 0),
+                    float(base.get("event_end") or 0),
                     fact_id,
                 ),
             )
@@ -3128,9 +3236,17 @@ class Store:
                     "VALUES ('fact',?,?,?,?)",
                     (k, dump(dict(rows[k])), reason, merged_at),
                 )
+            # 事件时间区间取并集：合并多个时间点的事实不该"塌成一点" ✗
+            spans = [
+                (float(rows[k]["event_at"] or 0), float(rows[k]["event_end"] or 0))
+                for k in group
+            ]
+            starts = [a for a, _ in spans if a] or [float(rows[target_id]["event_at"] or 0)]
+            ends = [b for _, b in spans if b] or starts
             db.execute(
                 "UPDATE facts SET sid=?,content=?,sources=?,tags=?,relations=?,"
-                "importance=?,merge_pending=0,fingerprint=?,revision=revision+1 WHERE id=?",
+                "importance=?,merge_pending=0,fingerprint=?,event_at=?,event_end=?,"
+                "revision=revision+1 WHERE id=?",
                 (
                     target_sid,
                     content,
@@ -3139,6 +3255,8 @@ class Store:
                     dump(list(relations.values())),
                     importance,
                     uid(),
+                    min(starts),
+                    max(ends),
                     target_id,
                 ),
             )

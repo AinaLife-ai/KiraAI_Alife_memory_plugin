@@ -54,9 +54,10 @@ class BotFactsTests(unittest.TestCase):
         self.assertEqual(set(view), {"c", "u", "x", "imp", "src", "t"})
         self.assertEqual(view["c"], "pr")  # 类别用短码，图例在静态规则块里
         self.assertEqual(view["src"], "rec-1")
-        self.assertEqual(
-            view["t"], time.strftime("%m-%d", time.localtime(1700000000.0))
-        )  # 事实只需要月-日
+        # 日期短码：同年只给月-日，跨年才补上年份（1700000000 是 2023 年，所以带年）
+        self.assertTrue(view["t"].endswith("11-15"), view["t"])
+        self.assertNotIn("t2", view)  # 单点事件不给区间
+        self.assertNotIn("rec", view)  # 记录时刻与事件时间相同就不重复说
         # 本会话事实不再重复 sid/by
         self.assertNotIn("sid", view)
 
@@ -66,6 +67,24 @@ class BotFactsTests(unittest.TestCase):
         )[0]
         self.assertEqual(view["sid"], "global")
         self.assertEqual(view["by"], "qq:other")
+
+    def test_event_span_and_record_time_are_separate(self):
+        """跨天合并要显示区间；"记下来"和"发生"差得远时额外标出来。"""
+        day = 86400.0
+        view = r.bot_facts(
+            [
+                fact(
+                    event_at=1700000000.0,
+                    event_end=1700000000.0 + 3 * day,
+                    created=1700000000.0 + 30 * day,
+                )
+            ],
+            "qq:dm:u",
+        )[0]
+        self.assertIn("t", view)
+        self.assertIn("t2", view)  # 区间
+        self.assertIn("rec", view)  # 30 天后才整理出来的
+        self.assertEqual(r.short_day(1700000000.0), view["t"])
 
     def test_needs_review_only_when_flagged(self):
         self.assertNotIn("rev", r.bot_facts([fact()], "qq:dm:u")[0])
