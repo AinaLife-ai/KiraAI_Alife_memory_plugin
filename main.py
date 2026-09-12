@@ -1585,6 +1585,9 @@ class AlifeMemoryPlugin(BasePlugin):
             if len(perms) > cfg.permanent_cap or perm_chars > cfg.permanent_budget_chars:
                 for owner in sorted({row["sid"] for row in perms if row["sid"]}):
                     await self.engine.enqueue("tidy", owner, automatic=True)
+                    # 超重往往是"重复项堆出来的" → 顺手把去重也排上（清老根 ✓）
+                    if self.settings.permanent_dedupe:
+                        await self.engine.enqueue("dedupe", owner, automatic=True)
         fresh = self._mark_access([row["id"] for row in perms])
         if fresh:
             await self.store.call("touch_accessed", fresh)

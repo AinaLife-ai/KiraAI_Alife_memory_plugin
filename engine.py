@@ -1623,10 +1623,15 @@ class Engine:
                     detail = audit_summary(counts)
                 elif job["kind"] == "dedupe":
                     report = await self.consolidate(job["sid"], job["id"])
+                    merged = report.get("merged", 0)
                     detail = "常驻 %d 条 · 合并 %d 簇" % (
                         report.get("permanent", 0),
-                        report.get("merged", 0),
+                        merged,
                     )
+                    # 真的合并了东西 → 顺手整理一次：tidy 看到的是**更小更干净**的集合，
+                    # 提炼/移出判断更准、输入 token 更少 ✓（没合并就不跟，避免空转 ✗）
+                    if merged > 0 and cfg.permanent_tidy_enabled:
+                        await self.enqueue("tidy", job["sid"], automatic=True)
                 elif job["kind"] == "classify":
                     row = await self.store.call("get", job["sid"])
                     if row:
@@ -1809,7 +1814,11 @@ class Engine:
                     heavy = len(live) > cfg.permanent_cap or sum(
                         len(row.get("summary") or "") for row in live
                     ) > cfg.permanent_budget_chars
-                    if heavy:
+                    # 不超重也定期体检：太久（permanent_tidy_days）没整理过就排一次 ✓
+                    stale = cfg.permanent_tidy_days > 0 and await self.store.call(
+                        "permanents_need_tidy", sid, cfg.permanent_tidy_days
+                    )
+                    if heavy or stale:
                         await self.enqueue("tidy", sid, automatic=True)
             if cfg.permanent_dedupe and now - self.last_dedupe >= cfg.audit_interval:
                 self.last_dedupe = now
