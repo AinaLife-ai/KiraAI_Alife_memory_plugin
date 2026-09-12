@@ -48,6 +48,7 @@ from .retrieval import (
     clean_text,
     short_time,
     squeeze,
+    overlap_hit,
     strip_reasoning,
     trim_nested,
     TOOL_RESULT_PREFIX,
@@ -241,6 +242,8 @@ class AlifeMemoryPlugin(BasePlugin):
         self._access_seen = {}
         self._memo = {}
         self._prewarm_seen = {}
+        # 轮换槽位：每个会话一批「相关但还没召回过的」记忆（v2.15.0）
+        self.rotation = {}
         self._bootstrap_review_logged = False
         self.bootstrap_review = {}
 
@@ -757,6 +760,101 @@ class AlifeMemoryPlugin(BasePlugin):
             self._memo.clear()  # 简单有界：满了就整体丢弃，避免无界增长
         self._memo[key] = (revision, value)
         return value
+
+    # ---- 轮换槽位（v2.15.0）--------------------------------------------------
+    def rotation_state(self, sid):
+        state = self.rotation.get(sid)
+        if state is None:
+            if len(self.rotation) > 64:  # 有界：丢掉最久没动过的
+                oldest = min(self.rotation, key=lambda k: self.rotation[k].get("touch", 0))
+                self.rotation.pop(oldest, None)
+            state = {
+                "rows": [], "texts": {}, "rounds": 0, "next": True,
+                "cooldown": {}, "touch": time.monotonic(),
+            }
+            self.rotation[sid] = state
+        state["touch"] = time.monotonic()
+        return state
+
+    async def rotation_extras(self, sid, cfg, pool, seen_key, text_of):
+        """轮换槽位：从「同样过门槛、但没被选中」的候选里补几条。
+
+        - 池子空了 → 留空（**不**降门槛、不拿不相关的凑数）
+        - 上一批没被用到 → 原样再留几轮（最多 rotate_keep_rounds）
+        - 被用到（或留满）→ 换下一批；下场的那批进入冷却
+        """
+        if not cfg.rotate_enabled or cfg.rotate_count <= 0:
+            return []
+        state = self.rotation_state(sid)
+        state["cooldown"] = {
+            rid: left - 1 for rid, left in state["cooldown"].items() if left - 1 > 0
+        }
+        if not state["next"]:
+            state["rounds"] += 1
+            return list(state["rows"])  # 继续留：同一批再摆一轮
+        seen = self.seen_window.get(seen_key)
+        banned = set(seen.get("ids") or [])
+        candidates = [
+            row
+            for row in pool
+            if row.get("id") and row["id"] not in banned
+            and state["cooldown"].get(row["id"], 0) <= 0
+        ]
+        if not candidates:  # 池子空了：这轮留空（但不改 next，下一轮还要再试）
+            state.update({"rows": [], "texts": {}, "ids": [], "rounds": 0})
+            return []
+        ids = await self.store.call(
+            "rotation_pick", [row["id"] for row in candidates], cfg.rotate_count
+        )
+        chosen = [row for row in candidates if row["id"] in set(ids)]
+        if not chosen:
+            return []
+        state.update(
+            {
+                "rows": chosen,
+                "texts": {row["id"]: text_of(row) for row in chosen},
+                "ids": [row["id"] for row in chosen],
+                "rounds": 0,
+                "next": False,
+            }
+        )
+        for row in chosen:
+            state["cooldown"][row["id"]] = cfg.rotate_cooldown_rounds
+        # 进 seen：下一轮它们就不再算"没给过"，也不会被当成主召回的重复项
+        self.seen_window.remember(seen_key, "", [row["id"] for row in chosen])
+        await self.store.call("mark_rotation", [row["id"] for row in chosen], [])
+        logger.info(
+            "[记忆·Z] 轮换槽位：注入 %s 条（%s）",
+            len(chosen),
+            "、".join(self.model_text(row.get("summary") or row.get("content") or "", ())[:14]
+                      for row in chosen),
+        )
+        return chosen
+
+    async def rotation_feedback(self, sid, reply):
+        """看她这轮有没有真的"用上"轮换进来的记忆 → 决定下轮换不换批。"""
+        state = self.rotation.get(sid)
+        if not state or state.get("next") or not state.get("ids"):
+            return
+        cfg = self.settings
+        hits = [
+            rid
+            for rid, text in (state.get("texts") or {}).items()
+            if overlap_hit(text, reply, cfg.rotate_min_hits)
+        ]
+        if hits:
+            await self.store.call("mark_rotation", [], hits)
+            state["next"] = True  # 用到了 → 下轮换批
+            state["rounds"] = 0
+            logger.info("[记忆·Z] 轮换槽位：命中 %s/%s 条 → 下轮换批", len(hits), len(state["ids"]))
+            return
+        # 没被用到：这轮算一次"留守"，累加到上限就换批
+        state["rounds"] = int(state.get("rounds") or 0) + 1
+        if state["rounds"] >= cfg.rotate_keep_rounds:
+            state["next"] = True
+            logger.info(
+                "[记忆·Z] 轮换槽位：留满 %s 轮没被用到 → 换批", state["rounds"]
+            )
 
     async def prewarm(self, sid, users, scope):
         """预热：把「不随消息变化」的部分提前算进缓存。
@@ -1282,6 +1380,31 @@ class AlifeMemoryPlugin(BasePlugin):
                 prefer,
                 allow_content_match=not over_budget,
             )
+        if cfg.rotate_enabled and cfg.rotate_count > 0 and cfg.fact_recall_min_score:
+            # 轮换槽位（事实）：同一个门槛、同一套词面匹配，只取"还没召回过"的
+            fact_pool = await self.store.call(
+                "facts",
+                sid,
+                subject="",
+                category="",
+                limit=cfg.rotate_count * 4,
+                offset=0,
+                global_scope=cfg.recall_scope == "global",
+                users=users,
+                include_shared=True,
+                hide_pending=cfg.merge_pending_hide,
+                lexical=query,
+                min_score=cfg.fact_recall_min_score,
+                **prefer,
+            )
+            if fact_pool:
+                facts = facts + await self.rotation_extras(
+                    sid,
+                    cfg,
+                    fact_pool,
+                    recall_key,
+                    lambda r: str(r.get("content") or ""),
+                )
         related, related_rows, related_shorts = [], [], {}
         if cfg.recall_scope != "session" and query.strip() and not over_budget:
             reach = cfg.top_k * (2 if keyword_hit else 1)
@@ -1298,7 +1421,18 @@ class AlifeMemoryPlugin(BasePlugin):
                 **prefer,
             )
             local_ids = {r["id"] for r in rows}
-            related_rows = [r for r in matches["items"] if r["id"] not in local_ids][:reach]
+            fresh = [r for r in matches["items"] if r["id"] not in local_ids]
+            related_rows = fresh[:reach]
+            # 轮换槽位（档案）：从"同样过门槛、但没进主召回"的候选里补几条
+            archive_pool = [r for r in fresh[reach:] if r.get("id")]
+            if archive_pool:
+                related_rows = related_rows + await self.rotation_extras(
+                    sid,
+                    cfg,
+                    archive_pool,
+                    recall_key,
+                    lambda r: str(r.get("summary") or r.get("content") or ""),
+                )
             related_shorts = await self.shortmap(
                 [r["id"] for r in related_rows]
                 + [r["sid"] for r in related_rows if r["sid"] != sid]
@@ -1595,6 +1729,8 @@ class AlifeMemoryPlugin(BasePlugin):
             summary = (
                 (summary + "\n" if summary else "") + tool_call_summary(response.tool_calls)
             )
+        # 轮换槽位的反馈：这轮回复有没有"用上"轮换进来的记忆（空回复也算没用上）
+        await self.rotation_feedback(sid, text)
         if content:
             await self.store.call(
                 "capture",

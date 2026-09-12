@@ -416,6 +416,36 @@
         "default": 0.35,
         "description": "同一条信息在私聊记过、群里又记一次时靠它发现。跨会话相似度要达到这个值才进入合并判定（同会话仍是 0.25）；比同会话更保守，因为不同会话的说法差异更大。"
       },
+      "rotate_enabled": {
+        "type": "bool",
+        "name": "轮换召回槽位",
+        "default": true,
+        "description": "开启后，在「相关性过门槛、但还没被召回过」的记忆里额外挑几条补进本轮上下文。门槛与主召回完全相同（所以它们一样是相关的，看起来也不突兀）；池子空了就留空，不会拿不相关的凑数。"
+      },
+      "rotate_count": {
+        "type": "integer",
+        "name": "轮换槽位条数",
+        "default": 3,
+        "description": "每批额外补几条。它们和普通召回长得一样、同样过门槛。"
+      },
+      "rotate_keep_rounds": {
+        "type": "integer",
+        "name": "轮换保留轮数",
+        "default": 3,
+        "description": "这一批一直没被用到时最多再留几轮；一旦被用到（回复里出现它的独特词元）就立刻换下一批。"
+      },
+      "rotate_min_hits": {
+        "type": "integer",
+        "name": "轮换命中阈值",
+        "default": 2,
+        "description": "判定「被用到了」需要几个词元重合；记忆里含 QQ 号/数字这类独特词元时，命中 1 个即算。"
+      },
+      "rotate_cooldown_rounds": {
+        "type": "integer",
+        "name": "轮换冷却轮数",
+        "default": 10,
+        "description": "被换下场的记忆多少轮内不再参与轮换，避免同一批反复抖动。"
+      },
       "inject_budget_ms": {
         "type": "integer",
         "name": "每轮注入时间预算（毫秒）",

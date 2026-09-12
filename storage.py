@@ -209,6 +209,9 @@ class Store:
               summary TEXT NOT NULL, content TEXT NOT NULL, users TEXT NOT NULL,
               -- speaker：这条是谁说的（显示名）。users 是"可见范围"，别混用 ✗
               speaker TEXT NOT NULL DEFAULT '',
+              -- 轮换槽位的记账：展示过几次 / 被真正用到几次（用于排序与冷却）
+              rotate_shown INTEGER NOT NULL DEFAULT 0,
+              rotate_used INTEGER NOT NULL DEFAULT 0,
               active INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0,
               revision INTEGER NOT NULL DEFAULT 1, permanent INTEGER NOT NULL DEFAULT 0,
               position INTEGER NOT NULL, event_key TEXT UNIQUE, created REAL NOT NULL,
@@ -317,6 +320,13 @@ class Store:
                 # 这条是谁说的（显示名）。users 是"可见范围"，不是同义词 ✗
                 db.execute(
                     "ALTER TABLE records ADD COLUMN speaker TEXT NOT NULL DEFAULT ''"
+                )
+            if "rotate_shown" not in columns:
+                db.execute(
+                    "ALTER TABLE records ADD COLUMN rotate_shown INTEGER NOT NULL DEFAULT 0"
+                )
+                db.execute(
+                    "ALTER TABLE records ADD COLUMN rotate_used INTEGER NOT NULL DEFAULT 0"
                 )
             if "search_body" not in columns:
                 db.execute(
@@ -3060,6 +3070,58 @@ class Store:
                 (FALLBACK_REASON_MARK,),
             )
             return int(cursor.rowcount or 0)
+
+    def mark_rotation(self, shown_ids=(), used_ids=()):
+        """轮换槽位记账：展示过 +N、被用过 +M（用于排序、冷却与观测）。"""
+        shown = [str(i) for i in (shown_ids or []) if i]
+        used = [str(i) for i in (used_ids or []) if i]
+        with self.connect() as db:
+            if shown:
+                db.executemany(
+                    "UPDATE records SET rotate_shown=rotate_shown+1 WHERE id=?",
+                    [(i,) for i in shown],
+                )
+            if used:
+                db.executemany(
+                    "UPDATE records SET rotate_used=rotate_used+1 WHERE id=?",
+                    [(i,) for i in used],
+                )
+        return len(shown) + len(used)
+
+    def rotation_pick(self, ids, limit):
+        """从给定的候选 id 里挑下一批轮换条目（排序即"学习"）。
+
+        优先级：
+        ① 从没展示过的优先
+        ② 展示过但 **用过/展示** 比例高的优先（历史证明有用）
+        ③ 展示次数少的优先，同次数按 id 稳定排序（可复现）
+        """
+        wanted = [str(i) for i in (ids or []) if i]
+        if not wanted or limit <= 0:
+            return []
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT id,rotate_shown,rotate_used FROM records WHERE id IN (%s)"
+                % ",".join("?" * len(wanted)),
+                wanted,
+            ).fetchall()
+        stats = {
+            row["id"]: (int(row["rotate_shown"] or 0), int(row["rotate_used"] or 0))
+            for row in rows
+        }
+        # 保持调用方给的候选顺序（那本身就是相关性排序）作为最后的稳定键
+        order = {rid: index for index, rid in enumerate(wanted)}
+
+        def key(rid):
+            shown, used = stats.get(rid, (0, 0))
+            return (
+                0 if shown == 0 else 1,          # ① 没展示过的优先
+                -(used / shown) if shown else 0,  # ② 用过比例高的优先
+                shown,                            # ③ 展示次数少的优先
+                order.get(rid, 0),
+            )
+
+        return sorted(wanted, key=key)[: int(limit)]
 
     def mark_rewrite_pending(self, fact_ids, pending=1):
         """给「降级拼接」出来的事实打/清待重做标记（不动其它任何字段）。"""

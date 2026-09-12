@@ -701,6 +701,32 @@ def short_day(ts):
     return time.strftime("%Y-%m-%d", stamp)
 
 
+def overlap_hit(text, reply, min_hits=2):
+    """这轮回复里有没有"用上"这条记忆？（轮换槽位的反馈信号）
+
+    - 普通情况：词元重合数 >= min_hits
+    - 独特词元（连续数字，如 QQ 号/编号）：命中 1 个即算（几乎不可能碰巧出现）
+    """
+    if not text or not reply:
+        return False
+    tokens = {t for t in query_tokens(text) if len(t) >= 2}
+    if not tokens:
+        return False
+    body = squeeze(reply).casefold()
+    hits = sum(1 for token in tokens if token in body)
+    if hits >= max(1, int(min_hits)):
+        return True
+    for token in tokens:
+        if token.isdigit() and len(token) >= 5 and token in body:
+            return True
+    # 长数字串（QQ 号/编号）：从原文里直接抓，出现即算命中
+    body = squeeze(reply).casefold()
+    for chunk in re.findall(r"\d{5,}", str(text)):
+        if chunk in body:
+            return True
+    return False
+
+
 def bot_facts(facts, current_sid="", short=None):
     """给 Bot 看的精简事实视图：只留判断与追溯必需的字段。
 
