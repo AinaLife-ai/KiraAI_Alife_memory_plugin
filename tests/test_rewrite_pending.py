@@ -324,6 +324,41 @@ class RewriteEngineCase(RewriteCase):
             )
         return model
 
+    def test_single_source_merge_is_not_rejected(self):
+        """提示词写的是「source_ids 至少一条」→ 只给一条时不能判失败。
+
+        线上实测：三组都因为一条多余的「≥2」校验被拒 → 全部降级拼接 ✗
+        （merge_facts 本来就会把 target 并进组，所以 ≥2 是多余且自相矛盾的）
+        """
+        ids = self.seed(["星月喜欢草莓蛋糕", "星月最爱草莓蛋糕，不吃巧克力的"])
+
+        async def model(*args, **kwargs):
+            group = args[-1]["groups"][0]
+            return json.dumps(
+                {
+                    "groups": [
+                        {
+                            "target_id": group["facts"][0]["id"],
+                            # 模型只列"另一条"，正如提示词所要求
+                            "source_ids": [f["id"] for f in group["facts"][1:]],
+                            "content": "星月最爱草莓蛋糕，不吃巧克力",
+                            "reason": "合并重复",
+                            "action": "merge",
+                        }
+                    ]
+                }
+            )
+
+        engine = e.Engine(self.store, lambda: c.Settings(), model, None, None)
+        run(engine.queue_fact_merges("qq:gm:1", 0))
+        run(engine.merge_facts("qq:gm:1", None))
+        with self.store.connect() as db:
+            rows = [dict(r) for r in db.execute("SELECT * FROM facts WHERE deleted=0").fetchall()]
+        assert len(rows) == 1, "应当真的合并成一条"
+        assert rows[0]["content"] == "星月最爱草莓蛋糕，不吃巧克力"
+        assert "；" not in rows[0]["content"], "不能是降级拼接的结果"
+        assert rows[0]["rewrite_pending"] == 0, "成功合并不该留待重做标记"
+
     def test_redo_merges_properly_and_clears_flag(self):
         ids = self.seed()
         target = self.concat_merge(ids)
