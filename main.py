@@ -39,6 +39,7 @@ from .contracts import (
 )
 from . import identity
 from .engine import Engine, compression_plan
+from .engine import worth_checking_probe
 from .engine import _boost_ok   # v2.18.19：与引擎共用每会话冷却 ✓
 from .storage import Conflict, Store
 from .migration import SOURCES, newest_legacy_mtime, source_roots
@@ -2220,12 +2221,20 @@ class AlifeMemoryPlugin(BasePlugin):
                 ],
             )
         if random.random() < self.settings.probability:
-            rows = await self.store.call("active", sid)
-            if compression_plan(
-                rows, self.settings, now=time.time(),
-                boost_allowed=_boost_ok(sid, self.settings, stamp=False),
-            ):
-                await self.engine.enqueue("compress", sid, automatic=True)
+            # ★ 2026-09-18 性能审计：这里原来**每条消息**都 `active(sid)` ✗
+            #   3000 条记录的群 = 65 ms ✗，而 `on_request` 开头还已经加载过一次 ✓
+            #   ⇒ 每轮白付 ~130 ms ✓（全在用户等回复的关键路径上 ✓）
+            #   现在先用**便宜预检**（只回 3 个数 ✓ 走索引 ✓ 亚毫秒 ✓）：
+            #   不满足"必要条件"就**根本不必把整表搬进 Python** ✓
+            #   预检只放行不否决 ✓ ⇒ 判定结果与原来**完全一致** ✓（有对拍测试 ✓）
+            _now = time.time()
+            _cfg = self.settings
+            _boost = _boost_ok(sid, _cfg, now=_now, stamp=False)
+            _probe = await self.store.call("compress_probe", sid)
+            if worth_checking_probe(_probe, _cfg, now=_now, boost_allowed=_boost):
+                rows = await self.store.call("active", sid)
+                if compression_plan(rows, _cfg, now=time.time(), boost_allowed=_boost):
+                    await self.engine.enqueue("compress", sid, automatic=True)
 
     def note_recall(self, sid, text):
         """v2.18.9：把「记忆进入上下文」的体量记下来 ✓（工作台可见 ✓）

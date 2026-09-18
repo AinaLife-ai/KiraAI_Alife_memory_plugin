@@ -564,6 +564,33 @@ def _fit_rows(rows, cap_chars):
     return out
 
 
+def worth_checking_probe(result, cfg, now=None, boost_allowed=False):
+    """`compression_plan` 的**必要条件**预检 ✓（用于不加载整表就跳过不可能的会话 ✓）
+
+    输入 = `store.compress_probe(sid)` 的 (非永久行数, 最早 end, 最新 end) ✓
+    口径与 `compression_plan` **逐条对齐** ✓（见那里的 _times/_stale/_idle/_cands ✓）
+
+    **只放行不否决** ✓：这里说 False 必须等价于"计划必然是空" ✓
+    （有测试用随机用例对拍 ✓ 修坏立刻报红 ✓）
+    """
+    count, oldest, newest = result
+    cfg_now = now or time.time()
+    rounds = int(getattr(cfg, "compress_rounds", 12) or 12)
+    if count >= rounds:
+        return True                                  # 正常路径的必要条件 ✓
+    if not count:
+        return False
+    if not boost_allowed:
+        return False
+    days = int(getattr(cfg, "compress_stale_after_days", 3) or 0)
+    hours = int(getattr(cfg, "compress_idle_after_hours", 6) or 0)
+    if not (days and hours):
+        return False
+    stale = oldest is not None and oldest < cfg_now - days * 86400
+    idle = newest is not None and newest < cfg_now - hours * 3600
+    return bool(stale and idle)                      # 与 _stale and _idle 同款 ✓
+
+
 def compression_plan(rows, cfg, now=None, boost_allowed=False):
     """挑出一批可以压缩的内容 ✓
 
