@@ -1777,3 +1777,58 @@ class CompressRaceToleranceCase(unittest.TestCase):
             self.store.call = real_call
         self.assertTrue(steps, "应当留一条说明 ✓ 而不是当成空转 ✓")
         self.assertIn("已被其它任务压缩", json.dumps(steps, ensure_ascii=False))
+
+
+class SelfEchoDowngradeCase(unittest.TestCase):
+    """bot 自述的事实只**降序**，不删不藏 ✓（2026-09-18，用户担心的"自我误导"）
+
+    已有 `v2.18.9 回声防线` 在**渲染**时给这类事实打 `self` 旗标 ✓
+    但**排序没动** ⇒ 照样占常驻版面 ✓ ⇒ 这次补上排序侧 ✓
+    判据与渲染侧完全一致（`src_user == self_id`）✓
+    """
+
+    def test_stable_partition(self):
+        facts = [{"id": 1, "src_user": "u1"}, {"id": 2, "src_user": "bot"},
+                 {"id": 3, "src_user": "u2"}, {"id": 4, "src_user": "bot"}]
+        out = r.self_only_last(facts, "bot")
+        self.assertEqual([f["id"] for f in out], [1, 3, 2, 4], "必须是**稳定**分区 ✓")
+        self.assertEqual(len(out), len(facts), "不许删 ✓")
+
+    def test_no_self_id_is_noop(self):
+        facts = [{"id": 1}, {"id": 2}]
+        self.assertEqual([f["id"] for f in r.self_only_last(facts, "")], [1, 2])
+
+    def test_pack_facts_applies_downgrade(self):
+        facts = [
+            {"id": "s1", "sid": "s", "src_user": "bot", "category": "profile",
+             "content": "我说过我早睡", "importance": 5},
+            {"id": "s2", "sid": "s", "src_user": "u1", "category": "profile",
+             "content": "用户说他早睡", "importance": 5},
+        ]
+        packed = r.pack_facts(facts, current_sid="s", view="flat", self_id="bot")
+        text = json.dumps(packed, ensure_ascii=False)
+        self.assertIn("我说过我早睡", text, "自述事实**不能消失** ✓（仍要能被想起来 ✓）")
+        self.assertIn("用户说他早睡", text)
+        self.assertLess(text.index("用户说他早睡"), text.index("我说过我早睡"),
+                        "自述事实应当排在**后面** ✗（不主动占版面 ✓）")
+
+
+class ArchiveLayerMarkCase(unittest.TestCase):
+    """存档行必须能看出**层级** ✓（2026-09-18：D 项）
+
+    原来存档行只有 `序号|角色|时间|说话人|内容` ✗ —— 模型分不清"事实"和"摘要"、
+    也不知道是第几手概括 ✓ ⇒ 加 `L<n>` 层标（`A`/`U` 之后 ✓）并同步说明文案 ✓
+    """
+
+    def setUp(self):
+        self.src = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding="utf-8")
+
+    def test_archive_line_carries_level(self):
+        self.assertIn('marks += "L%d" % _lvl', self.src,
+                      "存档行没有层标 ✗ ⇒ 模型看不出摘要层级 ✓")
+
+    def test_doc_explains_the_marks(self):
+        self.assertIn("L 后数字=摘要层级", self.src,
+                      "说明文案没解释 L 标 ✗ ⇒ 模型不会用 ✓")
+        self.assertIn("*=永久记忆", self.src)
+        self.assertIn("@=来自别的会话", self.src)

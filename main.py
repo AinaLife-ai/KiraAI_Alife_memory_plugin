@@ -80,7 +80,7 @@ _GROUPED_FACT_DOC = (
     "记忆简报（alife_memory.m）的格式：\n"
     "  第 1 行是表头，形如【记忆·范围】会话｜主体码=名字。\n"
     "  常驻事实每行形如 <主体码> <类别码> <内容> ★重要度 <关系> <时间>，后三项可能缺。\n"
-    "  相关存档每行形如 <序号>|<角色>|<时间>|<说话人>|<内容>，角色 A=助手 U=用户。\n"
+    "  相关存档每行形如 <序号>|<角色>|<时间>|<说话人>|<内容>；角色 A=助手 U=用户，L 后数字=摘要层级（越高越概括），*=永久记忆，@=来自别的会话。\n"
     "  跨会话条目形如 - 内容　来自 会话，要核对来源会话。\n"
     "  结尾「另有 N 条未展示」表示还有没给你的，用 next_batch=true 继续找。\n"
     "下面是示例。\n"
@@ -1967,6 +1967,11 @@ class AlifeMemoryPlugin(BasePlugin):
         lines, pick_ids = [], []
         for row in priority:
             marks = "A" if row["role"] == "assistant" else "U"
+            # v2.18.28：**层标** ✓ —— 摘要行看不出层级和"是摘要不是原文" ✗
+            #   （L1=一段对话的摘要 / L2=再上一层的概括 ✓ 模型据此判断细节量 ✓）
+            _lvl = int(row["level"] or 0)
+            if _lvl > 0:
+                marks += "L%d" % _lvl
             if row["permanent"]:
                 marks += "*"
             if row["sid"] and row["sid"] != sid:

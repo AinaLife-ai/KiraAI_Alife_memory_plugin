@@ -900,7 +900,25 @@ def bot_facts_grouped(facts, current_sid="", codes=None, self_id=""):
     return out
 
 
+def self_only_last(facts, self_id=""):
+    """把"最新来源是助手自己"的事实**稳定地排到最后** ✓（2026-09-18，回声防线的排序侧 ✓）
+
+    背景：`v2.18.9` 已经在渲染时给这类事实打 `self` 旗标 ✓，但**排序没动** ✗
+    ⇒ 它们照样占常驻版面 ✓ —— 用户担心"bot 自己说错的话反过来误导自己" ✓
+    做法：**只降序、不删除、不隐藏** ✓（主动召回仍能搜到 ✓ 只是不主动占版面 ✓）
+    判据与渲染侧的 self 旗标**完全一致**（`src_user == self_id`）✓ 一处定义、两处使用 ✓
+    用**稳定分区**（保持原有相对顺序 ✓）所以不会打乱重要度/时间排序的语义 ✓
+    """
+    if not self_id:
+        return list(facts or [])
+    others, selves = [], []
+    for fact in (facts or []):
+        (selves if fact.get("src_user") == self_id else others).append(fact)
+    return others + selves
+
+
 def pack_facts(facts, current_sid="", short=None, view=FACT_VIEW_GROUPED, codes=None, self_id=""):
+    facts = self_only_last(facts, self_id)      # ★ 自述降序（不删不藏）✓
     """事实渲染入口：grouped=分组视图（默认 ✓）/ flat=旧的扁平视图（逐字节不变 ✓）。"""
     if view == FACT_VIEW_FLAT:
         return bot_facts(facts, current_sid, short=short, self_id=self_id)
