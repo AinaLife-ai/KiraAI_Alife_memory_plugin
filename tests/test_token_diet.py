@@ -1655,3 +1655,125 @@ class ScanDedupCase(unittest.TestCase):
         with self.store.connect() as db:
             n = db.execute("SELECT count(*) FROM jobs WHERE kind='compress' AND sid='s:2'").fetchone()[0]
         self.assertEqual(n, 1, "同一会话同时只该有一行压缩任务 ✓")
+
+
+class FactRotationBookkeepingCase(unittest.TestCase):
+    """事实侧轮换必须真的记账 ✓（2026-09-18 查出的静默失效）
+
+    原来 `mark_rotation` / `rotation_stats` / `rotation_pick` **只认 records** ✗，
+    而事实轮换的候选来自 `facts` ⇒ 用事实 id 去 `UPDATE records … WHERE id=?`
+    **匹配 0 行** ⇒ 静默无效：事实槽位永远学不到"哪条被用过"
+    （只剩内存冷却 + seen 窗口，重启后从同几条重新开始）
+    ⇒ 这是"下沉/上浮"方案的地基 ✓
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = s.Store(Path(self.temp.name) / "db")
+        self.store.initialize()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _seed(self):
+        with self.store.connect() as db:
+            self.store._ensure_entities(db, "s:1", ["u-1"])
+            self.store._add_fact(db, "s:1", {
+                "category": "preference", "subject": "周武", "content": "爱喝美式",
+                "reason": "测试", "scenario": "", "relations": [], "tags": [],
+                "source_ids": [], "importance": 6,
+            })
+            fid = db.execute("SELECT id FROM facts LIMIT 1").fetchone()[0]
+            db.execute(
+                "INSERT INTO records(id,sid,role,level,start,end,summary,content,users,"
+                "position,created,visibility,active,deleted,permanent,cold)"
+                " VALUES('r1','s:1','user',0,1,1,'s','c',?,'1',1,'session',1,0,0,0)",
+                (json.dumps(["u-1"]),),
+            )
+        return fid
+
+    def test_fact_kind_writes_facts_table(self):
+        fid = self._seed()
+        self.store.mark_rotation([fid], [], "fact")
+        self.assertEqual(self.store.rotation_stats("fact").get(fid), (1, 0),
+                         "kind='fact' 没写进 facts 表 ✗ ⇒ 事实轮换学不到「被用过」✓")
+        self.store.mark_rotation([], [fid], "fact")
+        self.assertEqual(self.store.rotation_stats("fact").get(fid), (1, 1), "「用上」也要记 ✓")
+
+    def test_record_kind_unchanged(self):
+        """不能改坏档案侧 ✓（默认 kind 仍是 record ✓）"""
+        self._seed()
+        self.store.mark_rotation(["r1"], [], "record")
+        self.assertEqual(self.store.rotation_stats("record").get("r1"), (1, 0))
+        self.store.mark_rotation(["r1"], [])          # 老调用方式（不传 kind）✓
+        self.assertEqual(self.store.rotation_stats("record").get("r1"), (2, 0))
+
+    def test_kinds_are_isolated(self):
+        """两边的计数必须互不污染 ✓"""
+        fid = self._seed()
+        self.store.mark_rotation([fid, "r1"], [], "fact")
+        self.assertEqual(self.store.rotation_stats("fact").get("r1"), None,
+                         "事实口径不该写进 records 的 id ✓")
+        self.assertEqual(self.store.rotation_stats("record").get("r1"), None)
+
+
+class CompressRaceToleranceCase(unittest.TestCase):
+    """压缩遇到**竞态冲突**不该报失败 ✓（2026-09-18 查出并修）
+
+    `store.compress()` 用 `(revision, active, deleted)` 做 CAS ✓
+    若源记录在这期间被**别处**（同会话的另一个任务、或直调）压掉了 ⇒ 抛 Conflict ✓
+    而那时**目标已经达成** ✓ ⇒ 报失败会误导（工作台显示红、用户以为出问题）
+
+    实测来源：集成测试 `test_quiet_migrated_sessions_get_compressed_by_sweep`
+    （"扫描排任务 + 直调 compress" ⇒ 修复前在 KIRA_CORE 下 1/3 概率失败 ✓
+    修复后连跑 5 次全过 ✓）
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = s.Store(Path(self.temp.name) / "db")
+        self.store.initialize()
+        self.cfg = c.Settings(probability=0.0)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_conflict_does_not_raise(self):
+        """把 compress 换成必抛 Conflict ⇒ 层叠压缩必须**优雅收工** ✓"""
+        sid = "s:race"
+        now = time.time()
+        with self.store.connect() as db:
+            self.store._ensure_entities(db, sid, ["u-1"])
+            for i in range(40):
+                t = now - i * 60
+                db.execute(
+                    "INSERT INTO records(id,sid,role,level,start,end,summary,content,users,"
+                    "position,created,visibility,active,deleted,permanent,cold)"
+                    " VALUES(?,?,?,0,?,?,?,?,?,?,?,?,1,0,0,0)",
+                    ("rc-%d" % i, sid, ("user", "assistant")[i % 2], t, t, "s%d" % i,
+                     "c%d" % i, json.dumps(["u-1"]), i + 1, now, "session"),
+                )
+            db.commit()
+
+        async def model(*a, **k):
+            return json.dumps({"summary": "摘要", "facts": []})
+
+        engine = e.Engine(self.store, lambda: self.cfg, model, None, None)
+        real_call = self.store.call
+
+        async def racy_call(method, *args, **kwargs):
+            if method == "compress":
+                raise s.Conflict("source changed during compression")
+            return await real_call(method, *args, **kwargs)
+
+        self.store.call = racy_call
+        loop = asyncio.new_event_loop()
+        try:
+            steps = loop.run_until_complete(engine.compress(sid))
+        except s.Conflict:
+            self.fail("竞态冲突被抛出来了 ✗ ⇒ 任务会显示成失败 ✓（其实目标已达成 ✓）")
+        finally:
+            loop.close()
+            self.store.call = real_call
+        self.assertTrue(steps, "应当留一条说明 ✓ 而不是当成空转 ✓")
+        self.assertIn("已被其它任务压缩", json.dumps(steps, ensure_ascii=False))

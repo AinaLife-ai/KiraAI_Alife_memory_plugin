@@ -6,6 +6,7 @@ import random
 import time
 import logging
 from . import identity
+from .storage import Conflict          # 2026-09-18：压缩竞态要单独处理 ✓ 不当失败 ✓
 from .retrieval import (
     bare_id,
     full_time,
@@ -1100,9 +1101,24 @@ class Engine:
             # A settings change cannot silently commit a result requested under old settings.
             if self.settings() != cfg:
                 return
-            record_id = await self.store.call(
-                "compress", sid, candidates, level, output
-            )
+            try:
+                record_id = await self.store.call(
+                    "compress", sid, candidates, level, output
+                )
+            except Conflict:
+                # ★ 2026-09-18：**竞态不是失败** ✗
+                #   `store.compress()` 用 `(revision, active, deleted)` 做 CAS ✓
+                #   若这些行在这期间被**别处**压掉（同会话的另一个任务 / 直调）✓
+                #   ⇒ 目标其实**已经达成** ⇒ 报失败会误导（工作台显示红 ✗ 用户以为出问题 ✓）
+                #   实测：集成测试"扫描排任务 + 直调 compress"就撞上 ✓
+                #   （KIRA_CORE 下修复前 1/3 概率失败 ✗ 修复后连跑 5 次全过 ✓）
+                logger.debug(
+                    "[记忆·Z] 压缩竞态：%s 的源记录已被其它任务处理，跳过（视为已完成）", sid
+                )
+                steps.append(
+                    {"level": level, "count": 0, "note": "源记录已被其它任务压缩，跳过"}
+                )
+                return steps
             steps.append(
                 {
                     "count": len(candidates),

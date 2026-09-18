@@ -1138,7 +1138,7 @@ class AlifeMemoryPlugin(BasePlugin):
             return []
         holder.setdefault("used", {})
         if holder.get("shown") is None:  # 每会话只查一次（有轮换记录的通常很少）
-            snapshot = await self.store.call("rotation_stats")
+            snapshot = await self.store.call("rotation_stats", kind)
             holder["shown"] = {rid: stat[0] for rid, stat in snapshot.items()}
             holder["used"] = {rid: stat[1] for rid, stat in snapshot.items()}
         ids = rotation_order(
@@ -1164,7 +1164,7 @@ class AlifeMemoryPlugin(BasePlugin):
             holder["shown"][row["id"]] = int(holder["shown"].get(row["id"], 0)) + 1
         # 进 seen：下一轮它们就不再算"没给过"，也不会被当成主召回的重复项
         self.seen_window.remember(seen_key, "", [row["id"] for row in chosen])
-        await self.store.call("mark_rotation", [row["id"] for row in chosen], [])
+        await self.store.call("mark_rotation", [row["id"] for row in chosen], [], kind)
         # v2.18.18 绊线 ✓：真出现"以媒体标记开头"的文本被注入 ✗ 就打完整文本 ✓
         # （日志里只显示 14 字 ✗ 上次就是因为看不出结尾才排查困难 ✓）
         for row in chosen:
@@ -1203,7 +1203,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 if overlap_hit(text, reply, cfg.rotate_min_hits)
             ]
             if hits:
-                await self.store.call("mark_rotation", [], hits)
+                await self.store.call("mark_rotation", [], hits, kind)
                 state["hit_turn"] = state.get("turn")
                 for rid in hits:
                     holder["used"][rid] = int(holder["used"].get(rid, 0)) + 1

@@ -362,6 +362,19 @@ class Store:
                 db.execute(
                     "ALTER TABLE records ADD COLUMN rotate_used INTEGER NOT NULL DEFAULT 0"
                 )
+            # ★ 2026-09-18：**事实侧也要记账** ✓
+            #   原来 `mark_rotation` / `rotation_stats` / `rotation_pick` 只认 records ✗
+            #   而事实轮换的候选是 facts 的行 ✓ ⇒ 用事实 id 去 UPDATE records
+            #   ⇒ **匹配 0 行、静默无效果** ✗ ⇒ 事实轮换永远学不到"哪条被用过" ✓
+            #   （只剩内存里的冷却 + seen 窗口 ✓ 重启即忘 ⇒ 每次从同几条重新开始 ✓）
+            fact_columns = {r[1] for r in db.execute("PRAGMA table_info(facts)")}
+            if "rotate_shown" not in fact_columns:
+                db.execute(
+                    "ALTER TABLE facts ADD COLUMN rotate_shown INTEGER NOT NULL DEFAULT 0"
+                )
+                db.execute(
+                    "ALTER TABLE facts ADD COLUMN rotate_used INTEGER NOT NULL DEFAULT 0"
+                )
             if "search_body" not in columns:
                 db.execute(
                     "ALTER TABLE records ADD COLUMN search_body TEXT NOT NULL DEFAULT ''"
@@ -3525,38 +3538,47 @@ class Store:
             )
             return int(cursor.rowcount or 0)
 
-    def mark_rotation(self, shown_ids=(), used_ids=()):
-        """轮换槽位记账：展示过 +N、被用过 +M（用于排序、冷却与观测）。"""
+    def mark_rotation(self, shown_ids=(), used_ids=(), kind="record"):
+        """轮换槽位记账：展示过 +N、被用过 +M（用于排序、冷却与观测）✓
+
+        ⚠️ 2026-09-18 修：原来**只写 records** ✗，而事实轮换的候选来自 `facts` ✓
+        ⇒ 用事实 id 调用时 `UPDATE records … WHERE id=?` **匹配 0 行** ✓
+        ⇒ 静默失效：事实槽位学不到"被用过" ✓（重启后从同几条重新开始 ✓）
+        ⇒ 现在按 ``kind`` 分派（``"fact"`` ⇒ facts 表 ✓ 其余 ⇒ records ✓）
+        """
+        table = "facts" if str(kind) == "fact" else "records"
         shown = [str(i) for i in (shown_ids or []) if i]
         used = [str(i) for i in (used_ids or []) if i]
         with self.connect() as db:
             if shown:
                 db.executemany(
-                    "UPDATE records SET rotate_shown=rotate_shown+1 WHERE id=?",
+                    "UPDATE " + table + " SET rotate_shown=rotate_shown+1 WHERE id=?",
                     [(i,) for i in shown],
                 )
             if used:
                 db.executemany(
-                    "UPDATE records SET rotate_used=rotate_used+1 WHERE id=?",
+                    "UPDATE " + table + " SET rotate_used=rotate_used+1 WHERE id=?",
                     [(i,) for i in used],
                 )
         return len(shown) + len(used)
 
-    def rotation_stats(self):
+    def rotation_stats(self, kind="record"):
         """一次性取回"有轮换记录"的计数（量很小）。
 
         热路径（每轮注入）再用它做**纯内存排序**，省掉每轮的两次 DB 往返 ✓
         """
         with self.connect() as db:
             rows = db.execute(
-                "SELECT id,rotate_shown,rotate_used FROM records WHERE rotate_shown > 0"
+                "SELECT id,rotate_shown,rotate_used FROM "
+                + ("facts" if str(kind) == "fact" else "records")
+                + " WHERE rotate_shown > 0"
             ).fetchall()
         return {
             row["id"]: (int(row["rotate_shown"] or 0), int(row["rotate_used"] or 0))
             for row in rows
         }
 
-    def rotation_pick(self, ids, limit):
+    def rotation_pick(self, ids, limit, kind="record"):
         """从给定的候选 id 里挑下一批轮换条目（排序即"学习"）。
 
         优先级：
@@ -3569,7 +3591,9 @@ class Store:
             return []
         with self.connect() as db:
             rows = db.execute(
-                "SELECT id,rotate_shown,rotate_used FROM records WHERE id IN (%s)"
+                "SELECT id,rotate_shown,rotate_used FROM "
+                + ("facts" if str(kind) == "fact" else "records")
+                + " WHERE id IN (%s)"
                 % ",".join("?" * len(wanted)),
                 wanted,
             ).fetchall()
