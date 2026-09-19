@@ -939,7 +939,12 @@ async function loadHealth(page) {
   // ★ 2026-09-19（用户实测）：先点体检页时卡片只显示 `qq:2141951927` ✗
   //   根因：昵称表 displayNames 是**懒加载**的，只有"名字页/关系页"会补载 ✓
   //   ⇒ 这里先补一次 ✓（静默 ✓ 拿不到也不影响主流程 ✓）
-  await ensureNames();
+  //   ★★ 2026-09-19 二改：必须给**超时上限** ✗ —— ensureNames 有可能卡住不发请求
+  //      实测症状就是：整页永远停在"正在加载…"，切到别的页再切回来才出内容 ✓
+  await Promise.race([
+    Promise.resolve().then(() => ensureNames()).catch(() => {}),
+    new Promise((r) => setTimeout(r, 1500)),
+  ]);
   let d;
   try {
     // ★ 服务端分页：只拉**本页 50 条**（原来一次 300 行 = 189.5 KB ✗ 用户实测"加载太久"）
@@ -1505,15 +1510,28 @@ $$("[data-tab]").forEach(
       guard(async () => {
         await selectTab(e.dataset.tab);
         if (e.dataset.tab === "health") {
-          await loadHealth();   // ★ 体检页顺手拉一次 ✓
-          // ★ 2026-09-19（用户实测："首次点进去一直正在加载，得点别的页再点回来" ✓）
-          //   首屏偶发失败（面板刚起/竞态）⇒ 自动重试一次 ✓ 用户不必手动绕一圈 ✓
-          setTimeout(() => {
+          // ★ 2026-09-19 二改（用户实测"不切页就永远正在加载"）：
+          //   ⚠️ 重试必须放 **finally** —— 原来写在 `await loadHealth()` **后面** ✗
+          //      它一旦抛错/卡住，那行代码根本不会执行 ✗（"补救放在失败路径之后"）
+          const heal = (tries) => {
             const m = $("#healthMeta");
-            if (m && /正在加载/.test(m.textContent)) {
-              loadHealth(healthPage).catch(() => {});
+            if (!m) return;
+            if (!/正在加载/.test(m.textContent)) return;      // 已经出内容 ✓ 收工
+            if (tries <= 0) {
+              m.textContent = "加载失败：点右上「自动刷新」可重试 ✓";
+              return;
             }
-          }, 1200);
+            loadHealth(healthPage)
+              .catch(() => {})
+              .finally(() => setTimeout(() => heal(tries - 1), 1200));
+          };
+          try {
+            await loadHealth();
+          } catch (err) {
+            /* 抛错也照样排期自愈 ✓ */
+          } finally {
+            setTimeout(() => heal(3), 1200);
+          }
         }
       })),
 );

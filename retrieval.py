@@ -418,6 +418,11 @@ def _strip_wrappers(text):
 #   ⇒ 用户日志里 `[At 3991867505]` 原样进注入 ✓
 #   **结构化壳不依赖名单表** ✓（与 [Reply]/[CQ:at]/<at> 同档 ✓ —— 仓库既有约定 ✓）
 _AT_SHELL = re.compile(r"\[At\s*-?\d+[^\]]*\]", re.I)
+# ★ 2026-09-19：引用内容开头的 `[2026-09-19 08:09:37]` 时间戳 ✓ 对模型毫无用处
+#   而且它一占就 21 个字符 ⇒ 40 字的引用预算被吃掉一半 ✗（用户真机日志实测 ✓）
+_TS_LEAD = re.compile(
+    r"^\[?\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}[ T]\d{1,2}:\d{2}(?::\d{2})?\s*\]?\s*"
+)
 _AT_WITH_NAME = re.compile(r"\[At\s*-?\d+\s*\(\s*nickname:\s*([^)]*?)\s*\)\s*\]", re.I)
 _AT_BARE = re.compile(r"\[At\s*-?\d+\s*\]", re.I)
 
@@ -497,6 +502,11 @@ def trim_nested(text, reply_chars=40, desc_chars=DESC_CHARS_RECALL):
                 break
             raw_inner = text[reply.end() : end].strip()
             inner = raw_inner.strip("[]").strip()
+            # ★ 2026-09-19（用户）：引用内容**开头常常是一串时间戳** ✗
+            #   `[2026-09-19 08:09:37] 爱奈丽：行吧…` ⇒ 21 个字符白占预算 ✓
+            #   （模型看时间戳毫无用处 ✓ 而且 created/event_at 另有字段 ✓）
+            #   ⇒ 剥掉后再按 40 字裁 ✓ 让预算全用在**真正的引用内容**上 ✓
+            inner = _TS_LEAD.sub("", inner)
             # ⚠️ 判"引用里是不是媒体"要用**没剥括号**的原样 ✓
             #   （剥了 `[` 就匹配不上 `_MEDIA_HEAD` ✗ —— 实测踩到 ✓）
             # ★ 2026-09-18（用户）：**去掉无意义的 msgid、压平嵌套** ✓

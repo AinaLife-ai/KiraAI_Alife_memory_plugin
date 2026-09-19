@@ -462,7 +462,12 @@ class Search(Strict):
 class Edit(Strict):
     kind: Literal["record", "fact"]
     target: Short
-    revision: int = Field(ge=1)
+    # ★ 2026-09-19（用户实测：点删除报 422"请检查必填项"）：
+    #   快捷操作（重要度 ±1 / 删除）只发 {kind, target, patch} ✗ 不给 revision
+    #   而 storage.edit 写的是 `if revision is not None and (… != revision)` ✓
+    #   ⇒ **后端本来就允许不给** ✓ 只有这个模型强制必填 ✗ ⇒ 改可选 ✓
+    #   语义：给了就做"版本没变才允许改"的冲突检测 ✓ 没给就跳过 ✓
+    revision: int | None = Field(default=None, ge=1)
     patch: dict
     reason: Short
 

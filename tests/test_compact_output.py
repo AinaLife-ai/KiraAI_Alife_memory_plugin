@@ -155,3 +155,18 @@ def test_at_only_messages_never_reach_the_model_without_names():
     # 裸文本 `@` 才需要名单 ✓ 且**改名后是 fail-safe**：宁可多留，绝不吃真话 ✓
     assert r.media_only("@爱奈丽", ()) is False
     assert r.media_only("@爱奈丽", ("爱奈丽",)) is True
+
+
+def test_quoted_reply_drops_leading_timestamp():
+    """★ 2026-09-19（用户真机日志）：引用内容开头是时间戳 ✗
+    `[Reply: 2026-09-19 08:09:37] 爱奈丽：…` ⇒ 21 个字符白占 40 字预算的一半 ✓
+    时间戳对模型毫无用处（created/event_at 另有字段）⇒ 剥掉 ✓"""
+    raw = ("[Reply ID: -1026278658 content: [2026-09-19 08:09:37] 爱奈丽：行吧，"
+           "那我还歪打正着预言了一波]所以预言家跳了对吧？")
+    out = r.trim_nested(r.clean_text(raw, ()))
+    assert out.startswith("[Reply: 爱奈丽："), out
+    assert "2026-09-19" not in out, "时间戳不许进注入：%r" % out
+    # 无外层方括号的形态也要认 ✓（.strip("[]") 会先把 [ 剥掉）
+    assert r._TS_LEAD.sub("", "2026-09-19 08:09:37 你好呀").strip() == "你好呀"
+    # 别误伤"像日期的正文"✓
+    assert r._TS_LEAD.sub("", "2026年8月28日深夜小怪兽") == "2026年8月28日深夜小怪兽"
