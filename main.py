@@ -45,6 +45,7 @@ from .storage import Conflict, Store
 from .migration import SOURCES, newest_legacy_mtime, source_roots
 from .retrieval import (
     strip_at_ids,
+    tfield,
     CATEGORY_RANK,
     archives_flat,
     FACT_VIEW_GROUPED,
@@ -83,16 +84,11 @@ _GROUPED_FACT_DOC = (
     # v2.18.19：注入已改成**紧凑简报** ✗ 旧说明还在教模型读 JSON 数组/键名 ✓
     # ⇒ 模型会去找不存在的结构 ✓ 这里按**真实渲染**重写 ✓
     "记忆简报（alife_memory.m）的格式：\n"
-    "  第 1 行是表头，形如【记忆·范围】会话｜主体码=名字。\n"
-    "  常驻事实每行形如 <主体码> <类别码> <内容> ★重要度 <关系> <时间>，后三项可能缺。\n"
+    "  第 1 行表头形如【记忆·范围】会话｜主体码=名字。\n"
+    "  常驻事实每行形如 <主体码> <类别码> <内容> ★重要度 <关系> <时间>，后三项可缺。\n"
     "  相关存档每行形如 <序号>|<角色>|<时间>|<说话人>|<内容>；角色 A=助手 U=用户，L 后数字=摘要层级（越高越概括），*=永久记忆，@=来自别的会话。\n"
-    "  跨会话条目形如 - 内容　来自 会话，要核对来源会话。\n"
-    "  结尾「另有 N 条未展示」表示还有没给你的，用 next_batch=true 继续找。\n"
-    "下面是示例。\n"
-    "  【记忆·关联会话】某会话｜n1=某成员\n"
-    "  n1 pf 一条画像事实 ★7 n1>关系>n2 08-20\n"
-    "  1|A|07-05 20:30|某成员|一条原文消息\n"
-    "  - 一条跨会话记忆　来自 某会话\n"
+    "  跨会话条目形如 - <时间> <角色> <说话人>｜<内容>　来自 会话；缺则略。\n"
+    "  结尾「另有 N 条未展示」= 还有没给你的，用 next_batch=true 继续找。\n"
 )
 
 MEMORY_RULES = (
@@ -224,7 +220,26 @@ def brief(perception):
             if isinstance(item, dict):
                 txt = item.get("s") or item.get("summary") or item.get("content") or ""
                 src = item.get("from") or item.get("sid") or ""
-                lines.append("- %s%s" % (txt, ("　来自 %s" % src) if src else ""))
+                # ★ 2026-09-19（用户）：拍平时**别把算好的字段扔掉** ✗
+                #   原来只取 `s`（内容）⇒ 时间 `t` / 说话人 `sp` / 是不是我说的 `bot`
+                #   全被丢弃 ✓ ⇒ 模型看到的相关记忆**一条都没有时间** ✗
+                #   ⚠️ 写法**照仓库既有约定**（别自创）：
+                #     main.py:89   `<序号>|<角色>|<时间>|<说话人>|<内容>`，**A=助手 U=用户**
+                #     main.py:1533 画像行 `类别 说话人｜内容 ★重要度 日期 [来源短码]`
+                #   ⇒ 这里用：`<时间> <角色> <说话人>｜<内容>　来自 <来源>`
+                _t = item.get("t") or ""
+                _sp = item.get("sp") or ""
+                _role = "A" if item.get("bot") else "U"
+                lines.append(
+                    "- %s%s%s｜%s%s"
+                    % (
+                        (_t + " ") if _t else "",
+                        _role,
+                        (" " + _sp) if _sp else "",
+                        txt,
+                        ("　来自 %s" % src) if src else "",
+                    )
+                )
             elif item:
                 lines.append("- %s" % item)
 
@@ -320,6 +335,35 @@ def user_ids(event):
             not in ("", "unknown")
         }
     )
+
+
+def _slot_stamp(row):
+    """注入行的时间前缀 ✓ —— **只有真能代表"那件事发生时刻"的，才给到分钟** ✓
+
+    分级（用户定的规矩 ✓ 依据是 `records.level`）：
+      · `level == 0` 原始消息 ⇒ `start`/`end` 就是那条消息的真实时刻 ⇒ **给到分钟** ✓
+          `09-19 06:35 她今天有点累…`
+      · `level >= 1` 压缩摘要 ⇒ 它覆盖的是**一段区间** ⇒ 分钟是**假精确** ✗
+        模型会误以为"这句话是 06:35 说的" ✗ ⇒ **只给日期** ✓
+          `09-19 她今天有点累…`
+      · 拿不到可用时间 ⇒ **什么都不加** ✓
+        绝不用 `created` 兜底 ✗ —— 那是"**整理这条记忆的时刻**"（`storage.py:2073`
+        原话："created = 入库时刻（不是事件时间 ✗）"）⇒ 拿它冒充说话时间 = 造假 ✗
+
+    ⚠️ 口径仍由 `short_time` 统一保证（跨年自动带年份 ✓ 非法留空 ✓ 绝不出现 1970 ✓）
+    ⚠️ 只能加在**注入那一处** ✗ —— `text_of` 还被用来拼**检索查询**（capture_text），
+       往那里塞日期会把日期混进搜索词 ⇒ 直接毁掉词面匹配 ✗
+    """
+    try:
+        level = int(row.get("level") or 0)
+    except (TypeError, ValueError):
+        level = 0
+    stamp = short_time(row.get("end") or row.get("start"))
+    if not stamp:
+        return ""                      # 没有可信时间 ⇒ 不加 ✓
+    if level <= 0 and " " in stamp:
+        return stamp + " "             # 原始消息 ⇒ 精确到分钟 ✓
+    return stamp.split(" ")[0] + " "   # 摘要/不可精确定位 ⇒ 只到日 ✓
 
 
 def text_of(message):
@@ -1165,7 +1209,10 @@ class AlifeMemoryPlugin(BasePlugin):
         state.update(
             {
                 "rows": chosen,
-                "texts": {row["id"]: text_of(row) for row in chosen},
+                # ★ 2026-09-19：注入行带**日期前缀** ✓ 与常驻/事实槽同一口径
+                #   （`08-20 她今天有点累…` ✓ 跨年自动 `2025-08-15` ✓ 非法则不加 ✓）
+                #   只在这里加 ✗ 不能塞进 text_of（它还被用来拼检索查询 ✓）
+                "texts": {row["id"]: _slot_stamp(row) + text_of(row) for row in chosen},
                 "ids": [row["id"] for row in chosen],
                 "rounds": 0,
                 "next": False,
@@ -1900,7 +1947,7 @@ class AlifeMemoryPlugin(BasePlugin):
             for r in related_rows:
                 item = {
                     "a": related_shorts.get(r["id"], r["id"]),
-                    "t": short_time(r["end"] or r["start"]),
+                    **tfield("t", short_time(r["end"] or r["start"])),
                     "s": recall_text(self.model_text(r["summary"], keep_names), 200),
                 }
                 if r["speaker"]:
@@ -2032,10 +2079,16 @@ class AlifeMemoryPlugin(BasePlugin):
                 marks += "*"
             if row["sid"] and row["sid"] != sid:
                 marks += "@" + str(archive_shorts.get(row["sid"], row["sid"]))
+            # ★ 2026-09-19（用户）：**只有原始消息才给到分钟** ✓
+            #   摘要是"一段区间的概括" ⇒ 标分钟会让模型误以为"这句话就是那分钟说的" ✗
+            #   ⇒ level>0 只留日期 ✓（口径仍由 short_time 保证 ✓ 跨年带年份 ✓ 非法留空 ✓）
+            _time_txt = short_time(row["end"] or row["start"])
+            if _lvl > 0 and " " in _time_txt:
+                _time_txt = _time_txt.split(" ")[0]
             line = "%d|%s|%s|%s|%s" % (
                 len(lines) + 1,
                 marks,
-                short_time(row["end"] or row["start"]),
+                _time_txt,
                 self.model_text(row["speaker"] or "", keep_names) or "-",
                 self.model_text(row["summary"], keep_names),
             )
@@ -2913,7 +2966,7 @@ class AlifeMemoryPlugin(BasePlugin):
                 # 默认值全部省略（archived/permanent/role/level/revision 之前占了两成字符）
                 item = {
                     "i": shorts.get(r["id"], r["id"]),
-                    "t": short_time(r["end"] or r["start"]),
+                    **tfield("t", short_time(r["end"] or r["start"])),
                     "s": recall_text(self.model_text(r["summary"], keep_names), 200),
                 }
                 if r["speaker"]:

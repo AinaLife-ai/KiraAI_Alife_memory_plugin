@@ -53,13 +53,15 @@ def fact(**overrides):
 
 class BotFactsTests(unittest.TestCase):
     def test_keeps_only_decision_and_provenance_fields(self):
-        view = r.bot_facts([fact()], "qq:dm:u")[0]
+        # 2026-09-19：created 不再是事件的兜底 ⇒ 显式给 event_at ✓
+        view = r.bot_facts([fact(event_at=1700000000.0)], "qq:dm:u")[0]
         # 默认重要度(5)省略，这里用例给的是 6，所以 imp 会出现
         self.assertEqual(set(view), {"c", "u", "x", "imp", "src", "t"})
         self.assertEqual(view["c"], "pr")  # 类别用短码，图例在静态规则块里
         self.assertEqual(view["src"], "rec-1")
         # 日期短码：同年只给月-日，跨年才补上年份（1700000000 是 2023 年，所以带年）
-        self.assertTrue(view["t"].endswith("11-15"), view["t"])
+        # 2026-09-19：单来源事实现在**精确到分钟** ⇒ 断言改为"日期部分"比对（粒度无关 ✓）
+        self.assertTrue(view["t"].split(" ")[0].endswith("11-15"), view["t"])
         self.assertNotIn("t2", view)  # 单点事件不给区间
         self.assertNotIn("rec", view)  # 记录时刻与事件时间相同就不重复说
         # 本会话事实不再重复 sid/by
@@ -88,7 +90,8 @@ class BotFactsTests(unittest.TestCase):
         self.assertIn("t", view)
         self.assertIn("t2", view)  # 区间
         self.assertIn("rec", view)  # 30 天后才整理出来的
-        self.assertEqual(r.short_day(1700000000.0), view["t"])
+        # 同上：只比日期部分 ✓（单来源⇒到分钟，多来源⇒只到日）
+        self.assertEqual(r.short_day(1700000000.0), view["t"].split(" ")[0])
 
     def test_needs_review_only_when_flagged(self):
         self.assertNotIn("rev", r.bot_facts([fact()], "qq:dm:u")[0])

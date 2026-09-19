@@ -8,6 +8,7 @@ import logging
 from . import identity
 from .storage import Conflict          # 2026-09-18：压缩竞态要单独处理 ✓ 不当失败 ✓
 from .retrieval import (
+    tfield,
     bare_id,
     full_time,
     model_text,
@@ -286,9 +287,11 @@ def compress_records(candidates, aliases, names=None, keep=()):
                     record["sp_c"] = cand
         if row["level"] == 0:
             # L0 的 start 与 end 是同一条消息的时间戳，合并省一半。
-            record["t"] = full_time(row["start"])
+            if row["start"]:
+                record["t"] = full_time(row["start"])
         else:
-            record["t"], record["t2"] = full_time(row["start"]), full_time(row["end"])
+            if row["start"]:
+                record["t"], record["t2"] = full_time(row["start"]), full_time(row["end"])
         records.append(record)
     return records
 
@@ -1249,7 +1252,7 @@ class Engine:
                             if is_tool_step(row)
                             else model_text(row.get("content", ""), keep)
                         ),
-                        "t": full_time(row.get("start")),
+                        **tfield("t", full_time(row.get("start"))),
                         # v2.18.9：**证据必须带上说话人与 bot 标记** ✗
                         # 之前这里重建了字典 ✗ 把 additions 里的 sp/bot 全丢了 ✓
                         # （提示词写着"evidence[].bot=1"，载荷却没有 → 模型无法遵守 ✓）
@@ -1423,7 +1426,7 @@ class Engine:
                             "content": row["content"],
                             "reason": row["reason"],
                             "scenario": row["scenario"],
-                            "time": full_time(row["time"]),
+                            **tfield("time", full_time(row["time"])),
                         }
                     )
                 evidence, seen = [], set()
@@ -1997,8 +2000,8 @@ class Engine:
                     {
                         "id": "d%d" % (i + 1),
                         "s": model_text(item.get("summary", "")),
-                        "t": full_time(item.get("start")),
-                        "t2": full_time(item.get("end")),
+                        **tfield("t", full_time(item.get("start"))),
+                        **tfield("t2", full_time(item.get("end"))),
                     }
                     for i, item in enumerate(group)
                 ],

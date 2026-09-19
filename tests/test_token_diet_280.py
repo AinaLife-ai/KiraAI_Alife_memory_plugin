@@ -112,9 +112,15 @@ def test_fact_view_uses_codes_and_drops_defaults():
     fact = {
         "id": "x", "category": "relationship", "subject": "qq:1", "content": "是师傅",
         "importance": 5, "src": "rec-1", "created": 1772908601.0, "relations": [],
+        # 2026-09-19：created 不再兜底 ⇒ 显式给 event_at ✓
+        "event_at": 1700000000.0,
     }
     view = r.bot_facts([fact], "sess", short=lambda value: "ab12cd")[0]
-    assert view == {"c": "re", "u": "qq:1", "x": "是师傅", "src": "ab12cd", "t": "03-08"}
+    # t（事件时间）与 rec（记录时刻）单独断言 ✓ —— 两者差得远时渲染器**故意**都给 ✓
+    assert {k: v for k, v in view.items() if k not in ("t", "rec")} == {
+        "c": "re", "u": "qq:1", "x": "是师傅", "src": "ab12cd"}
+    assert view["rec"] == "03-08", view          # 整理于 03-08 ✓（与事件 11-15 不同 ⇒ 都显示 ✓）
+    assert view["t"].split(" ")[0] == r.short_day(1700000000.0)   # 粒度无关 ✓
     # 短码映射里没有的值退回原值，绝不输出 null
     other = r.bot_facts([fact], "sess", short=lambda value: None)[0]
     assert other["src"] == "rec-1"
@@ -651,3 +657,47 @@ def test_batch_mode_ui_switches_fields():
     assert check.exists(), "缺少分批模式的前端检查脚本"
     run = subprocess.run([node, str(check)], capture_output=True, text=True, timeout=60)
     assert run.returncode == 0, "分批模式互斥显示未通过：\n" + (run.stdout + run.stderr)[:700]
+
+
+def test_rotation_slot_has_date_prefix_like_fact_slot():
+    """★ 2026-09-19（用户）：轮换槽注入行要带日期 ✓ 且**照常驻/事实槽的口径** ✓
+
+    常驻事实行形如 `<主体码> <类别码> <内容> ★重要度 <关系> <时间>` ✓ 时间是 `08-20`（只到日）✓
+    ⚠️ 两条硬约束：
+      ① 前缀只能加在**注入那一处** ✗ —— `text_of` 还用于拼检索查询（capture_text），
+         把日期塞进去会污染搜索词 ✓
+      ② 口径必须来自 `short_time` ✓（跨年带年份 ✓ 非法留空 ✓ 绝不出现 1970 ✓）
+    """
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert "def _slot_stamp(row):" in src, "必须有 _slot_stamp（日期前缀的唯一出口）"
+    assert "_slot_stamp(row) + text_of(row)" in src, "注入行必须带日期前缀"
+    # ① text_of 本体不许掺时间（它同时喂检索查询 ✓）
+    body = src[src.index("def text_of(message):"):]
+    body = body[: body.index("\ndef ", 1)] if "\ndef " in body else body
+    assert "short_time" not in body and "_slot_stamp" not in body, \
+        "text_of 里不许加时间 ✗ 它还被用来拼检索查询"
+    # ② 口径来自 short_time ✓
+    stamp_body = src[src.index("def _slot_stamp(row):"):]
+    stamp_body = stamp_body[: stamp_body.index("def text_of(message):")]
+    assert "short_time(" in stamp_body, "日期必须走 short_time（跨年/非法都靠它 ✓）"
+    assert 'split(" ")[0]' in stamp_body, "只取日期部分（与事实行的 08-20 同口径 ✓）"
+
+
+def test_fact_time_granularity_follows_source_count():
+    """★ 2026-09-19（用户）：**只有"那一刻就是那句话"才给到分钟** ✓
+
+    · 单来源（sources 只有 1 条）⇒ 时间就是那句话被说出来的时刻 ⇒ 到分钟 ✓
+    · 多来源 ⇒ 是一段时间的概括 ⇒ 只到日 ✓（标分钟 = 假精确 ✗）
+    · 没有 event_at（老数据）⇒ **不显示时间** ✓（绝不用 created 冒充 ✗）
+    """
+    base = {
+        "id": "x", "category": "relationship", "subject": "qq:1", "content": "是师傅",
+        "importance": 5, "src": "rec-1", "relations": [],
+        "event_at": 1700000000.0, "created": 1772908601.0,
+    }
+    one = r.bot_facts([dict(base, sources=[{"r": 1}])], "sess")[0]
+    assert " " in one["t"], "单来源必须精确到分钟：%r" % one["t"]
+    many = r.bot_facts([dict(base, sources=[{"r": 1}, {"r": 2}])], "sess")[0]
+    assert " " not in many["t"], "多来源只到日：%r" % many["t"]
+    legacy = r.bot_facts([{k: v for k, v in base.items() if k != "event_at"}], "sess")[0]
+    assert "t" not in legacy, "没有 event_at 不许拿 created 冒充（现在=%r）" % legacy.get("t")

@@ -167,7 +167,7 @@ def archive_view(row, child_offset=0, child_count=20, include_content=False):
     # · `mem` **只在是永久记忆时**才写 ✓（不是就不写 ✗ 省掉 `"permanent":0` ✓）
     result = {
         "s": row.get("summary") or "",                        # 内容 ✓
-        "t": short_time(row.get("end") or row.get("start")),  # 绝对时间（跨年才带年份 ✓）
+        **tfield("t", short_time(row.get("end") or row.get("start"))),  # 绝对时间（跨年才带年份 ✓）
         "sp": row.get("speaker") or "",                       # 说话人 ✓
         "lv": row.get("level", 0),                            # 0=原文 / 1+=摘要 ✓
     }
@@ -418,8 +418,22 @@ def _strip_wrappers(text):
 #   ⇒ 用户日志里 `[At 3991867505]` 原样进注入 ✓
 #   **结构化壳不依赖名单表** ✓（与 [Reply]/[CQ:at]/<at> 同档 ✓ —— 仓库既有约定 ✓）
 _AT_SHELL = re.compile(r"\[At\s*-?\d+[^\]]*\]", re.I)
+# ★ 2026-09-19：引用内容开头的 `[2026-09-19 08:09:37]` 时间戳 ✓ 对模型毫无用处
+#   而且它一占就 21 个字符 ⇒ 40 字的引用预算被吃掉一半 ✗（用户真机日志实测 ✓）
+_TS_LEAD = re.compile(
+    r"^\[?\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}[ T]\d{1,2}:\d{2}(?::\d{2})?\s*\]?\s*"
+)
 _AT_WITH_NAME = re.compile(r"\[At\s*-?\d+\s*\(\s*nickname:\s*([^)]*?)\s*\)\s*\]", re.I)
 _AT_BARE = re.compile(r"\[At\s*-?\d+\s*\]", re.I)
+
+
+def tfield(key, value):
+    """时间字段：**有值才带这个键** ✓（用户定的规矩：空 t 省略 ✓ 有 t 的要有 ✓）
+
+    这样模型看到的 JSON 里就不会出现 `"t": ""` 这种空壳 ✓
+    （空值既没信息 ✓ 又会让模型以为"这里本来有时间但丢了" ✗）
+    """
+    return {key: value} if value else {}
 
 
 def strip_at_ids(text):
@@ -497,6 +511,11 @@ def trim_nested(text, reply_chars=40, desc_chars=DESC_CHARS_RECALL):
                 break
             raw_inner = text[reply.end() : end].strip()
             inner = raw_inner.strip("[]").strip()
+            # ★ 2026-09-19（用户）：引用内容**开头常常是一串时间戳** ✗
+            #   `[2026-09-19 08:09:37] 爱奈丽：行吧…` ⇒ 21 个字符白占预算 ✓
+            #   （模型看时间戳毫无用处 ✓ 而且 created/event_at 另有字段 ✓）
+            #   ⇒ 剥掉后再按 40 字裁 ✓ 让预算全用在**真正的引用内容**上 ✓
+            inner = _TS_LEAD.sub("", inner)
             # ⚠️ 判"引用里是不是媒体"要用**没剥括号**的原样 ✓
             #   （剥了 `[` 就匹配不上 `_MEDIA_HEAD` ✗ —— 实测踩到 ✓）
             # ★ 2026-09-18（用户）：**去掉无意义的 msgid、压平嵌套** ✓
@@ -846,13 +865,26 @@ def bot_facts(facts, current_sid="", short=None, self_id=""):
             item["src"] = (short(source) or source) if short else source
         created = fact.get("created")
         # 事件时间（这条事实讲的事发生在什么时候）优先；老数据没有 event_at 时退回 created。
-        event_at = fact.get("event_at") or created
+        created = fact.get("created")
+        # ③ 2026-09-19（用户）：**不许拿 created 兜底** ✗
+        #   created = 入库/整理这条事实的时刻（storage.py:2073 原话"不是事件时间"）
+        #   拿它冒充"事发生在什么时候" = 造假 ✓ ⇒ 老数据没有 event_at ⇒ **不显示时间** ✓
+        event_at = fact.get("event_at")
         event_end = fact.get("event_end") or event_at
         if isinstance(event_at, (int, float)) and event_at > 0:
-            item["t"] = short_day(event_at)
+            # ② 2026-09-19（用户）：**只有"那一刻就是那句话"才给到分钟** ✓
+            #   · 单来源（sources 只有 1 条）⇒ 它的时间就是那句话被说出来的时刻 ⇒ 到分钟 ✓
+            #   · 多来源 ⇒ 是"一段时间的概括" ⇒ 标分钟就是假精确 ✗ ⇒ 只到日 ✓
+            _srcs = fact.get("sources")
+            _single = isinstance(_srcs, list) and len(_srcs) == 1
+            if _single and short_time(event_at):
+                item["t"] = short_time(event_at)
+            elif short_day(event_at):
+                item["t"] = short_day(event_at)
             # 跨天的事（多条时间点合并进来的）给个区间，不然"塌成一点" ✗
             if isinstance(event_end, (int, float)) and event_end - event_at > 86400:
-                item["t2"] = short_day(event_end)
+                if short_day(event_end):
+                    item["t2"] = short_day(event_end)
         # 记录时刻和事情发生的时间不是一回事：差得远时才附上，省 token
         if (
             isinstance(created, (int, float))
