@@ -969,6 +969,15 @@ class Engine:
                 await self.queue_fact_merges(sid, started_at)
             except Exception:
                 logger.exception("[记忆·Z] 事实重复扫描失败，本次压缩结果不受影响")
+            # ★ 2026-09-19：压缩完成 ⇒ 通知上层（插件用它**解除该会话的"已给过"压制** ✓）
+            #   见 retrieval.RecallWindow.forget_sid 的说明 ✓
+            #   ⚠️ 可选回调 + 全包异常 ✓ 绝不影响压缩本身 ✓
+            cb = getattr(self, "on_compressed", None)
+            if callable(cb):
+                try:
+                    cb(sid)
+                except Exception:
+                    logger.exception("[记忆·Z] on_compressed 回调失败（不影响压缩 ✓）")
         return steps
 
     async def _compress_cascade(self, sid, steps=None, job_id=None):

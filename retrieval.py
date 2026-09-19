@@ -1,5 +1,6 @@
 """Local relevance and safe factual projections; no embedding provider required."""
 
+import logging
 import re
 import json
 import time
@@ -221,6 +222,26 @@ class RecallWindow:
             if now - self.entries[k]["updated"] > 1800:
                 del self.entries[k]
         return self.entries.get(key, {"query": "", "ids": [], "facts": []})
+
+    def forget_sid(self, sid):
+        """★ 2026-09-19：**压缩之后**解除该会话的"已给过"压制 ✓
+
+        为什么需要：seen 窗口只记得"我给过你" ✗ 却不记得
+          "**你上下文里现在还留着吗**" ✓
+        一旦发生压缩，那批结果很可能已经**被压掉/出窗** ✗
+        而 seen 仍在压制 ⇒ 模型最长 30 分钟拿不回来（只能靠 allow_seen 自救 ✓）
+
+        ⚠️ 安全：只**解除压制**（允许重发）✓ —— 不动任何数据 ✓
+           最坏结果只是多花几个 token ✓ 绝无数据风险 ✓
+        """
+        if not sid:
+            return 0
+        n = 0
+        for k in list(self.entries):
+            if isinstance(k, tuple) and k and k[0] == sid:
+                del self.entries[k]
+                n += 1
+        return n
 
     def remember(self, key, query, ids, facts=()):
         old = self.get(key)
@@ -741,6 +762,77 @@ def fts_match_query(tokens):
     return " OR ".join(quoted)
 
 
+# ★ 2026-09-19：中文分词（jieba）**软依赖** ✓ —— 照 KiraOS 的写法：
+#   "jieba 是中文分词的最佳选择，但**不应该作为插件加载的硬依赖**"
+#   没装就降级为按字切分 ✓ FTS5 仍可工作 ✓ 只是中文查准率差一些 ✓
+# 依赖自动安装由框架负责（插件根 requirements.txt ⇒ plugin_installer 自动 pip ✓）
+# 本模块**不依赖框架** ✓ 用标准库日志（jieba 缺失时提示一次 ✓）
+_log = logging.getLogger("alife_memory_z")
+
+
+try:
+    import jieba  # type: ignore
+
+    _JIEBA_AVAILABLE = True
+    # 静音 jieba 自己的 DEBUG 输出（每次建词典会打 4 行 ✗ 对用户是噪声 ✓）
+    try:
+        jieba.setLogLevel(logging.WARNING)
+    except Exception:  # pragma: no cover - 老版本没有这个方法
+        pass
+except ImportError:  # pragma: no cover - 取决于环境
+    jieba = None  # type: ignore
+    _JIEBA_AVAILABLE = False
+    _log.warning(
+        "jieba 未安装 ⇒ 中文检索降级为按字切分（功能不受影响，查准率略低）。"
+        "建议: pip install jieba（KiraAI 装插件时会自动装 ✓）"
+    )
+
+
+def warm_jieba():
+    """**预热**分词词典 ✓ —— 由插件加载时调用（后台线程 ✓ 不阻塞启动 ✓）
+
+    为什么要在加载时做（用户实测）：
+        jieba 首次分词才建词典 ⇒ 日志里出现 `Loading model cost **1.340 seconds**` ✗
+        而且它是**对话进行中**才发生 ✗ ⇒ 那 1.3 秒砸在一次真实回复的链路上 ✓
+    ⇒ 和 KiraOS 一样，把这一步放在**插件初始化**阶段 ✓✓
+    （词典有本地缓存 ✓ 之后每次启动都快 ✓ 这里只是"提前疼一下"✓）
+    """
+    if not _JIEBA_AVAILABLE:
+        return False
+    try:
+        jieba.initialize()
+        return True
+    except Exception:  # pragma: no cover - 预热失败不影响功能（首次用时再建 ✓）
+        _log.warning("jieba 预热失败（不影响功能 ✓ 首次检索时会再尝试 ✓）")
+        return False
+
+
+def score_tokens(query):
+    """**打分用**的词元 ✓ —— 有 jieba 时按**词**切，否则回退到 query_tokens（按字 ✓）。
+
+    为什么打分侧要按词切（用户实测）：
+      `doro 的 bot 是谁` 按字切会得到 [的d, do, or, ro, 的b, bo, ot, …] ✗
+      ⇒ 任何**两字重叠**都算命中 ⇒ `doro` 一个词命中 **761** 条 ⇒ 真正那条被埋 ✓
+      按词切 ⇒ [doro, bot] ✓ ⇒ 命中数大减 ✓ 与"叫/名字"邻近的行才能排上来 ✓
+
+    ⚠️ 只改**打分** ✗ 不动 FTS 查询词元（`query_tokens` / `index_grams`）✓
+      因为索引侧必须保持"打分能命中的都能查到"的超集不变式 ✓（见 index_grams 注释）
+      ⇒ 所以**不需要重建索引** ✓ 风险为零 ✓
+    """
+    text = squeeze(query or "").casefold()
+    if not _JIEBA_AVAILABLE:
+        return query_tokens(query)
+    words = []
+    for chunk in re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", text):
+        if re.match(r"[a-z0-9_]", chunk):
+            words.append(chunk)
+            continue
+        # 汉字片段：jieba 切词；单字词与虚词不进打分（噪声 ✓）
+        words.extend(w for w in jieba.lcut(chunk) if len(w) >= 2)
+    out = sorted({w for w in words if w.strip()} - STOP)
+    return out or query_tokens(query)   # 切没了就回退（安全 ✓）
+
+
 def query_tokens(query):
     """查询侧词元（与 relevance 口径完全一致），供 SQL 粗筛复用。"""
     chunks = re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", squeeze(query).casefold())
@@ -759,7 +851,7 @@ def query_tokens(query):
 
 
 def relevance(query, text):
-    tokens = query_tokens(query)
+    tokens = score_tokens(query)
     lowered = squeeze(text).casefold()
     return sum(len(t) * (t in lowered) for t in tokens)
 

@@ -1,4 +1,20 @@
-# KiraAI already supplies FastAPI and Pydantic; no separate models or vector service.
-pydantic>=2.11.7
-tomli>=2; python_version < "3.11"
-openai>=1.106.1
+# ─────────────────────────────────────────────────────────────
+# Alife 记忆插件（Z）的可选/补充依赖
+# KiraAI 的插件安装器会读本文件并自动 pip install（装完还会重试一次导入 ✓）
+# ⇒ 新用户与存量用户（更新插件时）都无需手动操作 ✓
+# ─────────────────────────────────────────────────────────────
+
+# 中文分词：检索**打分**按词切分（治"命中几百条却挑不出答案"）
+# 缺失时插件自动降级为按字切分 ✓ 功能不受影响 ✓ 只是中文查准率略低 ✓
+jieba
+
+# tomllib 的兼容回退（Python < 3.11 才需要；3.11+ 用标准库 tomllib ✓）
+# 见 migration.py：try: import tomllib / except ImportError: import tomli as tomllib
+tomli; python_version < "3.11"
+
+# ⚠️ 以下由 KiraAI 框架**已经提供**，故**不再重复声明**（避免版本冲突）：
+#     openai>=1.106.1 / fastapi>=0.124.0 / pydantic>=2.11.7
+#   （见 KiraAI 仓库根 requirements.txt ✓ 我们直接用框架装好的 ✓）
+#
+# 其余全部为 Python 标准库：asyncio collections contextlib datetime hashlib json
+#   logging math pathlib random re sqlite3 time typing urllib uuid

@@ -372,7 +372,9 @@ def test_sql_lexical_score_matches_python_relevance(tmp_path):
         "完全无关的一句话",
     ]
     for query in queries:
-        tokens = retrieval.query_tokens(query)
+        # ★ 2026-09-19：打分口径改为**词级**（jieba ✓ 无则回退按字 ✓）
+        #   过滤侧仍按字（索引超集 ✓，见下方 filter 用例）
+        tokens = retrieval.score_tokens(query)
         # 真实路径用的是 lower(summary)；测试里同样加 lower 才可比
         expr = storage._lexical_sql("lower(?)", tokens)
         with storage.Store(tmp_path / "db").connect() as db:

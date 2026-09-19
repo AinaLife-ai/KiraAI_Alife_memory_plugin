@@ -142,9 +142,12 @@ def _lexical_scorer(query):
     relevance() 每次调用都会重新切查询词元——在全表打分时等于每行重切一遍，
     是 1 秒级的开销来源。这里把词元提到闭包外，逐行只做一次子串计数。
     """
-    from .retrieval import query_tokens, squeeze
+    from .retrieval import score_tokens, squeeze
 
-    tokens = query_tokens(query)
+    # ★ 2026-09-19：打分用**词级**词元 ✓（有 jieba 按词，无则回退按字 ✓）
+    #   ⚠️ 只换打分 ✗ 不动 SQL 预筛（storage:2909 的 query_tokens）✓
+    #   索引侧超集不变式不受影响 ⇒ **不需要重建索引** ✓
+    tokens = score_tokens(query)
 
     def score(text):
         lowered = squeeze(text).casefold()
@@ -2915,10 +2918,18 @@ class Store:
                             extra = []
                         if extra:
                             lexical = lexical + " " + " ".join(extra)
-                tokens = query_tokens(lexical)
-                lexical_sql = _lexical_sql("lower(summary)", tokens)
-                clauses.append("(%s)>0" % lexical_sql)
-                hits = self._fts_hits(tokens)
+                # ★ 2026-09-19（判据抓到的真 bug）：原来**同一个 tokens 喂三处** ✗
+                #   → 过滤（要"能查到"= 索引超集 ✓）、打分（要"排序准"= 词级 ✓）、FTS 预筛
+                #   ⇒ 拆开 ✓：**过滤/FTS 继续按字** ✓（保住不漏召回 ✓）、
+                #     **打分改用词级** ✓（治「761 命中挑不出答案」✓）
+                from .retrieval import score_tokens as _score_tokens
+
+                filt_tokens = query_tokens(lexical)          # 过滤：按字（超集 ✓ 不动）
+                score_toks = _score_tokens(lexical)          # 打分：词级 ✓
+                clauses.append("(%s)>0" % _lexical_sql("lower(summary)", filt_tokens))
+                # 排序用词级表达式（下面 ORDER BY 引用 lex_sql 时用这个 ✓）
+                lexical_sql = _lexical_sql("lower(summary)", score_toks)
+                hits = self._fts_hits(filt_tokens)
                 if hits is not None:
                     # 先用 FTS 索引取候选（命中太宽返回 None → 退回全表）。
                     # 这里**只能**是纯 rowid 约束：一旦写成

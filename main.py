@@ -573,6 +573,18 @@ class AlifeMemoryPlugin(BasePlugin):
             "[记忆·Z] 启动中：版本 %s · 加载自 %s",
             self._plugin_version() or "未知", Path(__file__).parent,
         )
+        # ★ 2026-09-19：**预热中文分词词典** ✓（用户实测：首次分词要 1.34s ✗
+        #   而它偏偏发生在**对话进行中** ✗ ⇒ 那 1.3 秒砸在一次真实回复的链路上 ✓）
+        #   ⇒ 放到插件**加载阶段**、且用**后台线程** ✓（不阻塞启动 ✓）
+        #   与 KiraOS 的 initialize() 约定一致 ✓（它也是在这个钩子里做准备 ✓）
+        try:
+            import threading
+
+            from .retrieval import warm_jieba
+
+            threading.Thread(target=warm_jieba, name="z-jieba-warm", daemon=True).start()
+        except Exception:  # pragma: no cover - 预热只是优化，失败绝不影响加载 ✓
+            logger.exception("[记忆·Z] 分词预热启动失败（不影响功能 ✓）")
         try:
             await self.apply_config_migrations()
         except Exception:
@@ -619,6 +631,10 @@ class AlifeMemoryPlugin(BasePlugin):
         self.engine = Engine(
             self.store, self.runtime_settings, self.model_call, self.embed, self.notice
         )
+        # ★ 2026-09-19：压缩完成 ⇒ 解除该会话的「已给过」压制 ✓
+        #   seen 只记得"我给过" ✗ 不知道上下文是否已被压掉 ⇒ 压缩后放行 ✓
+        #   （可选回调 + 内部全包异常 ✓ 绝不影响压缩本身 ✓）
+        self.engine.on_compressed = self._on_compressed
         # 后台迁移：不阻塞插件加载；迁移期间记忆功能由 migration_blocked 暂停。
         self.migration_task = asyncio.create_task(self.migrate())
         asyncio.create_task(self.build_search_index())
@@ -988,6 +1004,15 @@ class AlifeMemoryPlugin(BasePlugin):
         for owner in sorted(owners):
             await self.engine.enqueue("tidy", owner, automatic=automatic, detail=detail)
         return sorted(owners)
+    def _on_compressed(self, sid):
+        """压缩完成回调：解除该会话的「已给过」压制 ✓（**只放行** ✓ 不动任何数据 ✓）"""
+        try:
+            n = self.seen_window.forget_sid(sid)
+            if n:
+                logger.info("[记忆·Z] 压缩完成 ⇒ 解除会话 %s 的已给过压制（%d 条可重发）", sid, n)
+        except Exception:
+            logger.exception("[记忆·Z] 解除压制失败（不影响压缩 ✓）")
+
     async def queue_compress_all(self, limit=2):
         """排"该压但还没压"的会话 ✓（**确定性**兜底 ✓ 不看骰子 ✓）
 
@@ -2509,6 +2534,12 @@ class AlifeMemoryPlugin(BasePlugin):
         items = value.get("items")
         if isinstance(items, list):                        # ② 搜索
             head = "【召回】命中 %s · 本次 %s" % (value.get("total", "?"), len(items))
+            # ★ 2026-09-19（用户）：命中过多时给模型一句**换词建议** ✓ 少翻几轮 ✓
+            try:
+                if int(value.get("total") or 0) > 200:
+                    head += "；命中过多，建议加或换更多具体的词（如人名/时间/物件）"
+            except (TypeError, ValueError):
+                pass
             if value.get("seen"):
                 head += " · 已见过 %s" % value["seen"]
             lines = [head]
